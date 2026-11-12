@@ -201,19 +201,45 @@ impl Frame {
                 pitch: look.2.atan2(look.0.hypot(look.1)),
             }
         });
-        let camera = death_camera.as_ref().unwrap_or(camera);
+        let guided_camera = game.ordnance.guided_view();
+        let camera = death_camera
+            .as_ref()
+            .or(guided_camera.as_ref())
+            .unwrap_or(camera);
         self.zoom = (0.5 * game.field_of_view().to_radians()).tan().recip();
         self.draw(map, camera, time);
         self.layer(Layer::Effects);
         let view = View::camera(camera);
+        if let Some(target) = &game.target {
+            let motion = if target.health == 0 {
+                &map.player_deaths[0]
+            } else {
+                &map.player_idle
+            };
+            let age = if target.health == 0 {
+                (motion.duration() - 0.001).max(0.0)
+            } else if motion.duration() > 0.0 {
+                game.time.rem_euclid(motion.duration())
+            } else {
+                0.0
+            };
+            if let Some(pose) = motion.sample(age) {
+                let model = view.in_model(
+                    target.position,
+                    Vec3(target.yaw.cos(), target.yaw.sin(), 0.0),
+                    1.0,
+                );
+                self.draw_faces_in_view(pose.current, &model, time, false, Some(pose), None);
+            }
+        }
         game.ordnance
             .visuals(&map.ordnance, game.time, |visual| match visual {
                 crate::game::ordnance::Visual::Sprite(position, image, scale, glow) => {
                     self.world_sprite(&view, position, image, scale, glow)
                 }
-                crate::game::ordnance::Visual::Mesh(position, direction, pose, scale) => {
+                crate::game::ordnance::Visual::Mesh(position, direction, pose, scale, glow) => {
                     let model = view.in_model(position, direction, scale);
-                    self.draw_faces_in_view(pose.current, &model, time, false, Some(pose), None);
+                    self.draw_faces_in_view(pose.current, &model, time, false, Some(pose), glow);
                 }
             });
         if let Some(death) = &game.death {
@@ -298,7 +324,8 @@ impl Frame {
             }
         }
         self.zoom = 1.0;
-        if game.death.is_none()
+        if guided_camera.is_none()
+            && game.death.is_none()
             && !game.scoped()
             && let Some(weapon) = map.arsenal.get(&game.weapon)
         {
@@ -339,6 +366,53 @@ impl Frame {
             self.draw_faces_blended(pose.current, &view, time, false, Some(pose));
         }
         self.layer(Layer::Hud);
+        if let Some(weapon) = map.arsenal.get(&crate::game::Weapon::Redeemer) {
+            let [reticle, readout, noise] = &weapon.guided_hud;
+            if guided_camera.is_some() && game.death.is_none() {
+                if let Some(reticle) = reticle {
+                    let (w, h) = reticle.size();
+                    let scale = (self.width as f32 / 640.0).floor().max(0.5);
+                    let (dw, dh) = ((w * scale) as i32, (h * scale) as i32);
+                    self.translucent_tile(
+                        reticle.image(0.0),
+                        [
+                            (self.width as i32 - dw) / 2,
+                            (self.height as i32 - dh) / 2,
+                            dw,
+                            dh,
+                        ],
+                        [0.0, 0.0, w, h],
+                        [1.0; 3],
+                    );
+                }
+                if let Some(readout) = readout {
+                    let (w, h) = readout.size();
+                    let offset = (game.time * 75.0) as i32 % h as i32;
+                    for y in (0..self.height as i32 + h as i32).step_by(h as usize) {
+                        self.translucent_tile(
+                            readout.image(0.0),
+                            [1, y - offset, w as i32, h as i32],
+                            [0.0, 0.0, w, h],
+                            [1.0; 3],
+                        );
+                    }
+                }
+                return;
+            }
+            if game.death.is_none()
+                && game.time < game.guidance_lost_until
+                && let Some(noise) = noise
+            {
+                let (w, h) = noise.size();
+                self.tile(
+                    noise.image(time),
+                    [0, 0, self.width as i32, self.height as i32],
+                    [0.0, 0.0, w, h],
+                    [1.0; 3],
+                );
+                return;
+            }
+        }
         let flash = ((game.hit_flash_until - game.time) / 0.20).clamp(0.0, 1.0) * 0.22;
         if flash > 0.0 {
             if let Some(commands) = &mut self.commands {

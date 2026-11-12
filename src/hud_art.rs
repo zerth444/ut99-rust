@@ -72,9 +72,17 @@ impl Art {
             );
         }
 
+        let crosshair = if game.rocket_locked {
+            arsenal
+                .get(&Weapon::Rocket)
+                .and_then(|weapon| weapon.lock_reticle.as_ref())
+                .or(self.crosshair.as_ref())
+        } else {
+            self.crosshair.as_ref()
+        };
         if game.death.is_none()
             && !game.scoped()
-            && let Some(crosshair) = &self.crosshair
+            && let Some(crosshair) = crosshair
         {
             let (w, h) = crosshair.size();
             let crosshair_scale = if width < 512.0 {

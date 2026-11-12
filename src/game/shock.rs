@@ -218,6 +218,17 @@ fn blast_sound(assets: &Assets) -> Option<Arc<Wave>> {
 }
 
 impl Shots {
+    pub(super) fn deflect(&mut self, map: &Map, camera: &Camera) {
+        for bolt in &mut self.bolts {
+            let speed = assets(map).map_or(1000.0, |art| art.speed);
+            if let Some(velocity) =
+                super::hammer_deflection(map, camera, bolt.position, bolt.direction * speed)
+            {
+                bolt.direction = unit(velocity);
+            }
+        }
+    }
+
     pub(super) fn fire(
         &mut self,
         map: &Map,
@@ -226,6 +237,7 @@ impl Shots {
         now: f32,
         ammo: &mut u16,
         sounds: &mut Vec<Arc<Wave>>,
+        pawn: Option<&mut super::TrainingTarget>,
     ) -> Option<Blast> {
         let fallback = Assets::default();
         let assets = assets(map).unwrap_or(&fallback);
@@ -259,7 +271,7 @@ impl Shots {
         let hit = map.collision.ray_surface(start, direction * 10_000.0);
         let (end, normal) = hit.unwrap_or((start + direction * 10_000.0, direction * -1.0));
         let delta = end - start;
-        let target = self
+        let bolt_target = self
             .bolts
             .iter()
             .enumerate()
@@ -273,8 +285,11 @@ impl Shots {
                 (fraction < 1.0).then_some((i, fraction))
             })
             .min_by(|(_, a), (_, b)| a.total_cmp(b));
+        let pawn_fraction = pawn.as_ref().and_then(|pawn| pawn.ray(start, delta));
         let mut blast = None;
-        let beam_end = if let Some((index, fraction)) = target {
+        let beam_end = if let Some((index, fraction)) = bolt_target
+            && pawn_fraction.is_none_or(|pawn| fraction < pawn)
+        {
             let bolt = self.bolts.remove(index);
             if *ammo >= 2 {
                 *ammo -= 2;
@@ -289,6 +304,12 @@ impl Shots {
             blast = Some(Blast::new(bolt.position, assets, true));
             start + delta * fraction
         } else {
+            let (end, normal) = if let (Some(pawn), Some(fraction)) = (pawn, pawn_fraction) {
+                pawn.damage(40);
+                (start + delta * fraction, direction * -1.0)
+            } else {
+                (end, normal)
+            };
             self.rings.push(Ring {
                 impact: Impact::Beam,
                 position: end + normal * 8.0,
@@ -312,6 +333,7 @@ impl Shots {
         dt: f32,
         now: f32,
         sounds: &mut Vec<Arc<Wave>>,
+        pawn: Option<&super::TrainingTarget>,
     ) -> Vec<Blast> {
         let fallback = Assets::default();
         let assets = assets(map).unwrap_or(&fallback);
@@ -328,7 +350,13 @@ impl Shots {
                 return false;
             }
             let delta = bolt.direction * (assets.speed * dt);
-            if let Some((point, normal)) = map.collision.ray_surface(bolt.position, delta) {
+            let hit = map.collision.ray_surface(bolt.position, delta);
+            let visible = hit.map_or(delta, |(point, _)| point - bolt.position);
+            let hit = pawn
+                .and_then(|pawn| pawn.ray(bolt.position, visible))
+                .map(|fraction| (bolt.position + visible * fraction, bolt.direction * -1.0))
+                .or(hit);
+            if let Some((point, normal)) = hit {
                 self.rings.push(Ring {
                     impact: Impact::Wall,
                     position: point + normal * 8.0,
@@ -440,7 +468,7 @@ impl Beam {
     }
 }
 
-fn cylinder_hit(start: Vec3, delta: Vec3, radius: f32, half_height: f32) -> Option<f32> {
+pub(super) fn cylinder_hit(start: Vec3, delta: Vec3, radius: f32, half_height: f32) -> Option<f32> {
     let a = delta.0 * delta.0 + delta.1 * delta.1;
     let b = start.0 * delta.0 + start.1 * delta.1;
     let c = start.0 * start.0 + start.1 * start.1 - radius * radius;
@@ -583,7 +611,15 @@ mod tests {
         let mut sounds = Vec::new();
         assert!(
             game.shock
-                .fire(&map, &camera, false, game.time, &mut ammo, &mut sounds)
+                .fire(
+                    &map,
+                    &camera,
+                    false,
+                    game.time,
+                    &mut ammo,
+                    &mut sounds,
+                    None
+                )
                 .is_none()
         );
         assert_eq!(game.shock.bolts.len(), 1);
@@ -599,7 +635,15 @@ mod tests {
         ammo = 1;
         let blast = game
             .shock
-            .fire(&map, &camera, false, game.time, &mut ammo, &mut sounds)
+            .fire(
+                &map,
+                &camera,
+                false,
+                game.time,
+                &mut ammo,
+                &mut sounds,
+                None,
+            )
             .unwrap();
         assert!(game.shock.bolts.is_empty());
         assert_eq!(ammo, 1);

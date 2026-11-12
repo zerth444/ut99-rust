@@ -354,6 +354,7 @@ pub struct Scene {
     pub player: crate::movement::Profile,
     pub player_audio: crate::movement::PlayerAudio,
     pub player_deaths: [Motion; 3],
+    pub player_idle: Motion,
     pub ordnance: ordnance::Arsenal,
 }
 
@@ -503,11 +504,55 @@ pub fn load(map: &Package<'_>, actors: &[&Export], path: &Path) -> io::Result<Sc
                 pulse_beam(&mut assets, &mut class_cache, &mut textures).unwrap_or_default();
         }
         let load_sound = match weapon {
+            Weapon::Hammer => find_export(&assets, "botpack", "ImpactAltFireStart", "Sound"),
+            Weapon::Minigun => find_export(&assets, "botpack", "M2WindDown", "Sound"),
             Weapon::Rocket => find_export(&assets, "unrealshare", "Loading", "Sound"),
             Weapon::Bio => find_export(&assets, "botpack", "BioAltRep", "Sound"),
             _ => None,
         };
         weapon_assets.load_sound = cached_wave(&assets, &mut waves, load_sound);
+        if weapon == Weapon::Hammer {
+            weapon_assets.charge_loop = cached_wave(
+                &assets,
+                &mut waves,
+                find_export(&assets, "botpack", "ImpactLoop", "Sound"),
+            );
+        }
+        if weapon == Weapon::Redeemer {
+            weapon_assets.guided_hud = ["GuidedX", "Readout", "Static_a00"].map(|name| {
+                find_export(&assets, "botpack", name, "Texture")
+                    .and_then(|id| cached_texture(&assets, &mut textures, id))
+            });
+            weapon_assets.charge_loop = cached_wave(
+                &assets,
+                &mut waves,
+                find_export(&assets, "botpack", "WarFly", "Sound"),
+            );
+        }
+        if weapon == Weapon::Rocket {
+            weapon_assets.rocket_lock = ["SeekLock", "SeekLost"].map(|name| {
+                cached_wave(
+                    &assets,
+                    &mut waves,
+                    find_export(&assets, "unrealshare", name, "Sound"),
+                )
+            });
+            weapon_assets.lock_reticle = find_export(&assets, "botpack", "Crosshair6", "Texture")
+                .or_else(|| find_export(&assets, "botpack", "CHair6", "Texture"))
+                .and_then(|id| cached_texture(&assets, &mut textures, id));
+        }
+        if weapon == Weapon::Ripper {
+            weapon_assets.fire = cached_wave(
+                &assets,
+                &mut waves,
+                find_export(&assets, "unreali", "StartBlade", "Sound"),
+            );
+            weapon_assets.alternate = cached_wave(
+                &assets,
+                &mut waves,
+                find_export(&assets, "botpack", "RazorAlt", "Sound"),
+            );
+        }
         if weapon == Weapon::Sniper {
             weapon_assets.scope = find_export(&assets, "botpack", "RReticle", "Texture")
                 .and_then(|id| cached_texture(&assets, &mut textures, id));
@@ -568,10 +613,12 @@ pub fn load(map: &Package<'_>, actors: &[&Export], path: &Path) -> io::Result<Sc
                             })
                     };
                     weapon_assets.primary_motion = motion(
-                        &["Shoot", "Fire1", "Fire", "ShootLoop", "Firing"],
+                        &["Shoot", "Fire1", "Fire", "Shoot1", "ShootLoop", "Firing"],
                         match weapon {
                             Weapon::Enforcer => 0.81,
                             Weapon::Shock => shock::firing_rate(false),
+                            Weapon::Hammer => 0.65,
+                            Weapon::Minigun => 1.6,
                             _ => 1.0,
                         },
                     );
@@ -585,10 +632,17 @@ pub fn load(map: &Package<'_>, actors: &[&Export], path: &Path) -> io::Result<Sc
                     weapon_assets.select_motion = motion(&["Select"], 1.0);
                     weapon_assets.down_motion = motion(&["Down"], 1.0);
                     weapon_assets.load = match weapon {
+                        Weapon::Hammer => motion(&["Pull"], 0.2),
                         Weapon::Rocket => motion(&["Load1"], 1.0),
                         Weapon::Bio => motion(&["Charging"], 0.24),
                         _ => Motion::default(),
                     };
+                    if weapon == Weapon::Hammer {
+                        weapon_assets.alternate_motion = motion(&["Shake"], 1.0);
+                    }
+                    if weapon == Weapon::Minigun {
+                        weapon_assets.alternate_motion = motion(&["Shoot1"], 1.3);
+                    }
                     weapon_assets.view = pose(rest);
                 }
             }
@@ -622,7 +676,7 @@ pub fn load(map: &Package<'_>, actors: &[&Export], path: &Path) -> io::Result<Sc
             find_export(&assets, "botpack", name, "Sound"),
         )
     });
-    let player_deaths = death_models(&mut assets, &mut class_cache, &mut textures);
+    let (player_deaths, player_idle) = player_models(&mut assets, &mut class_cache, &mut textures);
     let ordnance = Kind::ALL.map(|kind| {
         projectile_art(
             &mut assets,
@@ -639,15 +693,16 @@ pub fn load(map: &Package<'_>, actors: &[&Export], path: &Path) -> io::Result<Sc
         player,
         player_audio,
         player_deaths,
+        player_idle,
         ordnance,
     })
 }
 
-fn death_models(
+fn player_models(
     assets: &mut Assets<'_>,
     classes: &mut HashMap<Object, Appearance>,
     textures: &mut HashMap<Object, Option<Arc<Texture>>>,
-) -> [Motion; 3] {
+) -> ([Motion; 3], Motion) {
     let class = find_export(assets, "botpack", "TMale2", "Class");
     let mut visual = appearance(assets, classes, class);
     let Some(object) = visual.mesh else {
@@ -663,8 +718,11 @@ fn death_models(
     {
         visual.multiskins[slot] = find_export(assets, "soldierskins", name, "Texture");
     }
-    ["Dead1", "Dead3", "Dead8"]
-        .map(|name| effect_motion(assets, textures, object, visual, &mesh, &[name]))
+    (
+        ["Dead1", "Dead3", "Dead8"]
+            .map(|name| effect_motion(assets, textures, object, visual, &mesh, &[name])),
+        effect_motion(assets, textures, object, visual, &mesh, &["Breath1"]),
+    )
 }
 
 fn projectile_art(
@@ -710,6 +768,7 @@ fn projectile_art(
             Some(("unreali", "BladeHit")),
         ),
         Kind::RazorAlt => ("HEexpl1_a00", "unrealshare", "Expl03", None),
+        Kind::Warhead | Kind::GuidedWarhead => ("we_a00", "botpack", "WarExplo", None),
         _ => (
             "g1r_a00",
             "unrealshare",
@@ -742,9 +801,24 @@ fn projectile_art(
             art.stuck = effect_motion(assets, textures, object, visual, &mesh, &["Hit", "Still"]);
         }
     }
-    if kind == Kind::Rocket {
+    if matches!(kind, Kind::Rocket | Kind::Warhead | Kind::GuidedWarhead) {
         art.trail = find_export(assets, "botpack", "JRFlare", "Texture")
             .and_then(|id| cached_texture(assets, textures, id));
+    }
+    if matches!(kind, Kind::Warhead | Kind::GuidedWarhead) {
+        art.second_explosion = find_export(assets, "botpack", "ne_a00", "Texture")
+            .and_then(|id| cached_texture(assets, textures, id));
+        let class = find_export(assets, "botpack", "ShockWave", "Class");
+        let wave = appearance(assets, classes, class);
+        if let Some(object) = wave.mesh {
+            let (package, export) = assets.object(object);
+            if let Ok(mesh) = Mesh::read(package, export)
+                && let Some(frame) = mesh.frame(0)
+            {
+                let vertices = effect_vertices(&mesh, frame, 1.0);
+                art.wavefront = mesh_faces(assets, textures, object, wave, &mesh, &vertices);
+            }
+        }
     }
     art
 }

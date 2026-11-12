@@ -82,6 +82,7 @@ pub struct Map {
     pub arsenal: std::collections::HashMap<crate::game::Weapon, crate::game::WeaponAssets>,
     pub player_audio: crate::movement::PlayerAudio,
     pub player_deaths: [crate::game::Motion; 3],
+    pub player_idle: crate::game::Motion,
     pub ordnance: crate::game::ordnance::Arsenal,
     pub teleporters: Vec<crate::teleport::Teleporter>,
 }
@@ -119,6 +120,7 @@ impl Map {
             player,
             player_audio,
             player_deaths,
+            player_idle,
             ordnance,
         } = path
             .map(|path| crate::props::load(package, &actors, path))
@@ -164,6 +166,7 @@ impl Map {
             hud,
             player_audio,
             player_deaths,
+            player_idle,
             ordnance,
             teleporters,
         })

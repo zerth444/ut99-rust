@@ -35,7 +35,11 @@ struct Targets {
 }
 
 impl Presenter {
-    pub fn new(window: windows_sys::Win32::Foundation::HWND, size: (u32, u32)) -> Result<Self> {
+    pub fn new(
+        window: windows_sys::Win32::Foundation::HWND,
+        size: (u32, u32),
+        obs: bool,
+    ) -> Result<Self> {
         let (device, software) = match create_device(D3D_DRIVER_TYPE_HARDWARE) {
             Ok(device) => (device, false),
             Err(_) => (create_device(D3D_DRIVER_TYPE_WARP)?, true),
@@ -52,7 +56,13 @@ impl Presenter {
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
             BufferCount: 2,
             Scaling: DXGI_SCALING_STRETCH,
-            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            // Legacy HWND capture reads the redirected surface. Keep that surface
+            // populated in OBS mode, even when the game covers the monitor.
+            SwapEffect: if obs {
+                DXGI_SWAP_EFFECT_SEQUENTIAL
+            } else {
+                DXGI_SWAP_EFFECT_FLIP_DISCARD
+            },
             AlphaMode: DXGI_ALPHA_MODE_IGNORE,
             Flags: CHAIN_FLAGS.0 as u32,
             ..Default::default()

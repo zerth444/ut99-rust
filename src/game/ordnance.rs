@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use super::{Motion, Pose, shock::Blast};
+use super::{Motion, Pose, TrainingTarget, shock::Blast};
 use crate::{
-    map::{Map, Vec3},
+    map::{Face, Map, Vec3},
     mover::unit,
     render::Camera,
     sound::Wave,
@@ -21,10 +21,12 @@ pub enum Kind {
     FlakShell,
     Razor,
     RazorAlt,
+    Warhead,
+    GuidedWarhead,
 }
 
 impl Kind {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::Pulse,
         Self::Rocket,
         Self::Grenade,
@@ -35,6 +37,8 @@ impl Kind {
         Self::FlakShell,
         Self::Razor,
         Self::RazorAlt,
+        Self::Warhead,
+        Self::GuidedWarhead,
     ];
 
     pub fn class(self) -> &'static str {
@@ -49,11 +53,17 @@ impl Kind {
             Self::FlakShell => "flakslug",
             Self::Razor => "Razor2",
             Self::RazorAlt => "Razor2Alt",
+            Self::Warhead => "WarShell",
+            Self::GuidedWarhead => "GuidedWarShell",
         }
     }
 
     fn bio(self) -> bool {
         matches!(self, Self::Gel | Self::Glob | Self::Splash)
+    }
+
+    fn warhead(self) -> bool {
+        matches!(self, Self::Warhead | Self::GuidedWarhead)
     }
 }
 
@@ -70,13 +80,15 @@ pub struct Art {
     pub damage: Option<f32>,
     pub momentum: Option<f32>,
     pub scale: Option<f32>,
+    pub wavefront: Vec<Face>,
+    pub second_explosion: Option<Arc<Texture>>,
 }
 
 pub type Arsenal = [Art; Kind::ALL.len()];
 
 pub enum Visual<'a> {
     Sprite(Vec3, &'a TextureImage, f32, f32),
-    Mesh(Vec3, Vec3, Pose<'a>, f32),
+    Mesh(Vec3, Vec3, Pose<'a>, f32, Option<f32>),
 }
 
 #[derive(Default)]
@@ -96,6 +108,7 @@ struct Projectile {
     stuck: Option<f32>,
     next_trail: f32,
     wall_hits: u8,
+    seeking: Option<(Vec3, f32)>,
 }
 
 struct Effect {
@@ -105,9 +118,117 @@ struct Effect {
     duration: f32,
     scale: f32,
     trail: bool,
+    struck: [bool; 2],
 }
 
 impl Shots {
+    pub(super) fn nuclear_wave(
+        &mut self,
+        map: &Map,
+        time: f32,
+        center: Vec3,
+        victim: usize,
+    ) -> Option<(u16, Vec3)> {
+        let mut hit: Option<(u16, Vec3)> = None;
+        for effect in &mut self.effects {
+            if !effect.kind.warhead() || effect.trail || effect.struck[victim] {
+                continue;
+            }
+            let age = ((time - effect.born) * 10.0).floor() * 0.1;
+            if age < 0.1 {
+                continue;
+            }
+            let offset = center - effect.position;
+            let distance = offset.dot(offset).sqrt().max(1.0);
+            if distance > shock_size(age) * 29.0
+                || map.collision.ray(effect.position, offset).is_some()
+            {
+                continue;
+            }
+            effect.struck[victim] = true;
+            let force = (1100.0 - 1.1 * distance).max(0.0);
+            let impulse = (offset * distance.recip() + Vec3(0.0, 0.0, 0.3)) * (force + 20.0);
+            let (damage, velocity) = hit.get_or_insert((0u16, Vec3::default()));
+            *damage = damage.saturating_add(force as u16);
+            *velocity = *velocity + impulse;
+        }
+        hit
+    }
+    pub(super) fn clear_seeking(&mut self) {
+        for shot in &mut self.projectiles {
+            shot.seeking = None;
+        }
+    }
+
+    pub(super) fn seek_latest(&mut self, time: f32) {
+        if let Some(shot) = self
+            .projectiles
+            .last_mut()
+            .filter(|shot| shot.kind == Kind::Rocket && shot.born == time)
+        {
+            shot.seeking = Some((shot.direction, time + 0.1));
+            shot.expires = time + 10.0;
+        }
+    }
+
+    pub fn guided_view(&self) -> Option<Camera> {
+        let missile = self
+            .projectiles
+            .iter()
+            .find(|shot| shot.kind == Kind::GuidedWarhead)?;
+        let direction = missile.direction;
+        Some(Camera {
+            position: missile.position + direction * 18.0,
+            yaw: direction.1.atan2(direction.0),
+            pitch: direction.2.atan2(direction.0.hypot(direction.1)),
+        })
+    }
+
+    pub(super) fn guide(
+        &mut self,
+        map: &Map,
+        aim: Vec3,
+        dt: f32,
+        time: f32,
+        detonate: bool,
+        owner_alive: bool,
+        sounds: &mut Vec<Arc<Wave>>,
+    ) -> Option<Blast> {
+        let index = self
+            .projectiles
+            .iter()
+            .position(|shot| shot.kind == Kind::GuidedWarhead)?;
+        let shot = &mut self.projectiles[index];
+        if !owner_alive || (detonate && time - shot.born >= 1.0) {
+            let shot = self.projectiles.remove(index);
+            return explode(
+                &shot,
+                &map.ordnance[shot.kind as usize],
+                &mut self.effects,
+                sounds,
+                time,
+            );
+        }
+        shot.direction = unit(shot.velocity + aim * (1500.0 * dt));
+        shot.velocity = shot.direction * 550.0;
+        None
+    }
+
+    pub(super) fn deflect(&mut self, map: &Map, camera: &Camera) {
+        for shot in self
+            .projectiles
+            .iter_mut()
+            .filter(|shot| shot.stuck.is_none())
+        {
+            if let Some(velocity) =
+                super::hammer_deflection(map, camera, shot.position, shot.velocity)
+            {
+                shot.direction = unit(velocity);
+                shot.velocity = velocity;
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn fire(
         &mut self,
@@ -130,6 +251,7 @@ impl Shots {
             Kind::Rocket | Kind::Grenade => forward * 20.0 + right * (8.0 + side) - up * 9.0,
             Kind::FlakShell | Kind::Chunk => forward * 20.0 + right * (11.0 + side) - up * 15.0,
             Kind::Razor | Kind::RazorAlt => forward * 20.0 + right * 15.0 - up * 13.0,
+            Kind::Warhead | Kind::GuidedWarhead => forward * 26.0 - up * 10.0,
             _ => forward * 18.0 + right * 11.0 - up * 6.0,
         };
         let speed = art.speed.unwrap_or(match kind {
@@ -142,6 +264,7 @@ impl Shots {
             Kind::Chunk => 2500.0 + variation * 200.0 - 100.0,
             Kind::FlakShell => 1200.0,
             Kind::Razor | Kind::RazorAlt => 1300.0,
+            Kind::Warhead | Kind::GuidedWarhead => 600.0,
         });
         let lift = match kind {
             Kind::Grenade => 210.0,
@@ -161,12 +284,14 @@ impl Shots {
                     Kind::Grenade => 2.5 + variation * 0.5,
                     Kind::Rocket | Kind::FlakShell | Kind::Razor | Kind::RazorAlt => 6.0,
                     Kind::Chunk => 2.9,
+                    Kind::Warhead | Kind::GuidedWarhead => 30.0,
                     _ => 12.0,
                 },
             scale,
             stuck: None,
             next_trail: time,
             wall_hits: 0,
+            seeking: None,
         };
         if let Some((point, normal)) = map.collision.ray_surface(camera.position, offset) {
             shot.position = point + normal * 0.5;
@@ -182,10 +307,24 @@ impl Shots {
         None
     }
 
+    #[cfg(test)]
     pub(super) fn update(
         &mut self,
         map: &Map,
         player: Option<Vec3>,
+        time: f32,
+        dt: f32,
+        sounds: &mut Vec<Arc<Wave>>,
+        blasts: &mut Vec<Blast>,
+    ) {
+        self.update_with_target(map, player, None, time, dt, sounds, blasts);
+    }
+
+    pub(super) fn update_with_target(
+        &mut self,
+        map: &Map,
+        player: Option<Vec3>,
+        mut target: Option<&mut TrainingTarget>,
         time: f32,
         dt: f32,
         sounds: &mut Vec<Arc<Wave>>,
@@ -198,7 +337,9 @@ impl Shots {
             let kind = shot.kind;
             let art = &map.ordnance[kind as usize];
             if time >= shot.expires {
-                if kind == Kind::Grenade || shot.stuck.is_some() {
+                if matches!(kind, Kind::Grenade | Kind::GuidedWarhead | Kind::Warhead)
+                    || shot.stuck.is_some()
+                {
                     blasts.extend(explode(shot, art, &mut self.effects, sounds, time));
                 }
                 return false;
@@ -217,9 +358,24 @@ impl Shots {
                 }
                 return true;
             }
-            if kind == Kind::Rocket {
-                let speed = (shot.velocity.dot(shot.velocity).sqrt() + 50.0 * dt).min(1600.0);
-                shot.velocity = shot.direction * speed;
+            if matches!(kind, Kind::Rocket | Kind::Warhead | Kind::GuidedWarhead) {
+                if let Some((initial, next)) = &mut shot.seeking
+                    && time >= *next
+                {
+                    *next = time + 0.1;
+                    if let Some(target) = target.as_deref().filter(|target| target.health > 0) {
+                        let aim = unit(target.position - shot.position);
+                        if aim.dot(*initial) > 0.0 {
+                            shot.direction = unit(shot.direction + aim * 0.5);
+                        }
+                    }
+                }
+                let acceleration = if shot.seeking.is_some() { 25.0 } else { 50.0 };
+                let speed =
+                    (shot.velocity.dot(shot.velocity).sqrt() + acceleration * dt).min(1600.0);
+                if kind != Kind::GuidedWarhead {
+                    shot.velocity = shot.direction * speed;
+                }
                 if time >= shot.next_trail {
                     shot.next_trail = time + 0.035;
                     self.effects.push(Effect {
@@ -229,6 +385,7 @@ impl Shots {
                         duration: 0.22,
                         scale: 0.5,
                         trail: true,
+                        struck: [false; 2],
                     });
                 }
             } else if matches!(kind, Kind::Grenade | Kind::FlakShell)
@@ -239,7 +396,26 @@ impl Shots {
                     shot.velocity + map.collision.regions.at(shot.position).gravity * dt;
             }
             let delta = shot.velocity * dt;
-            let Some((point, normal)) = map.collision.ray_surface(shot.position, delta) else {
+            let wall = map.collision.ray_surface(shot.position, delta);
+            let visible_delta = wall.map_or(delta, |(point, _)| point - shot.position);
+            if let Some(target) = target.as_deref_mut()
+                && let Some(fraction) = target.ray(shot.position, visible_delta)
+            {
+                shot.position = shot.position + visible_delta * fraction;
+                let blast = explode(shot, art, &mut self.effects, sounds, time);
+                if blast.is_none() {
+                    let damage = match kind {
+                        Kind::Pulse => 20,
+                        Kind::Razor => 30,
+                        Kind::Chunk => 16,
+                        _ => 0,
+                    };
+                    target.damage(art.damage.map_or(damage, |damage| damage as u16));
+                }
+                blasts.extend(blast);
+                return false;
+            }
+            let Some((point, normal)) = wall else {
                 shot.position = shot.position + delta;
                 if shot.velocity.dot(shot.velocity) > 1.0 {
                     shot.direction = unit(shot.velocity);
@@ -304,6 +480,7 @@ impl Shots {
                             stuck: None,
                             next_trail: time,
                             wall_hits: 0,
+                            seeking: None,
                         });
                     }
                     shot.scale = shot.scale.min(1.5);
@@ -331,6 +508,7 @@ impl Shots {
                             stuck: None,
                             next_trail: time,
                             wall_hits: 0,
+                            seeking: None,
                         });
                     }
                 }
@@ -372,12 +550,51 @@ impl Shots {
                     shot.direction,
                     pose,
                     shot.scale,
+                    None,
                 ));
             }
         }
         for effect in &self.effects {
             let art = &assets[effect.kind as usize];
             let age = (time - effect.born) / effect.duration;
+            if effect.kind.warhead() && !effect.trail {
+                let elapsed = time - effect.born;
+                if !art.wavefront.is_empty() {
+                    let pose = Pose {
+                        current: &art.wavefront,
+                        next: &art.wavefront,
+                        fraction: 0.0,
+                    };
+                    draw(Visual::Mesh(
+                        effect.position,
+                        Vec3(1.0, 0.0, 0.0),
+                        pose,
+                        shock_size(elapsed),
+                        Some((1.5 - elapsed).clamp(0.0, 1.0)),
+                    ));
+                }
+                if elapsed < 1.0
+                    && let Some(texture) = &art.explosion
+                {
+                    draw(Visual::Sprite(
+                        effect.position,
+                        texture.image_once(elapsed),
+                        2.8,
+                        1.0,
+                    ));
+                }
+                if (0.5..1.5).contains(&elapsed)
+                    && let Some(texture) = &art.second_explosion
+                {
+                    draw(Visual::Sprite(
+                        effect.position,
+                        texture.image_once(elapsed - 0.5),
+                        3.2,
+                        1.0,
+                    ));
+                }
+                continue;
+            }
             let (texture, glow) = if effect.trail {
                 (&art.trail, 1.0 - age)
             } else {
@@ -414,6 +631,7 @@ fn explode(
         Kind::Rocket | Kind::Grenade => (0.7, 1.4),
         Kind::FlakShell => (0.5, 2.0),
         Kind::RazorAlt => (0.7, 1.0),
+        Kind::Warhead | Kind::GuidedWarhead => (1.5, 2.8),
         _ => (1.0, shot.scale * 1.4),
     };
     effects.push(Effect {
@@ -423,6 +641,7 @@ fn explode(
         duration,
         scale,
         trail: false,
+        struck: [false; 2],
     });
     let (radius, damage, momentum) = match kind {
         Kind::Pulse | Kind::Chunk | Kind::Razor => return None,
@@ -430,6 +649,7 @@ fn explode(
         Kind::Grenade => (200.0, 80.0, 50_000.0),
         Kind::FlakShell => (150.0, 70.0, 75_000.0),
         Kind::RazorAlt => (180.0, 34.0, 87_000.0),
+        Kind::Warhead | Kind::GuidedWarhead => (300.0, 1000.0, 100_000.0),
         Kind::Glob => ((150.0 * shot.scale).min(250.0), 75.0, 30_000.0),
         _ => ((150.0 * shot.scale).min(250.0), 20.0, 20_000.0),
     };
@@ -440,6 +660,11 @@ fn explode(
         art.damage.unwrap_or(damage) * multiplier,
         art.momentum.unwrap_or(momentum) * multiplier,
     ))
+}
+
+fn shock_size(age: f32) -> f32 {
+    let age = age.clamp(0.0, 1.5);
+    13.0 * age + 3.5 / ((1.5 - age) / 1.5 + 0.05)
 }
 
 #[cfg(test)]

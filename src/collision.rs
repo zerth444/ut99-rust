@@ -321,9 +321,15 @@ impl Walker {
         // Pawn.TakeDamage sets an upward component before applying the self-hit factor.
         if self.grounded {
             momentum.2 = momentum.2.max(0.4 * momentum.dot(momentum).sqrt());
-            self.grounded = false;
         }
-        let mut impulse = momentum * (0.6 / profile.mass.max(1.0));
+        self.add_velocity(momentum * (0.6 / profile.mass.max(1.0)));
+    }
+
+    pub fn add_velocity(&mut self, mut impulse: Vec3) {
+        if impulse.dot(impulse) == 0.0 {
+            return;
+        }
+        self.grounded = false;
         if self.velocity.2 > 380.0 && impulse.2 > 0.0 {
             impulse.2 *= 0.5;
         }

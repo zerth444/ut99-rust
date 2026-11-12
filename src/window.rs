@@ -22,7 +22,7 @@ use crate::map::{Map, Vec3};
 use crate::present::Presenter;
 use crate::render::{Camera, Frame};
 
-pub fn show(map: &mut Map, start: usize, title: &str) -> io::Result<()> {
+pub fn show(map: &mut Map, start: usize, title: &str, obs: bool) -> io::Result<()> {
     let class: Vec<u16> = "Ut99RustViewer\0".encode_utf16().collect();
     let title: Vec<u16> = title.encode_utf16().chain([0]).collect();
 
@@ -44,7 +44,7 @@ pub fn show(map: &mut Map, start: usize, title: &str) -> io::Result<()> {
             0,
             class.as_ptr(),
             title.as_ptr(),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             1120,
@@ -57,7 +57,7 @@ pub fn show(map: &mut Map, start: usize, title: &str) -> io::Result<()> {
         if window.is_null() {
             return Err(io::Error::last_os_error());
         }
-        message_loop(window, map, start)
+        message_loop(window, map, start, obs)
     }
 }
 
@@ -74,12 +74,27 @@ unsafe extern "system" fn window_proc(
                 0
             }
             WM_ERASEBKGND => 1,
+            WM_DPICHANGED
+                if GetWindowLongW(window, GWL_STYLE) as u32 & WS_OVERLAPPEDWINDOW != 0 =>
+            {
+                let rect = &*(lparam as *const RECT);
+                SetWindowPos(
+                    window,
+                    null_mut(),
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                0
+            }
             _ => DefWindowProcW(window, message, wparam, lparam),
         }
     }
 }
 
-unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize) -> io::Result<()> {
+unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize, obs: bool) -> io::Result<()> {
     let mut frame = Frame::hardware(map);
     let hud = Hud::new();
     let mut game = Practice::new(map);
@@ -110,6 +125,14 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize) -> io::Res
     let mut show_stats = false;
     let mut stats = FrameStats::new(started);
     let mut windowed = None;
+    let mut pilot_view = None;
+    let mut obs_announced = false;
+    if obs {
+        toggle_borderless(window, &mut windowed);
+    }
+    unsafe {
+        ShowWindow(window, SW_SHOW);
+    }
 
     unsafe {
         loop {
@@ -201,6 +224,9 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize) -> io::Res
                         }
                         key if key == u16::from(b'M') => muted = !muted,
                         VK_F3 => show_stats = !show_stats,
+                        VK_F8 if game.death.is_none() && game.ordnance.guided_view().is_none() => {
+                            game.place_training_target(map, &camera);
+                        }
                         VK_F11 => toggle_borderless(window, &mut windowed),
                         VK_F2 if game.death.is_none() => {
                             fly = !fly;
@@ -222,6 +248,10 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize) -> io::Res
             tick = now;
             let mut movement_audio = MotionEvents::default();
             let focused = GetForegroundWindow() == window;
+            let guiding = game.ordnance.guided_view().is_some();
+            if guiding && pilot_view.is_none() {
+                pilot_view = Some((camera.yaw, camera.pitch));
+            }
             if let Some(death) = &mut game.death {
                 if focused && primary && game.time - death.started >= 1.0 {
                     game.reset_player(&map.arsenal);
@@ -243,7 +273,11 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize) -> io::Res
                 update_view(&mut camera, dt);
                 let movement = camera.forward() * axis(b'W' as u16, b'S' as u16)
                     + camera.right() * axis(b'D' as u16, b'A' as u16);
-                if fly {
+                if guiding {
+                    if !fly {
+                        walker.advance(&map.collision, Vec3::default(), None, dt);
+                    }
+                } else if fly {
                     let movement = movement + Vec3(0.0, 0.0, axis(VK_SPACE, VK_CONTROL));
                     let speed = if key(VK_SHIFT) { 950.0 } else { 340.0 };
                     camera.position = camera.position
@@ -316,6 +350,12 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize) -> io::Res
             );
             primary = false;
             alternate = false;
+            if game.ordnance.guided_view().is_none()
+                && let Some((yaw, pitch)) = pilot_view.take()
+            {
+                camera.yaw = yaw;
+                camera.pitch = pitch;
+            }
             let reaction = if game.health == 0 && game.death.is_none() {
                 game.begin_death(walker.position, camera.yaw, map)
             } else {
@@ -355,12 +395,26 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize) -> io::Res
                 for sound in shots {
                     audio.play(sound);
                 }
-                let weapon_loop = game.pulse_beam.as_ref().and_then(|_| {
+                use crate::game::Weapon;
+                let weapon_loop = if game.ordnance.guided_view().is_some() {
                     map.arsenal
-                        .get(&crate::game::Weapon::Pulse)?
-                        .alternate
-                        .as_ref()
-                });
+                        .get(&Weapon::Redeemer)
+                        .and_then(|weapon| weapon.charge_loop.as_ref())
+                } else if game.hammer_charging() {
+                    map.arsenal
+                        .get(&Weapon::Hammer)
+                        .and_then(|weapon| weapon.charge_loop.as_ref())
+                } else if game.pulse_beam.is_some() {
+                    map.arsenal
+                        .get(&Weapon::Pulse)
+                        .and_then(|weapon| weapon.alternate.as_ref())
+                } else if game.minigun_firing {
+                    map.arsenal
+                        .get(&Weapon::Minigun)
+                        .and_then(|weapon| weapon.fire.as_ref())
+                } else {
+                    None
+                };
                 audio.set_weapon_loop(weapon_loop);
                 audio.update(
                     &map.ambient,
@@ -379,9 +433,11 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize) -> io::Res
                 let size = (client.right as u32, client.bottom as u32);
                 let presenter = match &mut presenter {
                     Some(presenter) => presenter,
-                    slot @ None => slot.insert(Presenter::new(window, size).map_err(|error| {
-                        io::Error::other(format!("Creating the VSync swap chain: {error}"))
-                    })?),
+                    slot @ None => {
+                        slot.insert(Presenter::new(window, size, obs).map_err(|error| {
+                            io::Error::other(format!("Creating the VSync swap chain: {error}"))
+                        })?)
+                    }
                 };
                 frame.width = size.0 as usize;
                 frame.height = size.1 as usize;
@@ -407,6 +463,10 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize) -> io::Res
                 let presented = presenter
                     .draw(size, frame.commands.as_mut().expect("GPU frame"))
                     .map_err(|error| io::Error::other(format!("Presenting the frame: {error}")))?;
+                if obs && !obs_announced {
+                    println!("OBS capture mode: {}x{}", size.0, size.1);
+                    obs_announced = true;
+                }
                 if presented {
                     stats.presented(Instant::now());
                 } else {
@@ -518,7 +578,8 @@ fn toggle_borderless(window: HWND, windowed: &mut Option<WINDOWPLACEMENT>) {
                 return;
             }
             *windowed = Some(placement);
-            SetWindowLongW(window, GWL_STYLE, (WS_POPUP | WS_VISIBLE) as i32);
+            let visibility = GetWindowLongW(window, GWL_STYLE) as u32 & WS_VISIBLE;
+            SetWindowLongW(window, GWL_STYLE, (WS_POPUP | visibility) as i32);
             let area = info.rcMonitor;
             SetWindowPos(
                 window,
