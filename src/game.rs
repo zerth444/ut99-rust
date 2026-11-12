@@ -5,6 +5,7 @@ use crate::map::{Face, Map, Vec3};
 use crate::render::Camera;
 use crate::sound::Wave;
 
+pub mod ballistics;
 pub mod ordnance;
 pub mod shock;
 
@@ -373,6 +374,7 @@ pub struct Practice {
     pub shock: shock::Shots,
     pub pulse_beam: Option<PulseBeam>,
     pub ordnance: ordnance::Shots,
+    pub ballistics: ballistics::Effects,
     pub death: Option<Death>,
     charge: Option<Charge>,
     hit_taken: u16,
@@ -414,6 +416,7 @@ impl Practice {
             shock: shock::Shots::default(),
             pulse_beam: None,
             ordnance: ordnance::Shots::default(),
+            ballistics: ballistics::Effects::default(),
             death: None,
             charge: None,
             hit_taken: 0,
@@ -455,6 +458,7 @@ impl Practice {
         self.shock = shock::Shots::default();
         self.pulse_beam = None;
         self.ordnance = ordnance::Shots::default();
+        self.ballistics = ballistics::Effects::default();
         self.death = None;
         self.charge = None;
         self.hit_taken = 0;
@@ -829,6 +833,8 @@ impl Practice {
         self.time += dt;
         self.effects.retain(|effect| effect.expires > self.time);
         let mut sounds = Vec::new();
+        self.ballistics
+            .update(map, self.target.as_ref(), self.time, dt, &mut sounds);
         for index in 0..map.props.len() {
             let prop = &mut map.props[index];
             if !prop.visible && self.time >= self.respawn[index] {
@@ -1379,17 +1385,24 @@ impl Practice {
             }
             return None;
         }
-        self.trace_bullet(map, camera, weapon, alternate);
+        self.trace_bullet(map, camera, weapon, alternate, sounds);
         None
     }
 
-    fn trace_bullet(&mut self, map: &Map, camera: &Camera, weapon: Weapon, alternate: bool) {
+    fn trace_bullet(
+        &mut self,
+        map: &Map,
+        camera: &Camera,
+        weapon: Weapon,
+        alternate: bool,
+        sounds: &mut Vec<Arc<Wave>>,
+    ) {
         let (cooldown, accuracy, damage, side, height) = match (weapon, alternate) {
-            (Weapon::Enforcer, false) => (0.32, 0.2, 17, 10.0, -4.0),
+            (Weapon::Enforcer, false) => (0.32, 0.2, 17, 3.5, -1.4),
             (Weapon::Enforcer, true) => {
                 let accuracy = self.enforcer_alt_accuracy;
                 self.enforcer_alt_accuracy = (accuracy + 0.5).min(3.0);
-                (0.19, accuracy, 17, 10.0, -4.0)
+                (0.19, accuracy, 17, 3.5, -1.4)
             }
             (Weapon::Minigun, alt) => {
                 let random_damage = 9 + (((self.jitter() + 1.0) * 3.0) as i32).min(5);
@@ -1399,7 +1412,7 @@ impl Practice {
                     (0.13, 0.2, random_damage, 5.0, -4.0)
                 }
             }
-            (Weapon::Sniper, _) => (0.67, 0.0, 45, 5.0, -2.0),
+            (Weapon::Sniper, _) => (0.67, 0.0, 45, 0.0, 0.0),
             _ => return,
         };
         self.next_shot = self.time + cooldown;
@@ -1409,31 +1422,79 @@ impl Practice {
         let start = camera.position + right * side + up * height;
         let delta =
             forward * 10_000.0 + (right * self.jitter() + up * self.jitter()) * (500.0 * accuracy);
-        let wall = map.collision.ray(start, delta);
-        let visible = wall.map_or(delta, |point| point - start);
-        let mut hit = wall;
+        let mut wall = map.collision.ray_surface(start, delta);
+        let mut visible = wall.map_or(delta, |(point, _)| point - start);
         if let Some(target) = &mut self.target
             && let Some(fraction) = target.ray(start, visible)
         {
             let point = start + visible * fraction;
             let headshot = weapon == Weapon::Sniper && point.2 - target.position.2 > 0.62 * 39.0;
             target.damage(if headshot { 100 } else { damage as u16 });
-            hit = Some(point);
+            sounds.extend(map.ballistics.flesh.iter().cloned());
+            visible = point - start;
+            wall = None;
         }
-        let end = hit.unwrap_or(start + delta);
-        self.effects.push(Effect {
-            origin: start + forward * 32.0,
-            end,
-            color: 0xffd294,
-            expires: self.time + 0.055,
-        });
-        if let Some(point) = hit {
-            self.effects.push(Effect {
-                origin: point - forward * 3.0,
-                end: point - forward * 3.0,
-                color: 0xffd294,
-                expires: self.time + 0.14,
-            });
+        if weapon == Weapon::Minigun {
+            self.ballistics.rounds = (self.ballistics.rounds + 1) % 4;
+            if self.ballistics.rounds == 0 && visible.dot(visible) > 250.0_f32.powi(2) {
+                self.ballistics.tracer.push(ballistics::Moving {
+                    position: start + forward * 96.0,
+                    velocity: crate::mover::unit(delta) * 4000.0,
+                    born: self.time,
+                    style: 0,
+                    scale: 1.0,
+                    bounces: 0,
+                });
+            }
+        }
+        if weapon != Weapon::Minigun || self.time - self.ballistics.last_case > 0.125 {
+            let (ahead, side, height) = match weapon {
+                Weapon::Enforcer => (20.0, 3.5, 1.0),
+                Weapon::Minigun => (30.0, 5.0, -5.0),
+                _ => (30.0, 5.0, -1.0),
+            };
+            let offset = forward * ahead + right * side + up * height;
+            if map.collision.ray(camera.position, offset).is_none() {
+                let velocity = (forward * (0.55 + 0.15 * self.jitter())
+                    + right * (0.3 + 0.1 * self.jitter())
+                    + up * (1.15 + 0.15 * self.jitter()))
+                    * 160.0;
+                self.ballistics.cases.push(ballistics::Moving {
+                    position: camera.position + offset,
+                    velocity,
+                    born: self.time,
+                    style: usize::from(weapon == Weapon::Minigun),
+                    scale: if weapon == Weapon::Sniper { 2.0 } else { 1.0 },
+                    bounces: 0,
+                });
+            }
+            if weapon == Weapon::Minigun {
+                self.ballistics.last_case = self.time;
+            }
+        }
+        if let Some((point, normal)) = wall {
+            let sound = (((self.jitter() + 1.0) * 2.0) as usize).min(3);
+            if let Some(sound) = map.ballistics.wall_sounds.get(sound) {
+                sounds.extend(sound.iter().cloned());
+            }
+            let origin = point + normal * if weapon == Weapon::Enforcer { 1.0 } else { 9.0 };
+            let style = (((self.jitter() + 1.0) * 2.0) as usize).min(3);
+            self.ballistics.smoke.push((origin, self.time, style));
+            let count = if weapon == Weapon::Minigun { 2 } else { 3 };
+            let sparks = ((self.jitter() + 1.0) * 0.5 * count as f32) as u8;
+            for _ in 0..sparks {
+                let direction =
+                    crate::mover::unit(Vec3(self.jitter(), self.jitter(), self.jitter()));
+                let velocity = (normal + direction) * (100.0 * (self.jitter() + 1.0));
+                self.ballistics.sparks.push(ballistics::Moving {
+                    position: point + normal * 9.0,
+                    velocity,
+                    born: self.time,
+                    style: 0,
+                    scale: 1.0,
+                    bounces: 0,
+                });
+            }
         }
     }
 
@@ -1495,6 +1556,56 @@ mod tests {
             alternate,
             slot: None,
             cycle: 0,
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the local GOTY game packages"]
+    fn enforcer_and_minigun_use_stock_impact_and_tracer_assets() {
+        let path = std::path::Path::new("local/goty/Maps/DM-Deck16][.unr");
+        let bytes = std::fs::read(path).unwrap();
+        let mut map = Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap();
+        assert!(map.ballistics.tracer.sample(0.0).is_some());
+        assert!(
+            map.ballistics
+                .cases
+                .iter()
+                .all(|motion| motion.sample(0.0).is_some())
+        );
+        assert!(map.ballistics.smoke.iter().all(Option::is_some));
+        assert!(map.ballistics.spark.is_some());
+        assert!(map.ballistics.wall_sounds.iter().all(Option::is_some));
+        let camera = Camera {
+            position: Vec3::default(),
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        for (distance, tracers) in [(200.0, 0), (400.0, 1)] {
+            map.collision =
+                crate::collision::Collision::read(&[], std::iter::empty(), &[]).unwrap();
+            map.collision.add_box(
+                Vec3(distance, -100.0, -100.0),
+                Vec3(distance + 10.0, 100.0, 100.0),
+            );
+            let mut game = Practice::new(&map);
+            let mut sounds = Vec::new();
+            for _ in 0..4 {
+                game.trace_bullet(&map, &camera, Weapon::Enforcer, false, &mut sounds);
+            }
+            assert!(game.ballistics.tracer.is_empty() && game.effects.is_empty());
+            assert_eq!(game.ballistics.smoke.len(), 4);
+            for _ in 0..3 {
+                game.trace_bullet(&map, &camera, Weapon::Minigun, false, &mut sounds);
+                assert!(game.ballistics.tracer.is_empty());
+            }
+            game.trace_bullet(&map, &camera, Weapon::Minigun, false, &mut sounds);
+            assert_eq!(game.ballistics.tracer.len(), tracers);
+            if let Some(shot) = game.ballistics.tracer.first() {
+                assert_eq!(shot.position.0, 96.0);
+                assert!((shot.velocity.dot(shot.velocity).sqrt() - 4000.0).abs() < 0.01);
+                game.ballistics.update(&map, None, 0.1, 0.1, &mut sounds);
+                assert!(game.ballistics.tracer.is_empty());
+            }
         }
     }
 
@@ -1913,7 +2024,8 @@ mod tests {
         let sounds = practice.update(&mut map, &camera, opening, shoot(), false, None);
         assert_eq!(practice.ammo(), Some(29));
         assert_eq!(practice.shots, 1);
-        assert!(!sounds.is_empty() && !practice.effects.is_empty());
+        assert!(!sounds.is_empty() && !practice.ballistics.cases.is_empty());
+        assert!(practice.ballistics.tracer.is_empty() && practice.effects.is_empty());
         assert!(practice.muzzle > practice.time);
         let mut with_flash = crate::render::Frame::new();
         with_flash.draw_practice(&map, &camera, practice.time, &practice);

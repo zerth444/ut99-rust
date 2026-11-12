@@ -232,16 +232,19 @@ impl Frame {
                 self.draw_faces_in_view(pose.current, &model, time, false, Some(pose), None);
             }
         }
+        let mut draw_effect = |visual| match visual {
+            crate::game::ordnance::Visual::Sprite(position, image, scale, glow) => {
+                self.world_sprite(&view, position, image, scale, glow)
+            }
+            crate::game::ordnance::Visual::Mesh(position, direction, pose, scale, glow) => {
+                let model = view.in_model(position, direction, scale);
+                self.draw_faces_in_view(pose.current, &model, time, false, Some(pose), glow);
+            }
+        };
         game.ordnance
-            .visuals(&map.ordnance, game.time, |visual| match visual {
-                crate::game::ordnance::Visual::Sprite(position, image, scale, glow) => {
-                    self.world_sprite(&view, position, image, scale, glow)
-                }
-                crate::game::ordnance::Visual::Mesh(position, direction, pose, scale, glow) => {
-                    let model = view.in_model(position, direction, scale);
-                    self.draw_faces_in_view(pose.current, &model, time, false, Some(pose), glow);
-                }
-            });
+            .visuals(&map.ordnance, game.time, &mut draw_effect);
+        game.ballistics
+            .visuals(&map.ballistics, game.time, &mut draw_effect);
         if let Some(death) = &game.death {
             let motion = &map.player_deaths[death.animation];
             let age = (game.time - death.started).min((motion.duration() - 0.001).max(0.0));

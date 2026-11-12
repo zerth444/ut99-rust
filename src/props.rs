@@ -356,6 +356,7 @@ pub struct Scene {
     pub player_deaths: [Motion; 3],
     pub player_idle: Motion,
     pub ordnance: ordnance::Arsenal,
+    pub ballistics: crate::game::ballistics::Art,
 }
 
 pub fn load(map: &Package<'_>, actors: &[&Export], path: &Path) -> io::Result<Scene> {
@@ -686,6 +687,7 @@ pub fn load(map: &Package<'_>, actors: &[&Export], path: &Path) -> io::Result<Sc
             kind,
         )
     });
+    let ballistics = read_ballistics(&mut assets, &mut class_cache, &mut textures, &mut waves);
     Ok(Scene {
         props,
         arsenal,
@@ -695,7 +697,50 @@ pub fn load(map: &Package<'_>, actors: &[&Export], path: &Path) -> io::Result<Sc
         player_deaths,
         player_idle,
         ordnance,
+        ballistics,
     })
+}
+
+fn read_ballistics(
+    assets: &mut Assets<'_>,
+    classes: &mut HashMap<Object, Appearance>,
+    textures: &mut HashMap<Object, Option<Arc<Texture>>>,
+    waves: &mut HashMap<Object, Option<Arc<Wave>>>,
+) -> crate::game::ballistics::Art {
+    let [tracer, pistol_case, mini_case] =
+        ["MTracer", "UT_ShellCase", "MiniShellCase"].map(|name| {
+            let class = find_export(assets, "botpack", name, "Class");
+            let visual = appearance(assets, classes, class);
+            let Some(object) = visual.mesh else {
+                return Motion::default();
+            };
+            let (package, export) = assets.object(object);
+            let Ok(mesh) = Mesh::read(package, export) else {
+                return Motion::default();
+            };
+            effect_motion(assets, textures, object, visual, &mesh, &["All"])
+        });
+    let mut texture = |name| {
+        find_export(assets, "botpack", name, "Texture")
+            .and_then(|object| cached_texture(assets, textures, object))
+    };
+    let smoke = ["us1_a00", "us2_a00", "us3_a00", "us8_a00"].map(&mut texture);
+    let spark = texture("Sparky");
+    let mut sound = |name| {
+        let object = ["botpack", "unrealshare", "unreali"]
+            .into_iter()
+            .find_map(|package| find_export(assets, package, name, "Sound"));
+        cached_wave(assets, waves, object)
+    };
+    crate::game::ballistics::Art {
+        tracer,
+        cases: [pistol_case, mini_case],
+        smoke,
+        spark,
+        wall_sounds: ["ricochet", "Impact1", "Impact2"].map(&mut sound),
+        flesh: sound("ChunkHit"),
+        shell: sound("shell2"),
+    }
 }
 
 fn player_models(

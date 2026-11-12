@@ -84,6 +84,7 @@ pub struct Map {
     pub player_deaths: [crate::game::Motion; 3],
     pub player_idle: crate::game::Motion,
     pub ordnance: crate::game::ordnance::Arsenal,
+    pub ballistics: crate::game::ballistics::Art,
     pub teleporters: Vec<crate::teleport::Teleporter>,
 }
 
@@ -122,6 +123,7 @@ impl Map {
             player_deaths,
             player_idle,
             ordnance,
+            ballistics,
         } = path
             .map(|path| crate::props::load(package, &actors, path))
             .transpose()?
@@ -168,6 +170,7 @@ impl Map {
             player_deaths,
             player_idle,
             ordnance,
+            ballistics,
             teleporters,
         })
     }
