@@ -60,7 +60,7 @@ impl Hud {
             );
         }
         if game.scoped() {
-            let magnification = 90.0 / game.field_of_view();
+            let magnification = game.base_fov / game.field_of_view();
             self.text(
                 frame,
                 width / 2 + width / 10,
@@ -121,7 +121,15 @@ impl Hud {
         );
     }
 
-    fn text(&self, frame: &mut Frame, x: i32, y: i32, scale: f32, text: &str, color: [f32; 3]) {
+    pub(crate) fn text(
+        &self,
+        frame: &mut Frame,
+        x: i32,
+        y: i32,
+        scale: f32,
+        text: &str,
+        color: [f32; 3],
+    ) {
         let Some(glyphs) = &self.glyphs else {
             return;
         };

@@ -30,11 +30,11 @@ impl Art {
     ) {
         let width = frame.width as f32;
         let height = frame.height as f32;
-        let scale = width / 1280.0;
+        let scale = game.hud_scale * width / 1280.0;
         if let (Some(elements), Some(weapons)) = (&self.elements, &self.weapons) {
             self.status(frame, game, elements.image(0.0), width, scale);
-            let bar_fraction = if width < 400.0 { 1.0 } else { 0.8 };
-            let weapon_scale = bar_fraction * scale;
+            let bar_fraction = (game.hud_scale * if width < 400.0 { 1.0 } else { 0.8 }).min(1.0);
+            let weapon_scale = bar_fraction * width / 1280.0;
             let row_width = bar_fraction * width;
             let ammo_y = height
                 - if row_width <= width - 255.0 * scale {

@@ -349,6 +349,13 @@ pub struct Prop {
     pub visible: bool,
     pub pickup_sound: Option<Arc<Wave>>,
     pub respawn_time: Option<f32>,
+    pub cinematic: Option<CinematicMotion>,
+}
+
+pub struct CinematicMotion {
+    pub event: usize,
+    pub animation: Motion,
+    pub started: Option<f32>,
 }
 
 #[derive(Default)]
@@ -442,17 +449,20 @@ pub fn load(
             Mesh::read(package, export).ok()
         });
         let Some(mesh) = mesh else { continue };
-        let vertices: Vec<_> = mesh
-            .frame(0)
-            .unwrap_or_default()
-            .iter()
-            .map(|&point| {
-                rotate(
-                    rotate(product(point - mesh.origin, mesh.scale), mesh.rotation) * visual.scale,
-                    placement.rotation,
-                ) + placement.location
-            })
-            .collect();
+        let placed_frame = |index| -> Vec<Vec3> {
+            mesh.frame(index)
+                .unwrap_or_default()
+                .iter()
+                .map(|&point| {
+                    rotate(
+                        rotate(product(point - mesh.origin, mesh.scale), mesh.rotation)
+                            * visual.scale,
+                        placement.rotation,
+                    ) + placement.location
+                })
+                .collect()
+        };
+        let vertices = placed_frame(0);
         let radius = vertices
             .iter()
             .map(|&point| {
@@ -463,6 +473,40 @@ pub fn load(
             .sqrt();
         let faces = mesh_faces(&mut assets, &mut textures, object, visual, mesh, &vertices);
         if !faces.is_empty() {
+            let clip = match map.object_name(actor.class) {
+                Some("IntroDude") => mesh.sequence(&["Shake"]).map(|clip| (clip, 1.0)),
+                Some("IntroBoss") => mesh.sequence(&["Wave"]).map(|clip| (clip, 0.5)),
+                _ => None,
+            };
+            let cinematic = clip.and_then(|(clip, rate)| {
+                let mut props = map.properties(actor).ok()?;
+                let mut tag = None;
+                while let Some((name, mut value)) = props.next().ok()? {
+                    if name == "Tag" {
+                        tag = value.index().ok();
+                        break;
+                    }
+                }
+                Some(CinematicMotion {
+                    event: tag?,
+                    started: None,
+                    animation: Motion {
+                        rate: clip.rate * rate,
+                        frames: (clip.start..clip.end)
+                            .map(|index| {
+                                mesh_faces(
+                                    &mut assets,
+                                    &mut textures,
+                                    object,
+                                    visual,
+                                    mesh,
+                                    &placed_frame(index),
+                                )
+                            })
+                            .collect(),
+                    },
+                })
+            });
             props.push(Prop {
                 faces,
                 position: placement.location,
@@ -474,6 +518,7 @@ pub fn load(
                     _ => item,
                 }),
                 respawn_time: visual.respawn_time.filter(|value| *value > 0.0),
+                cinematic,
                 visible: true,
                 pickup_sound: cached_wave(&assets, &mut waves, visual.pickup_sound).or_else(|| {
                     cached_wave(

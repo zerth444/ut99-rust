@@ -277,6 +277,8 @@ pub mod device {
         mixer: Mixer,
         music: Option<crate::music::player::Music>,
         music_samples: [i16; SAMPLES],
+        effects_gain: f32,
+        music_gain: f32,
     }
 
     impl Audio {
@@ -300,6 +302,8 @@ pub mod device {
                 mixer: Mixer::new(),
                 music: track.and_then(crate::music::player::Music::open),
                 music_samples: [0; SAMPLES],
+                effects_gain: 1.0,
+                music_gain: 1.0,
             };
             for _ in 0..3 {
                 let mut samples = Box::new([0; SAMPLES]);
@@ -323,6 +327,20 @@ pub mod device {
 
         pub fn music_playing(&self) -> bool {
             self.music.is_some()
+        }
+
+        pub fn set_volume(&mut self, effects: u32, music: u32) {
+            self.effects_gain = effects as f32 / 100.0;
+            self.music_gain = music as f32 / 100.0;
+        }
+
+        pub fn set_track(&mut self, track: Option<&crate::music::Track>) {
+            unsafe { waveOutReset(self.device) };
+            for buffer in &mut self.buffers {
+                buffer.queued = false;
+            }
+            self.mixer = Mixer::new();
+            self.music = track.and_then(crate::music::player::Music::open);
         }
 
         pub fn play(&mut self, wave: Arc<Wave>) {
@@ -358,6 +376,11 @@ pub mod device {
                 if !buffer.queued || flags & WHDR_DONE != 0 {
                     self.mixer
                         .fill(&mut *buffer.samples, emitters, listener, right, muted);
+                    if self.effects_gain != 1.0 {
+                        for sample in &mut *buffer.samples {
+                            *sample = (f32::from(*sample) * self.effects_gain) as i16;
+                        }
+                    }
                     if !muted
                         && !music_muted
                         && let Some(music) = &mut self.music
@@ -366,7 +389,8 @@ pub mod device {
                         for (output, &music) in
                             buffer.samples.iter_mut().zip(&self.music_samples[..count])
                         {
-                            *output = output.saturating_add((f32::from(music) * 0.25) as i16);
+                            *output = output
+                                .saturating_add((f32::from(music) * 0.25 * self.music_gain) as i16);
                         }
                     }
                     buffer.queued = unsafe { waveOutWrite(self.device, header, HEADER_SIZE) } == 0;

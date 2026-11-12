@@ -1,4 +1,5 @@
 use std::io;
+use std::path::Path;
 use std::ptr::null_mut;
 use std::time::{Duration, Instant};
 
@@ -16,13 +17,29 @@ use windows_sys::Win32::UI::Input::{
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::collision::{MotionEvents, Walker};
+use crate::frontend::{Action, Frontend, Menu};
 use crate::game::{Input, Practice};
 use crate::hud::Hud;
 use crate::map::{Map, Vec3};
 use crate::present::Presenter;
 use crate::render::{Camera, Frame};
+use crate::settings::{RESOLUTIONS, Settings};
+use crate::sound::device::Audio;
 
-pub fn show(map: &mut Map, start: usize, title: &str, obs: bool) -> io::Result<()> {
+pub fn show(
+    map: &mut Map,
+    start: usize,
+    title: &str,
+    obs: bool,
+    path: &Path,
+    startup: bool,
+) -> io::Result<()> {
+    let settings_path = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("../UT99-Rust.ini");
+    let mut settings = Settings::load(&settings_path)?;
+    let mut frontend = startup.then(|| Frontend::load(path, settings.intro));
     let class: Vec<u16> = "Ut99RustViewer\0".encode_utf16().collect();
     let title: Vec<u16> = title.encode_utf16().chain([0]).collect();
 
@@ -57,7 +74,15 @@ pub fn show(map: &mut Map, start: usize, title: &str, obs: bool) -> io::Result<(
         if window.is_null() {
             return Err(io::Error::last_os_error());
         }
-        message_loop(window, map, start, obs)
+        message_loop(
+            window,
+            map,
+            start,
+            obs,
+            frontend.as_mut(),
+            &mut settings,
+            &settings_path,
+        )
     }
 }
 
@@ -94,7 +119,15 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize, obs: bool) -> io::Result<()> {
+unsafe fn message_loop(
+    window: HWND,
+    map: &mut Map,
+    mut start: usize,
+    obs: bool,
+    mut frontend: Option<&mut Frontend>,
+    settings: &mut Settings,
+    settings_path: &Path,
+) -> io::Result<()> {
     let mut frame = Frame::hardware(map);
     let hud = Hud::new();
     let mut game = Practice::new(map);
@@ -108,7 +141,11 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize, obs: bool)
     let mut walker = Walker::spawn(&map.collision, map.starts[start].position);
     let mut fly = false;
     let mut muted = false;
-    let mut audio = crate::sound::device::Audio::open(map.music.as_ref());
+    let mut audio = Audio::open(if frontend.is_some() {
+        None
+    } else {
+        map.music.as_ref()
+    });
     let mut jump = false;
     let mut occupied_portal = None;
     let mut last_direction = None;
@@ -119,20 +156,43 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize, obs: bool)
         .map(|start| start.position.2)
         .fold(f32::INFINITY, f32::min)
         - 4096.0;
-    let started = Instant::now();
-    let mut tick = started;
     let mut presenter = None;
-    let mut show_stats = false;
-    let mut stats = FrameStats::new(started);
     let mut windowed = None;
     let mut pilot_view = None;
     let mut obs_announced = false;
-    if obs {
+    set_window_size(window, settings.resolution);
+    if obs || settings.fullscreen {
         toggle_borderless(window, &mut windowed);
     }
     unsafe {
         ShowWindow(window, SW_SHOW);
     }
+    if let Some(frontend) = frontend.as_deref_mut() {
+        if !run_frontend(
+            window,
+            map,
+            frontend,
+            &hud,
+            &mut presenter,
+            &mut audio,
+            settings,
+            settings_path,
+            &mut windowed,
+            obs,
+            false,
+        )? {
+            return Ok(());
+        }
+        if let Some(audio) = &mut audio {
+            audio.set_track(map.music.as_ref());
+        }
+        if unsafe { GetForegroundWindow() == window } {
+            mouse.capture();
+        }
+    }
+    let started = Instant::now();
+    let mut tick = started;
+    let mut stats = FrameStats::new(started);
 
     unsafe {
         loop {
@@ -143,6 +203,7 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize, obs: bool)
                     return Ok(());
                 }
                 if message.hwnd == window {
+                    let can_fire = mouse.captured || game.death.is_some();
                     match message.message {
                         WM_KILLFOCUS => mouse.release(),
                         WM_SIZE if message.wParam == SIZE_MINIMIZED as usize => mouse.release(),
@@ -153,14 +214,9 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize, obs: bool)
                                 raw.1 = raw.1.saturating_add(y);
                             }
                         }
-                        WM_LBUTTONDOWN => {
-                            if mouse.captured || game.death.is_some() {
-                                primary = true;
-                            } else {
-                                mouse.capture();
-                            }
+                        WM_LBUTTONDOWN if !mouse.captured && game.death.is_none() => {
+                            mouse.capture()
                         }
-                        WM_RBUTTONDOWN if mouse.captured => alternate = true,
                         WM_MOUSEWHEEL if mouse.captured => {
                             cycle = if (message.wParam >> 16) as i16 > 0 {
                                 -1
@@ -170,12 +226,48 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize, obs: bool)
                         }
                         _ => {}
                     }
+                    if can_fire && let Some(key) = mouse_button(&message, false) {
+                        primary |= key == settings.bindings[6];
+                        alternate |= key == settings.bindings[7];
+                    }
                 }
                 if message.hwnd == window
                     && message.message == WM_KEYDOWN
                     && message.lParam & (1 << 30) == 0
                 {
-                    match message.wParam as u16 {
+                    let key = message.wParam as u16;
+                    primary |= key == settings.bindings[6];
+                    alternate |= key == settings.bindings[7];
+                    match key {
+                        VK_ESCAPE if let Some(frontend) = frontend.as_deref_mut() => {
+                            mouse.release();
+                            if !run_frontend(
+                                window,
+                                map,
+                                frontend,
+                                &hud,
+                                &mut presenter,
+                                &mut audio,
+                                settings,
+                                settings_path,
+                                &mut windowed,
+                                obs,
+                                true,
+                            )? {
+                                return Ok(());
+                            }
+                            frame = Frame::hardware(map);
+                            tick = Instant::now();
+                            stats = FrameStats::new(tick);
+                            primary = false;
+                            alternate = false;
+                            jump = false;
+                            dodge = None;
+                            raw = (0, 0);
+                            if GetForegroundWindow() == window {
+                                mouse.capture();
+                            }
+                        }
                         VK_ESCAPE if mouse.captured => mouse.release(),
                         VK_ESCAPE => {
                             DestroyWindow(window);
@@ -187,21 +279,14 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize, obs: bool)
                             camera = Camera::from_start(map.starts[start]);
                             walker = Walker::spawn(&map.collision, map.starts[start].position);
                         }
-                        key if key == u16::from(b'R') => {
+                        key if key == u16::from(b'R') && !settings.bindings.contains(&key) => {
                             game.reset_player(&map.arsenal);
                             occupied_portal = None;
                             camera = Camera::from_start(map.starts[start]);
                             walker = Walker::spawn(&map.collision, map.starts[start].position);
                         }
-                        VK_SPACE => jump = true,
-                        key if [
-                            u16::from(b'W'),
-                            u16::from(b'S'),
-                            u16::from(b'A'),
-                            u16::from(b'D'),
-                        ]
-                        .contains(&key) =>
-                        {
+                        key if key == settings.bindings[4] => jump = true,
+                        key if settings.bindings[..4].contains(&key) => {
                             let pressed = Instant::now();
                             if last_direction.is_some_and(|(previous, time)| {
                                 key == previous
@@ -217,17 +302,30 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize, obs: bool)
                         VK_RIGHT => camera.yaw += 0.06,
                         VK_UP => camera.pitch += 0.05,
                         VK_DOWN => camera.pitch -= 0.05,
-                        key if key == u16::from(b'F') => primary = true,
-                        key if key == u16::from(b'N') => music_muted = !music_muted,
+                        key if key == u16::from(b'F') && !settings.bindings.contains(&key) => {
+                            primary = true
+                        }
+                        key if key == u16::from(b'N') && !settings.bindings.contains(&key) => {
+                            music_muted = !music_muted
+                        }
                         key if (u16::from(b'0')..=u16::from(b'9')).contains(&key) => {
                             slot = Some((key - u16::from(b'0')) as u8)
                         }
-                        key if key == u16::from(b'M') => muted = !muted,
-                        VK_F3 => show_stats = !show_stats,
+                        key if key == u16::from(b'M') && !settings.bindings.contains(&key) => {
+                            muted = !muted
+                        }
+                        VK_F3 => {
+                            settings.show_fps = !settings.show_fps;
+                            save_settings(settings, settings_path);
+                        }
                         VK_F8 if game.death.is_none() && game.ordnance.guided_view().is_none() => {
                             game.place_training_target(map, &camera);
                         }
-                        VK_F11 => toggle_borderless(window, &mut windowed),
+                        VK_F11 => {
+                            toggle_borderless(window, &mut windowed);
+                            settings.fullscreen = windowed.is_some();
+                            save_settings(settings, settings_path);
+                        }
                         VK_F2 if game.death.is_none() => {
                             fly = !fly;
                             if !fly {
@@ -246,6 +344,9 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize, obs: bool)
             let now = Instant::now();
             let dt = (now - tick).as_secs_f32().min(0.06);
             tick = now;
+            game.base_fov = settings.field_of_view as f32;
+            game.hud_scale = settings.hud_scale as f32 / 100.0;
+            let [forward, back, left, right, jump_key, walk, fire, alt_fire] = settings.bindings;
             let mut movement_audio = MotionEvents::default();
             let focused = GetForegroundWindow() == window;
             let guiding = game.ordnance.guided_view().is_some();
@@ -266,43 +367,46 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize, obs: bool)
             } else if focused {
                 if mouse.captured {
                     let (x, y) = mouse.motion(raw);
-                    let sensitivity = 0.0027 * game.field_of_view() / 90.0;
+                    let sensitivity =
+                        0.0027 * (settings.sensitivity as f32 / 100.0) * game.field_of_view()
+                            / 90.0;
                     camera.yaw += x as f32 * sensitivity;
-                    camera.pitch -= y as f32 * sensitivity;
+                    camera.pitch +=
+                        y as f32 * sensitivity * if settings.invert_mouse { 1.0 } else { -1.0 };
                 }
                 update_view(&mut camera, dt);
-                let movement = camera.forward() * axis(b'W' as u16, b'S' as u16)
-                    + camera.right() * axis(b'D' as u16, b'A' as u16);
+                let movement =
+                    camera.forward() * axis(forward, back) + camera.right() * axis(right, left);
                 if guiding {
                     if !fly {
                         walker.advance(&map.collision, Vec3::default(), None, dt);
                     }
                 } else if fly {
-                    let movement = movement + Vec3(0.0, 0.0, axis(VK_SPACE, VK_CONTROL));
-                    let speed = if key(VK_SHIFT) { 950.0 } else { 340.0 };
+                    let movement = movement + Vec3(0.0, 0.0, axis(jump_key, VK_CONTROL));
+                    let speed = if key(walk) { 950.0 } else { 340.0 };
                     camera.position = camera.position
                         + movement * (speed * dt / movement.dot(movement).sqrt().max(1.0));
                 } else {
                     let speed =
-                        map.collision.profile.ground_speed * if key(VK_SHIFT) { 0.3 } else { 1.0 };
+                        map.collision.profile.ground_speed * if key(walk) { 0.3 } else { 1.0 };
                     for mover in &mut map.movers {
                         mover.tick(&mut map.collision, &mut walker, dt);
                     }
                     let dodged = dodge.take().is_some_and(|direction_key| {
-                        if key(VK_SHIFT) {
+                        if key(walk) {
                             return false;
                         }
-                        let direction = match direction_key as u8 {
-                            b'W' => camera.forward(),
-                            b'S' => camera.forward() * -1.0,
-                            b'A' => camera.right() * -1.0,
+                        let direction = match direction_key {
+                            key if key == forward => camera.forward(),
+                            key if key == back => camera.forward() * -1.0,
+                            key if key == left => camera.right() * -1.0,
                             _ => camera.right(),
                         };
                         walker.dodge(map.collision.profile, direction)
                     });
-                    let swim = camera.look_direction() * axis(b'W' as u16, b'S' as u16)
-                        + camera.right() * (0.5 * axis(b'D' as u16, b'A' as u16))
-                        + Vec3(0.0, 0.0, f32::from(key(VK_SPACE) || key(VK_CONTROL)) * 0.5);
+                    let swim = camera.look_direction() * axis(forward, back)
+                        + camera.right() * (0.5 * axis(right, left))
+                        + Vec3(0.0, 0.0, f32::from(key(jump_key) || key(VK_CONTROL)) * 0.5);
                     movement_audio = walker.advance_with_swim(
                         &map.collision,
                         movement * (speed / movement.dot(movement).sqrt().max(1.0)),
@@ -344,8 +448,9 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize, obs: bool)
                 &camera,
                 dt,
                 Input {
-                    primary: focused && (primary || (mouse.captured && key(VK_LBUTTON))),
-                    alternate: focused && (alternate || (mouse.captured && key(VK_RBUTTON))),
+                    primary: focused && (primary || ((mouse.captured || fire > 6) && key(fire))),
+                    alternate: focused
+                        && (alternate || ((mouse.captured || alt_fire > 6) && key(alt_fire))),
                     slot: slot.take(),
                     cycle: std::mem::take(&mut cycle),
                 },
@@ -366,6 +471,7 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize, obs: bool)
                 game.pain_sound(map)
             };
             if let Some(audio) = &mut audio {
+                audio.set_volume(settings.effects_volume, settings.music_volume);
                 if let Some(sound) = reaction {
                     audio.play(sound);
                 }
@@ -459,7 +565,9 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize, obs: bool)
                             && audio.as_ref().is_some_and(|audio| audio.music_playing())
                     })
                     .map(|track| track.name.as_str());
-                let label = show_stats.then(|| stats.label(window, size, presenter.software));
+                let label = settings
+                    .show_fps
+                    .then(|| stats.label(window, size, presenter.software));
                 hud.draw(
                     &mut frame,
                     &game,
@@ -469,7 +577,11 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize, obs: bool)
                     label.as_deref(),
                 );
                 let presented = presenter
-                    .draw(size, frame.commands.as_mut().expect("GPU frame"))
+                    .draw(
+                        size,
+                        frame.commands.as_mut().expect("GPU frame"),
+                        settings.vsync,
+                    )
                     .map_err(|error| io::Error::other(format!("Presenting the frame: {error}")))?;
                 if obs && !obs_announced {
                     println!("OBS capture mode: {}x{}", size.0, size.1);
@@ -484,6 +596,256 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize, obs: bool)
                 // Keep pumping audio and messages while there is no visible frame to present.
                 std::thread::sleep(Duration::from_millis(10));
             }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_frontend(
+    window: HWND,
+    game_map: &Map,
+    frontend: &mut Frontend,
+    hud: &Hud,
+    presenter: &mut Option<Presenter>,
+    audio: &mut Option<Audio>,
+    settings: &mut Settings,
+    settings_path: &Path,
+    windowed: &mut Option<WINDOWPLACEMENT>,
+    obs: bool,
+    resume: bool,
+) -> io::Result<bool> {
+    let mut intro = (!resume && settings.intro)
+        .then(|| frontend.intro.take())
+        .flatten();
+    let mut menu = Menu::default();
+    menu.resume = resume;
+    let logo = frontend.logo.as_ref().map(|(map, _)| map);
+    let mut frame = Frame::hardware(
+        intro
+            .as_ref()
+            .map(|intro| &intro.map)
+            .or(logo)
+            .unwrap_or(game_map),
+    );
+    let mut tick = Instant::now();
+    let mut time = 0.0;
+    if let Some(audio) = audio {
+        audio.set_weapon_loop(None);
+        if !resume {
+            audio.set_track(
+                intro
+                    .as_ref()
+                    .map(|intro| &intro.map)
+                    .or(logo)
+                    .and_then(|map| map.music.as_ref()),
+            );
+        }
+    }
+    unsafe {
+        loop {
+            let now = Instant::now();
+            let dt = (now - tick).as_secs_f32().min(0.06);
+            tick = now;
+            time += dt;
+            let mut client = RECT::default();
+            GetClientRect(window, &mut client);
+            let size = [client.right, client.bottom];
+            let mut message = MSG::default();
+            let mut skip = false;
+            while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                if message.message == WM_QUIT {
+                    return Ok(false);
+                }
+                if message.hwnd == window {
+                    let key = (message.message == WM_KEYDOWN && message.lParam & (1 << 30) == 0)
+                        .then_some(message.wParam as u16);
+                    let button = mouse_button(&message, true);
+                    let previous_display = (settings.fullscreen, settings.resolution);
+                    let action = if intro.is_some() {
+                        skip |= matches!(key, Some(VK_ESCAPE | VK_SPACE | VK_RETURN))
+                            || button == Some(VK_LBUTTON);
+                        Action::None
+                    } else if let Some(key) = key {
+                        if key == VK_F11 {
+                            settings.fullscreen = windowed.is_none();
+                            Action::Changed
+                        } else {
+                            menu.key(key, settings)
+                        }
+                    } else if let Some(button) = button {
+                        let x = message.lParam as i16 as i32;
+                        let y = (message.lParam >> 16) as i16 as i32;
+                        menu.click(size, x, y, button, settings)
+                    } else {
+                        Action::None
+                    };
+                    match action {
+                        Action::Play => return Ok(true),
+                        Action::Quit => {
+                            DestroyWindow(window);
+                            return Ok(false);
+                        }
+                        Action::Changed => {
+                            if previous_display.0 != settings.fullscreen
+                                && windowed.is_some() != settings.fullscreen
+                            {
+                                toggle_borderless(window, windowed);
+                            }
+                            if !settings.fullscreen
+                                && previous_display != (settings.fullscreen, settings.resolution)
+                            {
+                                set_window_size(window, settings.resolution);
+                            }
+                            if let Err(error) = settings.save(settings_path) {
+                                eprintln!("{}: {error}", settings_path.display());
+                                menu.status = "COULD NOT SAVE SETTINGS".into();
+                            }
+                            if let Some(audio) = audio {
+                                frontend.play_menu_sound(audio);
+                            }
+                        }
+                        Action::None => {}
+                    }
+                }
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            let intro_frame = intro
+                .as_mut()
+                .filter(|_| !skip)
+                .and_then(|intro| intro.update(dt));
+            if intro.is_some() && intro_frame.is_none() {
+                intro = None;
+                time = 0.0;
+                frame = Frame::hardware(logo.unwrap_or(game_map));
+                if let Some(audio) = audio {
+                    audio.set_track(logo.and_then(|map| map.music.as_ref()));
+                }
+            }
+            let active = GetForegroundWindow() == window;
+            if let Some(audio) = audio {
+                audio.set_volume(settings.effects_volume, settings.music_volume);
+                if let (Some(intro), Some((shot, voices))) = (&intro, &intro_frame) {
+                    for voice in voices {
+                        audio.play(voice.clone());
+                    }
+                    audio.update(
+                        &intro.map.ambient,
+                        shot.camera.position,
+                        shot.camera.right(),
+                        !active,
+                        false,
+                    );
+                } else {
+                    audio.update(&[], Vec3::default(), Vec3(0.0, 1.0, 0.0), !active, false);
+                }
+            }
+            if IsIconic(window) != 0 || size[0] <= 0 || size[1] <= 0 {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            frame.width = size[0] as usize;
+            frame.height = size[1] as usize;
+            if let (Some(intro), Some((shot, _))) = (&intro, &intro_frame) {
+                frame.draw_cinematic(
+                    &intro.map,
+                    &shot.camera,
+                    intro.time,
+                    shot.fov,
+                    shot.roll,
+                    shot.flash,
+                );
+                if intro.time < 6.0 {
+                    hud.text(
+                        &mut frame,
+                        12,
+                        size[1] - 30,
+                        0.85,
+                        "ESC TO SKIP",
+                        [0.8, 0.8, 0.8],
+                    );
+                }
+            } else {
+                if !frontend.has_desktop()
+                    && let Some((logo, camera)) = &frontend.logo
+                {
+                    frame.draw_cinematic(logo, camera, time, 90.0, 0.0, 1.0);
+                } else {
+                    frame.begin_ui(true);
+                }
+                menu.draw(frontend, &mut frame, hud, settings);
+            }
+            let size = (size[0] as u32, size[1] as u32);
+            let presenter = match &mut *presenter {
+                Some(presenter) => presenter,
+                slot @ None => {
+                    slot.insert(Presenter::new(window, size, obs).map_err(io::Error::other)?)
+                }
+            };
+            if !presenter
+                .draw(
+                    size,
+                    frame.commands.as_mut().expect("GPU frame"),
+                    settings.vsync,
+                )
+                .map_err(io::Error::other)?
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+fn save_settings(settings: &Settings, path: &Path) {
+    if let Err(error) = settings.save(path) {
+        eprintln!("{}: {error}", path.display());
+    }
+}
+
+fn mouse_button(message: &MSG, release: bool) -> Option<u16> {
+    match (message.message, release) {
+        (WM_LBUTTONDOWN, false) | (WM_LBUTTONUP, true) => Some(VK_LBUTTON),
+        (WM_RBUTTONDOWN, false) | (WM_RBUTTONUP, true) => Some(VK_RBUTTON),
+        (WM_MBUTTONDOWN, false) | (WM_MBUTTONUP, true) => Some(VK_MBUTTON),
+        (WM_XBUTTONDOWN, false) | (WM_XBUTTONUP, true) => Some(if message.wParam >> 16 == 1 {
+            VK_XBUTTON1
+        } else {
+            VK_XBUTTON2
+        }),
+        _ => None,
+    }
+}
+
+fn set_window_size(window: HWND, resolution: usize) {
+    let (width, height) = RESOLUTIONS[resolution];
+    unsafe {
+        let mut frame = RECT {
+            right: width as i32,
+            bottom: height as i32,
+            ..Default::default()
+        };
+        AdjustWindowRectEx(&mut frame, WS_OVERLAPPEDWINDOW, 0, 0);
+        let mut monitor = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(
+            MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST),
+            &mut monitor,
+        ) != 0
+        {
+            let area = monitor.rcWork;
+            let w = (frame.right - frame.left).min(area.right - area.left);
+            let h = (frame.bottom - frame.top).min(area.bottom - area.top);
+            SetWindowPos(
+                window,
+                null_mut(),
+                (area.right + area.left - w) / 2,
+                (area.bottom + area.top - h) / 2,
+                w,
+                h,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
         }
     }
 }

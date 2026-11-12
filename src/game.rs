@@ -392,6 +392,8 @@ impl SniperZoom {
 
 pub struct Practice {
     pub health: u16,
+    pub base_fov: f32,
+    pub hud_scale: f32,
     pub score: i16,
     pub pickup_time: f32,
     armor: [u16; 3],
@@ -445,6 +447,8 @@ impl Practice {
     pub fn new(map: &Map) -> Self {
         let mut game = Self {
             health: 100,
+            base_fov: 90.0,
+            hud_scale: 1.0,
             score: 0,
             pickup_time: -1.0,
             armor: [0; 3],
@@ -676,7 +680,7 @@ impl Practice {
     }
 
     pub fn field_of_view(&self) -> f32 {
-        90.0 - self.zoom.level * 88.0
+        self.base_fov - self.zoom.level * (self.base_fov - 2.0)
     }
 
     pub fn scoped(&self) -> bool {

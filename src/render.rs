@@ -107,6 +107,7 @@ pub struct Frame {
     pub height: usize,
     pub commands: Option<DrawList>,
     zoom: f32,
+    roll: f32,
 }
 
 impl Frame {
@@ -119,6 +120,7 @@ impl Frame {
             height: HEIGHT,
             commands: None,
             zoom: 1.0,
+            roll: 0.0,
         }
     }
 
@@ -131,12 +133,59 @@ impl Frame {
             height: HEIGHT,
             commands: Some(DrawList::new(map)),
             zoom: 1.0,
+            roll: 0.0,
         }
     }
 
     fn layer(&mut self, layer: Layer) {
         if let Some(commands) = &mut self.commands {
             commands.layer = layer;
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn begin_ui(&mut self, clear: bool) {
+        if clear && let Some(commands) = &mut self.commands {
+            commands.clear();
+        }
+        self.layer(Layer::Hud);
+    }
+
+    #[cfg(windows)]
+    pub fn draw_cinematic(
+        &mut self,
+        map: &Map,
+        camera: &Camera,
+        time: f32,
+        fov: f32,
+        roll: f32,
+        flash: f32,
+    ) {
+        self.zoom = (0.5 * fov.clamp(20.0, 150.0).to_radians()).tan().recip();
+        self.roll = roll;
+        self.draw(map, camera, time);
+        self.roll = 0.0;
+        self.zoom = 1.0;
+        self.begin_ui(false);
+        if flash < 0.999 {
+            if let Some(commands) = &mut self.commands {
+                let gain = flash.clamp(0.0, 1.0) * 0.5;
+                quad(
+                    commands,
+                    [self.width, self.height],
+                    [0, 0, self.width as i32, self.height as i32],
+                    [0.0, 0.0, 1.0, 1.0],
+                    [gain, gain, gain, 0.0],
+                    None,
+                    Mode::ModulatedScreen,
+                    commands::WHITE,
+                );
+            } else {
+                for pixel in &mut self.pixels {
+                    let color = [16, 8, 0].map(|shift| ((*pixel >> shift) & 255) as f32);
+                    *pixel = pack(color, flash);
+                }
+            }
         }
     }
 
@@ -173,7 +222,19 @@ impl Frame {
         for prop in map.props.iter().filter(|prop| prop.visible) {
             let offset = prop.position - camera.position;
             if offset.dot(forward) + prop.radius >= NEAR {
-                self.draw_faces(&prop.faces, camera, time, false);
+                let pose = prop.cinematic.as_ref().and_then(|actor| {
+                    let time = time - actor.started?;
+                    actor
+                        .animation
+                        .sample(time.min((actor.animation.duration() - 0.001).max(0.0)))
+                });
+                self.draw_faces_blended(
+                    pose.map_or(prop.faces.as_slice(), |pose| pose.current),
+                    camera,
+                    time,
+                    false,
+                    pose,
+                );
             }
         }
     }
@@ -720,7 +781,15 @@ impl Frame {
         sky: bool,
         pose: Option<crate::game::Pose<'_>>,
     ) {
-        self.draw_faces_in_view(faces, &View::camera(camera), time, sky, pose, None);
+        let mut view = View::camera(camera);
+        if self.roll != 0.0 {
+            let (sin, cos) = self.roll.sin_cos();
+            (view.right, view.up) = (
+                view.right * cos + view.up * sin,
+                view.up * cos - view.right * sin,
+            );
+        }
+        self.draw_faces_in_view(faces, &view, time, sky, pose, None);
     }
 
     fn draw_faces_in_view(

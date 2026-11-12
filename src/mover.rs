@@ -46,9 +46,19 @@ pub struct Mover {
     hull: Option<usize>,
     triggers: Vec<Trigger>,
     activation: Activation,
+    tag: Option<usize>,
 }
 
 impl Mover {
+    #[cfg(windows)]
+    pub fn scene_event(&mut self, event: usize) {
+        if self.tag == Some(event) {
+            self.opening = true;
+            self.ready = false;
+            self.countdown = self.pause;
+        }
+    }
+
     pub fn load(
         package: &Package<'_>,
         actors: &[&Export],
@@ -305,6 +315,7 @@ impl Brush {
                 hull: None,
                 triggers,
                 activation,
+                tag,
             },
         }))
     }

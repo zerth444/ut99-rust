@@ -99,7 +99,7 @@ impl Presenter {
         })
     }
 
-    pub fn draw(&mut self, size: (u32, u32), commands: &mut DrawList) -> Result<bool> {
+    pub fn draw(&mut self, size: (u32, u32), commands: &mut DrawList, vsync: bool) -> Result<bool> {
         self.resize(size)?;
         for (id, image, mips) in commands.uploads.drain(..) {
             let texture = self.upload(&image, mips)?;
@@ -167,7 +167,7 @@ impl Presenter {
                 }
                 context.Draw(count, first);
             }
-            let status = self.chain.Present(1, DXGI_PRESENT(0));
+            let status = self.chain.Present(u32::from(vsync), DXGI_PRESENT(0));
             status.ok()?;
             Ok(status != DXGI_STATUS_OCCLUDED)
         }
@@ -445,6 +445,7 @@ impl Pipeline {
             Mode::World => (&self.depth_write, None, &self.world),
             Mode::SkyMask => (&self.depth_write, Some(&self.no_color), &self.world),
             Mode::Modulated => (&self.depth_read, Some(&self.modulated), &self.world),
+            Mode::ModulatedScreen => (&self.depth_off, Some(&self.modulated), &self.ui),
             Mode::ScreenDepth => (&self.depth_read, Some(&self.screen), &self.world),
             Mode::Screen => (&self.depth_off, Some(&self.screen), &self.ui),
             Mode::Ui => (&self.depth_off, None, &self.ui),

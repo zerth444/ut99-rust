@@ -1,4 +1,6 @@
 mod collision;
+#[cfg(windows)]
+mod frontend;
 mod game;
 #[cfg(windows)]
 mod hud;
@@ -14,6 +16,8 @@ mod present;
 mod props;
 mod render;
 mod script;
+#[cfg(windows)]
+mod settings;
 mod sound;
 mod teleport;
 mod texture;
@@ -39,7 +43,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let package = Package::read(&bytes)?;
                 let mut map = Map::load(&package, Some(&demo))?;
                 let start = 6.min(map.starts.len() - 1);
-                return Ok(window::show(&mut map, start, &window_title(&demo), obs)?);
+                return Ok(window::show(
+                    &mut map,
+                    start,
+                    &window_title(&demo),
+                    obs,
+                    &demo,
+                    true,
+                )?);
             }
         }
     }
@@ -53,7 +64,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     if !matches!(
         command.to_str(),
-        Some("inspect" | "map-info" | "view" | "capture" | "capture-practice")
+        Some("inspect" | "map-info" | "view" | "play" | "capture" | "capture-practice")
     ) {
         return Err(io::Error::other("Unknown command. Run with --help.").into());
     }
@@ -68,7 +79,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    let start = if command == "view" || command == "capture" || command == "capture-practice" {
+    let start = if command == "view"
+        || command == "play"
+        || command == "capture"
+        || command == "capture-practice"
+    {
         args.next()
             .map(|value| {
                 value
@@ -171,9 +186,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 frame.draw(&map, &camera, 0.0);
             }
             frame.save_bmp(Path::new(&output))?;
-        } else if command == "view" {
+        } else if command == "view" || command == "play" {
             #[cfg(windows)]
-            window::show(&mut map, start, &window_title(path), obs)?;
+            window::show(
+                &mut map,
+                start,
+                &window_title(path),
+                obs,
+                path,
+                command == "play",
+            )?;
             #[cfg(not(windows))]
             return Err(io::Error::other("Interactive view currently requires Windows").into());
         }
@@ -193,6 +215,7 @@ fn print_usage() {
     println!("ut99-rust inspect <package>");
     println!("ut99-rust map-info <map.unr>");
     println!("ut99-rust [--obs] view <map.unr> [player-start]");
+    println!("ut99-rust [--obs] play <map.unr> [player-start]");
     println!("ut99-rust capture <map.unr> <output.bmp> [player-start]");
     println!("ut99-rust capture-practice <map.unr> <output.bmp> [player-start]");
 }
