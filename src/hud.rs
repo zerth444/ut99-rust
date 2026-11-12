@@ -1,195 +1,237 @@
-use windows_sys::Win32::Foundation::RECT;
-use windows_sys::Win32::Graphics::Gdi::*;
+use std::ptr::null_mut;
+use windows_sys::Win32::{Foundation::RECT, Graphics::Gdi::*};
 
-use crate::game::Practice;
+use crate::{game::Practice, render::Frame, texture::TextureImage};
+
+const CELL_W: usize = 12;
+const CELL_H: usize = 20;
+const COLUMNS: usize = 16;
+const ROWS: usize = 6;
 
 pub struct Hud {
-    title: HFONT,
-    small: HFONT,
-    panel: HBRUSH,
+    glyphs: Option<TextureImage>,
 }
 
 impl Hud {
     pub fn new() -> Self {
-        let face: Vec<_> = "Consolas".encode_utf16().chain([0]).collect();
-        let font = |height| unsafe {
-            CreateFontW(
-                height,
-                0,
-                0,
-                0,
-                FW_BOLD as i32,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET.into(),
-                OUT_DEFAULT_PRECIS.into(),
-                CLIP_DEFAULT_PRECIS.into(),
-                CLEARTYPE_QUALITY.into(),
-                (FF_MODERN | FIXED_PITCH).into(),
-                face.as_ptr(),
-            )
-        };
         Self {
-            title: font(-25),
-            small: font(-16),
-            panel: unsafe { CreateSolidBrush(rgb(19, 26, 31)) },
+            glyphs: glyph_atlas(),
         }
     }
 
     pub fn draw(
         &self,
-        dc: HDC,
-        viewport: RECT,
+        frame: &mut Frame,
         game: &Practice,
         captured: bool,
         has_art: bool,
         music: Option<&str>,
+        stats: Option<&str>,
     ) {
-        let width = viewport.right;
-        let height = viewport.bottom;
-        if width < 450 || height < 180 {
-            return;
-        }
-        let bottom = height - 15;
-        let top = bottom - 57;
-        let left = 15;
-        let right = width - 15;
-        unsafe {
-            let old_font = SelectObject(dc, self.small);
-            let old_mode = SetBkMode(dc, TRANSPARENT as i32);
-            if !has_art {
-                self.box_at(dc, left, top, left + 208, bottom);
-                self.box_at(dc, right - 224, top, right, bottom);
-                self.text(dc, left + 11, top + 5, "HEALTH", rgb(161, 199, 202));
-                self.text(dc, left + 111, top + 5, "ARMOR", rgb(161, 199, 202));
-                self.text(
-                    dc,
-                    right - 213,
-                    top + 5,
+        let scale = (frame.width as f32 / 1280.0).clamp(0.7, 2.0);
+        let width = frame.width as i32;
+        let height = frame.height as i32;
+        if !has_art {
+            let ammo = game
+                .ammo()
+                .map_or_else(|| "MELEE".to_string(), |ammo| ammo.to_string());
+            self.text(
+                frame,
+                12,
+                height - 30,
+                scale,
+                &format!(
+                    "HEALTH {}  ARMOR {}  {}  {}",
+                    game.health,
+                    game.armor(),
                     game.weapon.label(),
-                    rgb(161, 199, 202),
-                );
-                SelectObject(dc, self.title);
-                self.text(
-                    dc,
-                    left + 11,
-                    top + 22,
-                    &game.health.to_string(),
-                    rgb(211, 244, 236),
-                );
-                self.text(
-                    dc,
-                    left + 111,
-                    top + 22,
-                    &game.armor.to_string(),
-                    rgb(211, 244, 236),
-                );
-                self.text(
-                    dc,
-                    right - 213,
-                    top + 22,
-                    &game
-                        .ammo()
-                        .map_or_else(|| "MELEE".into(), |ammo| format!("{ammo} AMMO")),
-                    rgb(255, 202, 109),
-                );
-                SelectObject(dc, self.small);
-
-                if width >= 780 {
-                    let slots: Vec<_> = game.owned().map(|weapon| weapon.slot()).collect();
-                    let start = width / 2 - slots.len() as i32 * 12;
-                    for (i, slot) in slots.into_iter().enumerate() {
-                        let x = start + i as i32 * 24;
-                        self.box_at(dc, x, bottom - 26, x + 21, bottom);
-                        let color = if slot == game.weapon.slot() {
-                            rgb(255, 202, 109)
-                        } else {
-                            rgb(161, 199, 202)
-                        };
-                        self.text(dc, x + 5, bottom - 22, &slot.to_string(), color);
-                    }
-                }
-            }
-            if game.time < game.message_until {
-                self.centered(dc, width, 46, &game.message, rgb(255, 202, 109));
-            }
-            if !captured {
-                self.box_at(
-                    dc,
-                    width / 2 - 175,
-                    height / 2 - 26,
-                    width / 2 + 175,
-                    height / 2 + 38,
-                );
-                self.centered(
-                    dc,
-                    width,
-                    height / 2 - 17,
-                    "CLICK TO CAPTURE MOUSE",
-                    rgb(223, 240, 240),
-                );
-                self.centered(
-                    dc,
-                    width,
-                    height / 2 + 8,
-                    "WASD / SPACE / LMB / RMB",
-                    rgb(161, 199, 202),
-                );
-            }
-            if let Some(track) = music {
-                self.text(
-                    dc,
-                    left,
-                    12,
-                    &format!("NOW PLAYING  {track}"),
-                    rgb(198, 224, 225),
-                );
-            }
-            SetBkMode(dc, old_mode);
-            SelectObject(dc, old_font);
+                    ammo
+                ),
+                [0.8, 0.9, 1.0],
+            );
         }
-    }
-
-    fn box_at(&self, dc: HDC, left: i32, top: i32, right: i32, bottom: i32) {
-        unsafe {
-            FillRect(
-                dc,
-                &RECT {
-                    left,
-                    top,
-                    right,
-                    bottom,
-                },
-                self.panel,
+        if game.time < game.message_until {
+            self.centered(
+                frame,
+                (50.0 * scale) as i32,
+                scale,
+                &game.message,
+                [1.0, 0.79, 0.32],
+            );
+        }
+        if game.scoped() {
+            let magnification = 90.0 / game.field_of_view();
+            self.text(
+                frame,
+                width / 2 + width / 10,
+                height / 2 + (height * 3 / 20),
+                scale,
+                &format!("X{magnification:.1}"),
+                [0.20, 1.0, 0.20],
+            );
+        }
+        if !captured && game.death.is_none() {
+            let w = (350.0 * scale).round() as i32;
+            let h = (54.0 * scale).round() as i32;
+            frame.solid(
+                [(width - w) / 2, (height - h) / 2, w, h],
+                [0.07, 0.09, 0.12],
+            );
+            self.centered(
+                frame,
+                (height - h) / 2 + (7.0 * scale) as i32,
+                scale,
+                "CLICK TO CAPTURE MOUSE",
+                [0.86, 0.94, 0.98],
+            );
+            self.centered(
+                frame,
+                height / 2,
+                scale,
+                "WASD / SPACE / LMB / RMB",
+                [0.60, 0.77, 0.84],
+            );
+        }
+        let mut y = (10.0 * scale) as i32;
+        if let Some(stats) = stats {
+            self.text(frame, 12, y, scale, stats, [0.72, 0.95, 0.78]);
+            y += (CELL_H as f32 * scale) as i32;
+        }
+        if let Some(track) = music {
+            self.text(
+                frame,
+                12,
+                y,
+                scale,
+                &format!("NOW PLAYING  {track}"),
+                [0.77, 0.88, 0.93],
             );
         }
     }
 
-    fn text(&self, dc: HDC, x: i32, y: i32, text: &str, color: u32) {
-        let text: Vec<_> = text.encode_utf16().collect();
-        unsafe {
-            SetTextColor(dc, color);
-            TextOutW(dc, x, y, text.as_ptr(), text.len() as i32);
-        }
+    fn centered(&self, frame: &mut Frame, y: i32, scale: f32, text: &str, color: [f32; 3]) {
+        let width = text.chars().count() as f32 * CELL_W as f32 * scale;
+        self.text(
+            frame,
+            (frame.width as f32 * 0.5 - width * 0.5).round() as i32,
+            y,
+            scale,
+            text,
+            color,
+        );
     }
 
-    fn centered(&self, dc: HDC, width: i32, y: i32, text: &str, color: u32) {
-        let x = (width - text.chars().count() as i32 * 9) / 2;
-        self.text(dc, x, y, text, color);
+    fn text(&self, frame: &mut Frame, x: i32, y: i32, scale: f32, text: &str, color: [f32; 3]) {
+        let Some(glyphs) = &self.glyphs else {
+            return;
+        };
+        for (i, ch) in text.chars().enumerate() {
+            if ch == ' ' {
+                continue;
+            }
+            let index = if ch.is_ascii_graphic() {
+                ch as usize - 32
+            } else {
+                usize::from(b'?' - 32)
+            };
+            let dx = (i as f32 * CELL_W as f32 * scale).round() as i32;
+            frame.translucent_tile(
+                glyphs,
+                [
+                    x + dx,
+                    y,
+                    (CELL_W as f32 * scale).round() as i32,
+                    (CELL_H as f32 * scale).round() as i32,
+                ],
+                [
+                    (index % COLUMNS * CELL_W) as f32,
+                    (index / COLUMNS * CELL_H) as f32,
+                    CELL_W as f32,
+                    CELL_H as f32,
+                ],
+                color,
+            );
+        }
     }
 }
 
-impl Drop for Hud {
-    fn drop(&mut self) {
-        unsafe {
-            DeleteObject(self.title);
-            DeleteObject(self.small);
-            DeleteObject(self.panel);
+fn glyph_atlas() -> Option<TextureImage> {
+    let (width, height) = (CELL_W * COLUMNS, CELL_H * ROWS);
+    let bitmap = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width as i32,
+            biHeight: -(height as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    unsafe {
+        let dc = CreateCompatibleDC(null_mut());
+        if dc.is_null() {
+            return None;
         }
+        let mut bits = null_mut();
+        let dib = CreateDIBSection(dc, &bitmap, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+        if dib.is_null() || bits.is_null() {
+            DeleteDC(dc);
+            return None;
+        }
+        let previous_bitmap = SelectObject(dc, dib);
+        let face: Vec<_> = "Consolas\0".encode_utf16().collect();
+        let font = CreateFontW(
+            -18,
+            0,
+            0,
+            0,
+            FW_BOLD as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.into(),
+            OUT_DEFAULT_PRECIS.into(),
+            CLIP_DEFAULT_PRECIS.into(),
+            ANTIALIASED_QUALITY.into(),
+            (FF_MODERN | FIXED_PITCH).into(),
+            face.as_ptr(),
+        );
+        let previous_font = SelectObject(dc, font);
+        std::ptr::write_bytes(bits.cast::<u32>(), 0, width * height);
+        SetTextColor(dc, 0xffffff);
+        SetBkMode(dc, TRANSPARENT as i32);
+        for (index, character) in (32u16..=126).enumerate() {
+            let x = (index % COLUMNS * CELL_W) as i32;
+            let y = (index / COLUMNS * CELL_H) as i32;
+            let cell = RECT {
+                left: x,
+                top: y,
+                right: x + CELL_W as i32,
+                bottom: y + CELL_H as i32,
+            };
+            ExtTextOutW(
+                dc,
+                x,
+                y,
+                ETO_CLIPPED,
+                &cell,
+                &character,
+                1,
+                std::ptr::null(),
+            );
+        }
+        GdiFlush();
+        let pixels = std::slice::from_raw_parts(bits.cast::<u32>(), width * height)
+            .iter()
+            .map(|pixel| (pixel & 255) as u8)
+            .collect();
+        SelectObject(dc, previous_font);
+        SelectObject(dc, previous_bitmap);
+        DeleteObject(font);
+        DeleteObject(dib);
+        DeleteDC(dc);
+        Some(TextureImage::glyph_mask(width, height, pixels))
     }
-}
-
-fn rgb(r: u32, g: u32, b: u32) -> u32 {
-    r | (g << 8) | (b << 16)
 }

@@ -5,6 +5,9 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::Input::{
     GetRawInputData, MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT,
@@ -16,7 +19,8 @@ use crate::collision::{MotionEvents, Walker};
 use crate::game::{Input, Practice};
 use crate::hud::Hud;
 use crate::map::{Map, Vec3};
-use crate::render::{Camera, Frame, HEIGHT, WIDTH};
+use crate::present::Presenter;
+use crate::render::{Camera, Frame};
 
 pub fn show(map: &mut Map, start: usize, title: &str) -> io::Result<()> {
     let class: Vec<u16> = "Ut99RustViewer\0".encode_utf16().collect();
@@ -24,6 +28,7 @@ pub fn show(map: &mut Map, start: usize, title: &str) -> io::Result<()> {
 
     // The HWND, its device contexts and the message pump all live on this thread.
     unsafe {
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let instance = GetModuleHandleW(std::ptr::null());
         let window_class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
@@ -75,7 +80,7 @@ unsafe extern "system" fn window_proc(
 }
 
 unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize) -> io::Result<()> {
-    let mut frame = Frame::new();
+    let mut frame = Frame::hardware(map);
     let hud = Hud::new();
     let mut game = Practice::new(map);
     let mut mouse = Mouse::new(window);
@@ -101,19 +106,10 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize) -> io::Res
         - 4096.0;
     let started = Instant::now();
     let mut tick = started;
-
-    let bitmap = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: WIDTH as i32,
-            biHeight: -(HEIGHT as i32),
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
+    let mut presenter = None;
+    let mut show_stats = false;
+    let mut stats = FrameStats::new(started);
+    let mut windowed = None;
 
     unsafe {
         loop {
@@ -135,7 +131,7 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize) -> io::Res
                             }
                         }
                         WM_LBUTTONDOWN => {
-                            if mouse.captured {
+                            if mouse.captured || game.death.is_some() {
                                 primary = true;
                             } else {
                                 mouse.capture();
@@ -162,7 +158,7 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize) -> io::Res
                             DestroyWindow(window);
                             return Ok(());
                         }
-                        VK_TAB => {
+                        VK_TAB if game.death.is_none() => {
                             start = (start + 1) % map.starts.len();
                             occupied_portal = None;
                             camera = Camera::from_start(map.starts[start]);
@@ -204,7 +200,9 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize) -> io::Res
                             slot = Some((key - u16::from(b'0')) as u8)
                         }
                         key if key == u16::from(b'M') => muted = !muted,
-                        VK_F2 => {
+                        VK_F3 => show_stats = !show_stats,
+                        VK_F11 => toggle_borderless(window, &mut windowed),
+                        VK_F2 if game.death.is_none() => {
                             fly = !fly;
                             if !fly {
                                 occupied_portal = None;
@@ -223,11 +221,24 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize) -> io::Res
             let dt = (now - tick).as_secs_f32().min(0.06);
             tick = now;
             let mut movement_audio = MotionEvents::default();
-            if GetForegroundWindow() == window {
+            let focused = GetForegroundWindow() == window;
+            if let Some(death) = &mut game.death {
+                if focused && primary && game.time - death.started >= 1.0 {
+                    game.reset_player(&map.arsenal);
+                    camera = Camera::from_start(map.starts[start]);
+                    walker = Walker::spawn(&map.collision, map.starts[start].position);
+                    occupied_portal = None;
+                } else if walker.position.2 >= kill_z && !walker.grounded {
+                    walker.advance(&map.collision, Vec3::default(), None, dt);
+                    death.position = walker.position;
+                }
+                primary = false;
+            } else if focused {
                 if mouse.captured {
                     let (x, y) = mouse.motion(raw);
-                    camera.yaw += x as f32 * 0.0027;
-                    camera.pitch -= y as f32 * 0.0027;
+                    let sensitivity = 0.0027 * game.field_of_view() / 90.0;
+                    camera.yaw += x as f32 * sensitivity;
+                    camera.pitch -= y as f32 * sensitivity;
                 }
                 update_view(&mut camera, dt);
                 let movement = camera.forward() * axis(b'W' as u16, b'S' as u16)
@@ -273,7 +284,7 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize) -> io::Res
                         }
                     }
                     if walker.position.2 < kill_z {
-                        game.reset_player(&map.arsenal);
+                        game.health = 0;
                         occupied_portal = None;
                         walker = Walker::spawn(&map.collision, map.starts[start].position);
                     }
@@ -290,7 +301,6 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize) -> io::Res
             if let Some(speed) = movement_audio.landing {
                 game.fall_damage(speed, game.jump_speed(map.collision.profile.jump_speed));
             }
-            let focused = GetForegroundWindow() == window;
             let shots = game.update(
                 map,
                 &camera,
@@ -302,16 +312,19 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize) -> io::Res
                     cycle: std::mem::take(&mut cycle),
                 },
                 focused && !fly,
+                (!fly && game.health > 0).then_some(&mut walker),
             );
             primary = false;
             alternate = false;
-            if game.health == 0 {
-                game.reset_player(&map.arsenal);
-                camera = Camera::from_start(map.starts[start]);
-                walker = Walker::spawn(&map.collision, map.starts[start].position);
-                occupied_portal = None;
-            }
+            let reaction = if game.health == 0 && game.death.is_none() {
+                game.begin_death(walker.position, camera.yaw, map)
+            } else {
+                game.pain_sound(map)
+            };
             if let Some(audio) = &mut audio {
+                if let Some(sound) = reaction {
+                    audio.play(sound);
+                }
                 if movement_audio.jump
                     && let Some(sound) = &map.player_audio.jump
                 {
@@ -342,6 +355,13 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize) -> io::Res
                 for sound in shots {
                     audio.play(sound);
                 }
+                let weapon_loop = game.pulse_beam.as_ref().and_then(|_| {
+                    map.arsenal
+                        .get(&crate::game::Weapon::Pulse)?
+                        .alternate
+                        .as_ref()
+                });
+                audio.set_weapon_loop(weapon_loop);
                 audio.update(
                     &map.ambient,
                     camera.position,
@@ -350,43 +370,165 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize) -> io::Res
                     music_muted,
                 );
             }
-            if IsIconic(window) == 0 {
+            let mut client = RECT::default();
+            if IsIconic(window) == 0
+                && GetClientRect(window, &mut client) != 0
+                && client.right > 0
+                && client.bottom > 0
+            {
+                let size = (client.right as u32, client.bottom as u32);
+                let presenter = match &mut presenter {
+                    Some(presenter) => presenter,
+                    slot @ None => slot.insert(Presenter::new(window, size).map_err(|error| {
+                        io::Error::other(format!("Creating the VSync swap chain: {error}"))
+                    })?),
+                };
+                frame.width = size.0 as usize;
+                frame.height = size.1 as usize;
                 frame.draw_practice(map, &camera, (now - started).as_secs_f32(), &game);
-                let mut client = RECT::default();
-                if GetClientRect(window, &mut client) != 0 {
-                    let dc = GetDC(window);
-                    if dc.is_null() {
-                        return Err(io::Error::last_os_error());
-                    }
-                    StretchDIBits(
-                        dc,
-                        0,
-                        0,
-                        client.right,
-                        client.bottom,
-                        0,
-                        0,
-                        WIDTH as i32,
-                        HEIGHT as i32,
-                        frame.pixels.as_ptr().cast(),
-                        &bitmap,
-                        DIB_RGB_COLORS,
-                        SRCCOPY,
-                    );
-                    let track = map
-                        .music
-                        .as_ref()
-                        .filter(|_| {
-                            !music_muted
-                                && !muted
-                                && audio.as_ref().is_some_and(|audio| audio.music_playing())
-                        })
-                        .map(|track| track.name.as_str());
-                    hud.draw(dc, client, &game, mouse.captured, map.hud.ready(), track);
-                    ReleaseDC(window, dc);
+                let track = map
+                    .music
+                    .as_ref()
+                    .filter(|_| {
+                        !music_muted
+                            && !muted
+                            && audio.as_ref().is_some_and(|audio| audio.music_playing())
+                    })
+                    .map(|track| track.name.as_str());
+                let label = show_stats.then(|| stats.label(window, size, presenter.software));
+                hud.draw(
+                    &mut frame,
+                    &game,
+                    mouse.captured,
+                    map.hud.ready(),
+                    track,
+                    label.as_deref(),
+                );
+                let presented = presenter
+                    .draw(size, frame.commands.as_mut().expect("GPU frame"))
+                    .map_err(|error| io::Error::other(format!("Presenting the frame: {error}")))?;
+                if presented {
+                    stats.presented(Instant::now());
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
                 }
+            } else {
+                // Keep pumping audio and messages while there is no visible frame to present.
+                std::thread::sleep(Duration::from_millis(10));
             }
-            std::thread::sleep(Duration::from_millis(10).saturating_sub(tick.elapsed()));
+        }
+    }
+}
+
+struct FrameStats {
+    since: Instant,
+    frames: u32,
+    fps: f32,
+    refresh: Option<u32>,
+    refresh_checked: Option<Instant>,
+}
+
+impl FrameStats {
+    fn new(now: Instant) -> Self {
+        Self {
+            since: now,
+            frames: 0,
+            fps: 0.0,
+            refresh: None,
+            refresh_checked: None,
+        }
+    }
+
+    fn presented(&mut self, now: Instant) {
+        self.frames += 1;
+        let elapsed = now.duration_since(self.since);
+        if elapsed >= Duration::from_millis(500) {
+            self.fps = self.frames as f32 / elapsed.as_secs_f32();
+            self.frames = 0;
+            self.since = now;
+        }
+    }
+
+    fn label(&mut self, window: HWND, size: (u32, u32), software: bool) -> String {
+        let now = Instant::now();
+        if self
+            .refresh_checked
+            .is_none_or(|checked| now.duration_since(checked) >= Duration::from_secs(1))
+        {
+            self.refresh = monitor_refresh(window);
+            self.refresh_checked = Some(now);
+        }
+        let refresh = self
+            .refresh
+            .map_or_else(|| "? Hz".to_owned(), |hz| format!("{hz} Hz"));
+        let device = if software { "WARP" } else { "D3D11" };
+        format!(
+            "{:.0} FPS / {refresh}  {}x{}  {device}",
+            self.fps, size.0, size.1
+        )
+    }
+}
+
+fn monitor_refresh(window: HWND) -> Option<u32> {
+    let mut info = MONITORINFOEXW::default();
+    info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+    let mut mode = DEVMODEW {
+        dmSize: size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    unsafe {
+        let monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+        if GetMonitorInfoW(monitor, &mut info.monitorInfo) == 0
+            || EnumDisplaySettingsW(info.szDevice.as_ptr(), ENUM_CURRENT_SETTINGS, &mut mode) == 0
+            || mode.dmDisplayFrequency <= 1
+        {
+            return None;
+        }
+    }
+    Some(mode.dmDisplayFrequency)
+}
+
+fn toggle_borderless(window: HWND, windowed: &mut Option<WINDOWPLACEMENT>) {
+    unsafe {
+        if let Some(placement) = windowed.take() {
+            SetWindowLongW(window, GWL_STYLE, (WS_OVERLAPPEDWINDOW | WS_VISIBLE) as i32);
+            SetWindowPlacement(window, &placement);
+            SetWindowPos(
+                window,
+                null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            );
+        } else {
+            let mut placement = WINDOWPLACEMENT {
+                length: size_of::<WINDOWPLACEMENT>() as u32,
+                ..Default::default()
+            };
+            let mut info = MONITORINFO {
+                cbSize: size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            let monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+            if GetWindowPlacement(window, &mut placement) == 0
+                || GetMonitorInfoW(monitor, &mut info) == 0
+            {
+                return;
+            }
+            *windowed = Some(placement);
+            SetWindowLongW(window, GWL_STYLE, (WS_POPUP | WS_VISIBLE) as i32);
+            let area = info.rcMonitor;
+            SetWindowPos(
+                window,
+                HWND_TOP,
+                area.left,
+                area.top,
+                area.right - area.left,
+                area.bottom - area.top,
+                SWP_FRAMECHANGED,
+            );
         }
     }
 }

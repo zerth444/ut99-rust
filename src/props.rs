@@ -5,6 +5,8 @@ use std::{
     sync::Arc,
 };
 
+use crate::game::ordnance::{self, Kind};
+use crate::game::shock;
 use crate::game::{Flash, Item, Motion, Weapon, WeaponAssets};
 use crate::map::{Face, Vec3, material_color, native_data};
 use crate::mover::{product, read_rotation, rotate, unit};
@@ -67,6 +69,7 @@ struct Appearance {
     draw_type: u8,
     mesh: Option<Object>,
     player_mesh: Option<Object>,
+    status_icon: Option<Object>,
     player_offset: Option<Vec3>,
     player_scale: Option<f32>,
     fire_sound: Option<Object>,
@@ -86,6 +89,7 @@ struct Appearance {
     ammo_amount: Option<u16>,
     max_ammo: Option<u16>,
     respawn_time: Option<f32>,
+    lifetime: Option<f32>,
     skin: Option<Object>,
     texture: Option<Object>,
     multiskins: [Option<Object>; 8],
@@ -97,6 +101,7 @@ struct VisualProperties {
     draw_type: Option<u8>,
     mesh: Option<i32>,
     player_mesh: Option<i32>,
+    status_icon: Option<i32>,
     player_offset: Option<Vec3>,
     player_scale: Option<f32>,
     fire_sound: Option<i32>,
@@ -116,6 +121,7 @@ struct VisualProperties {
     ammo_amount: Option<u16>,
     max_ammo: Option<u16>,
     respawn_time: Option<f32>,
+    lifetime: Option<f32>,
     skin: Option<i32>,
     texture: Option<i32>,
     multiskins: [Option<i32>; 8],
@@ -131,6 +137,7 @@ impl VisualProperties {
             draw_type: None,
             mesh: None,
             player_mesh: None,
+            status_icon: None,
             player_offset: None,
             player_scale: None,
             fire_sound: None,
@@ -150,6 +157,7 @@ impl VisualProperties {
             ammo_amount: None,
             max_ammo: None,
             respawn_time: None,
+            lifetime: None,
             skin: None,
             texture: None,
             multiskins: [None; 8],
@@ -164,6 +172,7 @@ impl VisualProperties {
                 "DrawType" => props_out.draw_type = Some(value.byte()?),
                 "Mesh" => props_out.mesh = Some(value.compact()?),
                 "PlayerViewMesh" => props_out.player_mesh = Some(value.compact()?),
+                "StatusIcon" => props_out.status_icon = Some(value.compact()?),
                 "PlayerViewOffset" => props_out.player_offset = Some(Vec3::read(&mut value)?),
                 "PlayerViewScale" => props_out.player_scale = Some(value.f32()?),
                 "FireSound" => props_out.fire_sound = Some(value.compact()?),
@@ -185,6 +194,7 @@ impl VisualProperties {
                 "AmmoAmount" => props_out.ammo_amount = u16::try_from(value.u32()?).ok(),
                 "MaxAmmo" => props_out.max_ammo = u16::try_from(value.u32()?).ok(),
                 "RespawnTime" => props_out.respawn_time = Some(value.f32()?),
+                "LifeSpan" => props_out.lifetime = Some(value.f32()?),
                 "Skin" => props_out.skin = Some(value.compact()?),
                 "Texture" => props_out.texture = Some(value.compact()?),
                 "MultiSkins" if prop.array_index < props_out.multiskins.len() => {
@@ -211,6 +221,7 @@ impl VisualProperties {
         }
         for (slot, value) in [
             (&mut parent.player_mesh, self.player_mesh),
+            (&mut parent.status_icon, self.status_icon),
             (&mut parent.fire_sound, self.fire_sound),
             (&mut parent.alt_sound, self.alt_sound),
             (&mut parent.pickup_sound, self.pickup_sound),
@@ -254,6 +265,7 @@ impl VisualProperties {
         parent.ammo_amount = self.ammo_amount.or(parent.ammo_amount);
         parent.max_ammo = self.max_ammo.or(parent.max_ammo);
         parent.respawn_time = self.respawn_time.or(parent.respawn_time);
+        parent.lifetime = self.lifetime.or(parent.lifetime);
         if let Some(value) = self.scale {
             parent.scale = value;
         }
@@ -341,6 +353,8 @@ pub struct Scene {
     pub hud: crate::hud_art::Art,
     pub player: crate::movement::Profile,
     pub player_audio: crate::movement::PlayerAudio,
+    pub player_deaths: [Motion; 3],
+    pub ordnance: ordnance::Arsenal,
 }
 
 pub fn load(map: &Package<'_>, actors: &[&Export], path: &Path) -> io::Result<Scene> {
@@ -367,10 +381,13 @@ pub fn load(map: &Package<'_>, actors: &[&Export], path: &Path) -> io::Result<Sc
             .then_some(())?;
         let name = path.file_stem()?.to_str()?.to_ascii_lowercase();
         // Only packages directly referenced by this map and the engine's base classes.
-        if !matches!(name.as_str(), "engine" | "core" | "botpack" | "dmatch")
-            && !map.imports.iter().any(|import| {
-                import.outer == 0 && map.names[import.name].eq_ignore_ascii_case(&name)
-            })
+        if !matches!(
+            name.as_str(),
+            "engine" | "core" | "botpack" | "dmatch" | "unrealshare" | "unreali" | "soldierskins"
+        ) && !map
+            .imports
+            .iter()
+            .any(|import| import.outer == 0 && map.names[import.name].eq_ignore_ascii_case(&name))
         {
             return None;
         }
@@ -464,11 +481,37 @@ pub fn load(map: &Package<'_>, actors: &[&Export], path: &Path) -> io::Result<Sc
         let mut weapon_assets = WeaponAssets {
             pickup_ammo: visual.pickup_ammo,
             max_ammo: ammo.max_ammo,
+            status_icon: visual
+                .status_icon
+                .and_then(|id| cached_texture(&assets, &mut textures, id)),
             fire: cached_wave(&assets, &mut waves, visual.fire_sound),
             select_sound: cached_wave(&assets, &mut waves, visual.select_sound),
             alternate: cached_wave(&assets, &mut waves, visual.alt_sound),
             ..Default::default()
         };
+        if weapon == Weapon::Shock {
+            weapon_assets.shock = Some(read_shock(
+                &mut assets,
+                &mut class_cache,
+                &mut textures,
+                &mut waves,
+                visual,
+            ));
+        }
+        if weapon == Weapon::Pulse {
+            weapon_assets.pulse_beam =
+                pulse_beam(&mut assets, &mut class_cache, &mut textures).unwrap_or_default();
+        }
+        let load_sound = match weapon {
+            Weapon::Rocket => find_export(&assets, "unrealshare", "Loading", "Sound"),
+            Weapon::Bio => find_export(&assets, "botpack", "BioAltRep", "Sound"),
+            _ => None,
+        };
+        weapon_assets.load_sound = cached_wave(&assets, &mut waves, load_sound);
+        if weapon == Weapon::Sniper {
+            weapon_assets.scope = find_export(&assets, "botpack", "RReticle", "Texture")
+                .and_then(|id| cached_texture(&assets, &mut textures, id));
+        }
         if visual.flash_enabled == Some(true) {
             let flash: Vec<_> = visual
                 .flash_variations
@@ -525,17 +568,27 @@ pub fn load(map: &Package<'_>, actors: &[&Export], path: &Path) -> io::Result<Sc
                             })
                     };
                     weapon_assets.primary_motion = motion(
-                        &["Shoot", "Fire1", "Fire", "Firing"],
-                        if weapon == Weapon::Enforcer {
-                            0.81
-                        } else {
-                            1.0
+                        &["Shoot", "Fire1", "Fire", "ShootLoop", "Firing"],
+                        match weapon {
+                            Weapon::Enforcer => 0.81,
+                            Weapon::Shock => shock::firing_rate(false),
+                            _ => 1.0,
                         },
                     );
-                    weapon_assets.alternate_motion =
-                        motion(&["Shot2", "Fire2", "AltFire", "AltFiring"], 1.0);
+                    weapon_assets.alternate_motion = motion(
+                        &["Shot2", "Fire2", "AltFire", "BoltLoop", "AltFiring"],
+                        match weapon {
+                            Weapon::Shock => shock::firing_rate(true),
+                            _ => 1.0,
+                        },
+                    );
                     weapon_assets.select_motion = motion(&["Select"], 1.0);
                     weapon_assets.down_motion = motion(&["Down"], 1.0);
+                    weapon_assets.load = match weapon {
+                        Weapon::Rocket => motion(&["Load1"], 1.0),
+                        Weapon::Bio => motion(&["Charging"], 0.24),
+                        _ => Motion::default(),
+                    };
                     weapon_assets.view = pose(rest);
                 }
             }
@@ -552,15 +605,343 @@ pub fn load(map: &Package<'_>, actors: &[&Export], path: &Path) -> io::Result<Sc
         weapons: hud_texture("HUDWeapons"),
         crosshair: hud_texture("CHair1"),
         doll: hud_texture("Man"),
+        belt: hud_texture("ManBelt"),
     };
-    let (player, player_audio) = read_player(&mut assets, &mut waves);
+    let (player, mut player_audio) = read_player(&mut assets, &mut waves);
+    player_audio.pain = ["injurL2", "injurL04", "injurM04", "injurH5"].map(|name| {
+        cached_wave(
+            &assets,
+            &mut waves,
+            find_export(&assets, "botpack", name, "Sound"),
+        )
+    });
+    player_audio.death = ["deathc1", "deathc51", "deathc3"].map(|name| {
+        cached_wave(
+            &assets,
+            &mut waves,
+            find_export(&assets, "botpack", name, "Sound"),
+        )
+    });
+    let player_deaths = death_models(&mut assets, &mut class_cache, &mut textures);
+    let ordnance = Kind::ALL.map(|kind| {
+        projectile_art(
+            &mut assets,
+            &mut class_cache,
+            &mut textures,
+            &mut waves,
+            kind,
+        )
+    });
     Ok(Scene {
         props,
         arsenal,
         hud,
         player,
         player_audio,
+        player_deaths,
+        ordnance,
     })
+}
+
+fn death_models(
+    assets: &mut Assets<'_>,
+    classes: &mut HashMap<Object, Appearance>,
+    textures: &mut HashMap<Object, Option<Arc<Texture>>>,
+) -> [Motion; 3] {
+    let class = find_export(assets, "botpack", "TMale2", "Class");
+    let mut visual = appearance(assets, classes, class);
+    let Some(object) = visual.mesh else {
+        return Default::default();
+    };
+    let (package, export) = assets.object(object);
+    let Ok(mesh) = Mesh::read(package, export) else {
+        return Default::default();
+    };
+    for (slot, name) in ["blkt1", "blkt2", "blkt3", "blkt4Malcom"]
+        .into_iter()
+        .enumerate()
+    {
+        visual.multiskins[slot] = find_export(assets, "soldierskins", name, "Texture");
+    }
+    ["Dead1", "Dead3", "Dead8"]
+        .map(|name| effect_motion(assets, textures, object, visual, &mesh, &[name]))
+}
+
+fn projectile_art(
+    assets: &mut Assets<'_>,
+    classes: &mut HashMap<Object, Appearance>,
+    textures: &mut HashMap<Object, Option<Arc<Texture>>>,
+    waves: &mut HashMap<Object, Option<Arc<Wave>>>,
+    kind: Kind,
+) -> ordnance::Art {
+    let mut art = ordnance::Art::default();
+    let Some(class) = find_export(assets, "botpack", kind.class(), "Class") else {
+        return art;
+    };
+    let visual = appearance(assets, classes, Some(class));
+    art.scale = Some(visual.scale);
+    let (package, export) = assets.object(class);
+    if let Ok(mut properties) = class_properties(package, export) {
+        while let Ok(Some((name, mut value))) = properties.next() {
+            match name {
+                name if name.eq_ignore_ascii_case("speed") => art.speed = value.f32().ok(),
+                "Damage" => art.damage = value.f32().ok(),
+                "MomentumTransfer" => {
+                    art.momentum = value.u32().ok().map(|value| value as i32 as f32)
+                }
+                _ => {}
+            }
+        }
+    }
+    let (texture, package, sound, contact) = match kind {
+        Kind::Pulse => ("pblst_a00", "botpack", "PulseExp", None),
+        Kind::Rocket | Kind::Grenade => (
+            "exp1_a00",
+            "unrealshare",
+            "Explo1",
+            Some(("unrealshare", "GrenadeFloor")),
+        ),
+        Kind::Chunk => ("Chunk_a00", "botpack", "Hit1", Some(("botpack", "Hit1"))),
+        Kind::FlakShell => ("Exp2_a00", "unrealshare", "Expl04", None),
+        Kind::Razor => (
+            "HEexpl1_a00",
+            "unreali",
+            "BladeHit",
+            Some(("unreali", "BladeHit")),
+        ),
+        Kind::RazorAlt => ("HEexpl1_a00", "unrealshare", "Expl03", None),
+        _ => (
+            "g1r_a00",
+            "unrealshare",
+            "Explg02",
+            Some(("botpack", "GelHit")),
+        ),
+    };
+    art.explosion = find_export(assets, "botpack", texture, "Texture")
+        .and_then(|id| cached_texture(assets, textures, id));
+    art.sound = cached_wave(assets, waves, find_export(assets, package, sound, "Sound"));
+    art.contact = contact.and_then(|(package, sound)| {
+        cached_wave(assets, waves, find_export(assets, package, sound, "Sound"))
+    });
+    if kind == Kind::Pulse {
+        art.sprite = visual
+            .texture
+            .and_then(|id| cached_texture(assets, textures, id))
+            .or_else(|| art.explosion.clone());
+    } else if let Some(object) = visual.mesh {
+        let (package, export) = assets.object(object);
+        if let Ok(mesh) = Mesh::read(package, export) {
+            art.flight = effect_motion(
+                assets,
+                textures,
+                object,
+                visual,
+                &mesh,
+                &["Flying", "Spin", "Wing", "WingIn", "Still", "All"],
+            );
+            art.stuck = effect_motion(assets, textures, object, visual, &mesh, &["Hit", "Still"]);
+        }
+    }
+    if kind == Kind::Rocket {
+        art.trail = find_export(assets, "botpack", "JRFlare", "Texture")
+            .and_then(|id| cached_texture(assets, textures, id));
+    }
+    art
+}
+
+fn effect_motion(
+    assets: &mut Assets<'_>,
+    textures: &mut HashMap<Object, Option<Arc<Texture>>>,
+    object: Object,
+    visual: Appearance,
+    mesh: &Mesh,
+    names: &[&str],
+) -> Motion {
+    let Some(seq) = mesh.sequence(names) else {
+        return Motion::default();
+    };
+    Motion {
+        rate: seq.rate,
+        frames: (seq.start..seq.end)
+            .map(|frame| {
+                let vertices =
+                    effect_vertices(mesh, mesh.frame(frame).unwrap_or_default(), visual.scale);
+                mesh_faces(assets, textures, object, visual, mesh, &vertices)
+            })
+            .collect(),
+    }
+}
+
+fn pulse_beam(
+    assets: &mut Assets<'_>,
+    classes: &mut HashMap<Object, Appearance>,
+    textures: &mut HashMap<Object, Option<Arc<Texture>>>,
+) -> Option<Vec<Vec<Face>>> {
+    let class = find_export(assets, "botpack", "PBolt", "Class")?;
+    let mut visual = appearance(assets, classes, Some(class));
+    let object = visual.mesh?;
+    let (package, export) = assets.object(object);
+    let mesh = Mesh::read(package, export).ok()?;
+    let mut vertices = effect_vertices(&mesh, mesh.frame(0)?, visual.scale);
+    let min = vertices.iter().map(|p| p.0).fold(f32::INFINITY, f32::min);
+    let max = vertices
+        .iter()
+        .map(|p| p.0)
+        .fold(f32::NEG_INFINITY, f32::max);
+    if max - min < 0.1 {
+        return None;
+    }
+    for point in &mut vertices {
+        point.0 = (point.0 - min) * 81.0 / (max - min);
+    }
+    let mut frames = Vec::new();
+    for texture in ["pbolt0", "pbolt1", "pbolt2", "pbolt3", "pbolt4"] {
+        visual.skin = find_export(assets, "botpack", texture, "Texture");
+        frames.push(mesh_faces(
+            assets, textures, object, visual, &mesh, &vertices,
+        ));
+    }
+    Some(frames)
+}
+
+fn read_shock(
+    assets: &mut Assets<'_>,
+    classes: &mut HashMap<Object, Appearance>,
+    textures: &mut HashMap<Object, Option<Arc<Texture>>>,
+    waves: &mut HashMap<Object, Option<Arc<Wave>>>,
+    weapon: Appearance,
+) -> shock::Assets {
+    let mut art = shock::Assets::default();
+    art.fire_offset = weapon.fire_offset.unwrap_or(art.fire_offset);
+    if let Some(bolt) = find_export(assets, "botpack", "ShockProj", "Class") {
+        let visual = appearance(assets, classes, Some(bolt));
+        art.lifetime = visual.lifetime.unwrap_or(art.lifetime);
+        art.bolt_scale = visual.scale;
+        art.bolt = visual
+            .texture
+            .and_then(|id| cached_texture(assets, textures, id));
+        let (package, export) = assets.object(bolt);
+        let mut impact = 0;
+        let mut combo = 0;
+        if let Ok(mut properties) = class_properties(package, export) {
+            while let Ok(Some((name, mut value))) = properties.next() {
+                let property = match name {
+                    "MomentumTransfer" => {
+                        if let Ok(value) = value.u32() {
+                            art.momentum = value as i32 as f32;
+                        }
+                        continue;
+                    }
+                    "Speed" => &mut art.speed,
+                    "Damage" => &mut art.damage,
+                    "CollisionRadius" => &mut art.radius,
+                    "CollisionHeight" => &mut art.half_height,
+                    "ImpactSound" => {
+                        impact = value.compact().unwrap_or(0);
+                        continue;
+                    }
+                    "ExploSound" => {
+                        combo = value.compact().unwrap_or(0);
+                        continue;
+                    }
+                    _ => continue,
+                };
+                if let Ok(value) = value.f32() {
+                    *property = value;
+                }
+            }
+        }
+        let impact = assets.resolve(bolt.package, impact);
+        let combo = assets.resolve(bolt.package, combo);
+        art.hit_sound = cached_wave(assets, waves, impact);
+        art.combo_sound = cached_wave(assets, waves, combo);
+    }
+    art.beam = (|| {
+        let class = find_export(assets, "botpack", "ShockBeam", "Class")?;
+        let visual = appearance(assets, classes, Some(class));
+        let texture = cached_texture(assets, textures, visual.texture?)?;
+        let (package, export) = assets.object(visual.mesh?);
+        let mesh = Mesh::read(package, export).ok()?;
+        let points = effect_vertices(&mesh, mesh.frame(0)?, visual.scale);
+        Some(shock::BeamArt {
+            texture,
+            points,
+            scale: visual.scale,
+            lifetime: visual.lifetime?,
+        })
+    })();
+    art.blast = (|| {
+        let class = find_export(assets, "botpack", "ShockExplo", "Class")?;
+        let visual = appearance(assets, classes, Some(class));
+        let texture = cached_texture(assets, textures, visual.texture?)?;
+        let (package, export) = assets.object(class);
+        let mut properties = class_properties(package, export).ok()?;
+        let mut sound = 0;
+        while let Ok(Some((name, mut value))) = properties.next() {
+            if name == "EffectSound1" {
+                sound = value.compact().unwrap_or(0);
+                break;
+            }
+        }
+        let sound = assets.resolve(class.package, sound);
+        Some(shock::BlastArt {
+            texture,
+            scale: visual.scale,
+            lifetime: visual.lifetime?,
+            sound: cached_wave(assets, waves, sound),
+        })
+    })();
+    art.wavefront = (|| {
+        let class = find_export(assets, "botpack", "ShockrifleWave", "Class")?;
+        let visual = appearance(assets, classes, Some(class));
+        let object = visual.mesh?;
+        let (package, export) = assets.object(object);
+        let mesh = Mesh::read(package, export).ok()?;
+        let vertices = effect_vertices(&mesh, mesh.frame(0)?, visual.scale);
+        Some(shock::WavefrontArt {
+            faces: mesh_faces(assets, textures, object, visual, &mesh, &vertices),
+            lifetime: visual.lifetime?,
+        })
+    })();
+    for (index, (name, rate)) in [
+        ("UT_RingExplosion", 0.35),
+        ("UT_RingExplosion5", 0.35),
+        ("UT_ComboRing", 0.1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        art.rings[index] = (|| {
+            let class = find_export(assets, "botpack", name, "Class")?;
+            let visual = appearance(assets, classes, Some(class));
+            let object = visual.mesh?;
+            let (package, export) = assets.object(object);
+            let mesh = Mesh::read(package, export).ok()?;
+            let seq = mesh.sequence(&["Explo"])?;
+            let frames: Vec<_> = (seq.start..seq.end)
+                .map(|frame| {
+                    let vertices =
+                        effect_vertices(&mesh, mesh.frame(frame).unwrap_or_default(), visual.scale);
+                    mesh_faces(assets, textures, object, visual, &mesh, &vertices)
+                })
+                .collect();
+            Some(shock::RingArt {
+                motion: Motion {
+                    frames,
+                    rate: seq.rate * rate,
+                },
+                lifetime: visual.lifetime?,
+            })
+        })();
+    }
+    art
+}
+
+fn effect_vertices(mesh: &Mesh, frame: &[Vec3], scale: f32) -> Vec<Vec3> {
+    frame
+        .iter()
+        .map(|&point| rotate(product(point - mesh.origin, mesh.scale), mesh.rotation) * scale)
+        .collect()
 }
 
 fn read_player(
@@ -593,6 +974,7 @@ fn read_player(
                 "BaseEyeHeight" => &mut player.eye_height,
                 "MaxStepHeight" => &mut player.step_height,
                 "Bob" => &mut player.bob,
+                "Mass" => &mut player.mass,
                 "Footstep1" | "Footstep2" | "Footstep3" | "JumpSound" | "Land" | "WaterStep" => {
                     if let Ok(reference) = value.compact() {
                         references.push((name.to_owned(), reference));

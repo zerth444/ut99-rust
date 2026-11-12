@@ -4,7 +4,8 @@ use crate::map::Vec3;
 use crate::movement::{Profile, Regions};
 use crate::package::invalid;
 
-const PLAYER: Vec3 = Vec3(17.0, 17.0, 39.0);
+pub(crate) const PLAYER_RADIUS: f32 = 17.0;
+const PLAYER: Vec3 = Vec3(PLAYER_RADIUS, PLAYER_RADIUS, 39.0);
 const SKIN: f32 = 0.15;
 const UP: Vec3 = Vec3(0.0, 0.0, 1.0);
 const FLOOR_NORMAL: f32 = 0.7;
@@ -139,8 +140,12 @@ impl Collision {
     }
 
     pub fn ray(&self, start: Vec3, delta: Vec3) -> Option<Vec3> {
+        self.ray_surface(start, delta).map(|(point, _)| point)
+    }
+
+    pub fn ray_surface(&self, start: Vec3, delta: Vec3) -> Option<(Vec3, Vec3)> {
         self.sweep(start, delta, Vec3::default())
-            .map(|hit| start + delta * hit.fraction)
+            .map(|hit| (start + delta * hit.fraction, hit.normal))
     }
 
     fn trace(&self, start: Vec3, delta: Vec3) -> Option<Hit> {
@@ -307,6 +312,22 @@ impl Walker {
         self.grounded = false;
         self.dodging = true;
         true
+    }
+
+    pub fn apply_self_damage_momentum(&mut self, mut momentum: Vec3, profile: Profile) {
+        if momentum.dot(momentum) == 0.0 {
+            return;
+        }
+        // Pawn.TakeDamage sets an upward component before applying the self-hit factor.
+        if self.grounded {
+            momentum.2 = momentum.2.max(0.4 * momentum.dot(momentum).sqrt());
+            self.grounded = false;
+        }
+        let mut impulse = momentum * (0.6 / profile.mass.max(1.0));
+        if self.velocity.2 > 380.0 && impulse.2 > 0.0 {
+            impulse.2 *= 0.5;
+        }
+        self.velocity = self.velocity + impulse;
     }
 
     pub fn eye(&self, profile: Profile, right: Vec3) -> Vec3 {
@@ -486,6 +507,22 @@ fn limit(velocity: Vec3, maximum: f32) -> Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn self_damage_momentum_lifts_grounded_players_and_limits_extra_upward_boost() {
+        let mut world = Collision::read(&[], std::iter::empty(), &[]).unwrap();
+        world.add_box(Vec3(-100.0, -100.0, -64.0), Vec3(100.0, 100.0, 0.0));
+        let mut walker = Walker::spawn(&world, UP * 39.0);
+        assert!(walker.grounded);
+        walker.apply_self_damage_momentum(Vec3(70_000.0, 0.0, 0.0), world.profile);
+        assert!(!walker.grounded);
+        assert!((walker.velocity.0 - 420.0).abs() < 0.01);
+        assert!((walker.velocity.2 - 168.0).abs() < 0.01);
+
+        walker.velocity.2 = 400.0;
+        walker.apply_self_damage_momentum(Vec3(0.0, 0.0, 70_000.0), world.profile);
+        assert!((walker.velocity.2 - 610.0).abs() < 0.01);
+    }
 
     #[test]
     fn stock_acceleration_braking_and_dodge_preserve_momentum() {

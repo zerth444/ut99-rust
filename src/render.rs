@@ -1,8 +1,12 @@
 use std::io::{self, Write};
 use std::path::Path;
 
+use crate::game::shock::{self, Visual};
 use crate::map::{Face, Map, Start, Vec3};
 use crate::texture::TextureImage;
+
+pub mod commands;
+use commands::{DrawList, Layer, Material, Mode, Vertex as GpuVertex};
 
 pub const WIDTH: usize = 800;
 pub const HEIGHT: usize = 450;
@@ -44,10 +48,62 @@ struct Vertex {
     v: f32,
 }
 
+struct View {
+    eye: Vec3,
+    right: Vec3,
+    up: Vec3,
+    forward: Vec3,
+}
+
+impl View {
+    fn camera(camera: &Camera) -> Self {
+        let forward = camera.look_direction();
+        let right = camera.right();
+        Self {
+            eye: camera.position,
+            right,
+            up: forward.cross(right),
+            forward,
+        }
+    }
+
+    fn in_model(&self, origin: Vec3, forward: Vec3, scale: f32) -> Self {
+        self.scaled_model(origin, forward, Vec3(scale, scale, scale))
+    }
+
+    fn scaled_model(&self, origin: Vec3, forward: Vec3, scale: Vec3) -> Self {
+        let (right, up) = shock::axes(forward);
+        let local = |p: Vec3| Vec3(p.dot(forward), p.dot(right), p.dot(up));
+        let product = crate::mover::product;
+        Self {
+            eye: product(
+                local(self.eye - origin),
+                Vec3(scale.0.recip(), scale.1.recip(), scale.2.recip()),
+            ),
+            right: product(local(self.right), scale),
+            up: product(local(self.up), scale),
+            forward: product(local(self.forward), scale),
+        }
+    }
+
+    fn point(&self, position: Vec3) -> Vec3 {
+        let offset = position - self.eye;
+        Vec3(
+            offset.dot(self.right),
+            offset.dot(self.up),
+            offset.dot(self.forward),
+        )
+    }
+}
+
 pub struct Frame {
     pub pixels: Vec<u32>,
     depth: Vec<f32>,
     sky: Vec<u32>,
+    pub width: usize,
+    pub height: usize,
+    pub commands: Option<DrawList>,
+    zoom: f32,
 }
 
 impl Frame {
@@ -56,11 +112,37 @@ impl Frame {
             pixels: vec![0; WIDTH * HEIGHT],
             depth: vec![0.0; WIDTH * HEIGHT],
             sky: vec![0x0d1520; WIDTH * HEIGHT],
+            width: WIDTH,
+            height: HEIGHT,
+            commands: None,
+            zoom: 1.0,
+        }
+    }
+
+    pub fn hardware(map: &Map) -> Self {
+        Self {
+            pixels: Vec::new(),
+            depth: Vec::new(),
+            sky: Vec::new(),
+            width: WIDTH,
+            height: HEIGHT,
+            commands: Some(DrawList::new(map)),
+            zoom: 1.0,
+        }
+    }
+
+    fn layer(&mut self, layer: Layer) {
+        if let Some(commands) = &mut self.commands {
+            commands.layer = layer;
         }
     }
 
     pub fn draw(&mut self, map: &Map, camera: &Camera, time: f32) {
+        if let Some(commands) = &mut self.commands {
+            commands.clear();
+        }
         if let Some(position) = map.sky_origin {
+            self.layer(Layer::Sky);
             let sky_camera = Camera {
                 position,
                 yaw: camera.yaw,
@@ -72,6 +154,7 @@ impl Frame {
         } else {
             self.sky.fill(0x0d1520);
         }
+        self.layer(Layer::World);
         self.clear();
         self.draw_faces(&map.faces, camera, time, false);
         for mover in &map.movers {
@@ -90,9 +173,6 @@ impl Frame {
                 self.draw_faces(&prop.faces, camera, time, false);
             }
         }
-        if map.hud.crosshair.is_none() {
-            self.draw_crosshair();
-        }
     }
 
     pub fn draw_practice(
@@ -102,17 +182,132 @@ impl Frame {
         time: f32,
         game: &crate::game::Practice,
     ) {
+        let death_camera = game.death.as_ref().map(|death| {
+            let age = (game.time - death.started).max(0.0);
+            let angle = death.yaw + 0.8 + age.min(1.6) * 0.45;
+            let up = Vec3(0.0, 0.0, 1.0);
+            let target = death.position - up * (12.0 + age.min(1.0) * 12.0);
+            let delta = Vec3(-angle.cos() * 118.0, -angle.sin() * 118.0, 54.0);
+            let position = map
+                .collision
+                .ray(target, delta)
+                .map_or(target + delta, |point| {
+                    point - crate::mover::unit(delta) * 5.0
+                });
+            let look = target - position;
+            Camera {
+                position,
+                yaw: look.1.atan2(look.0),
+                pitch: look.2.atan2(look.0.hypot(look.1)),
+            }
+        });
+        let camera = death_camera.as_ref().unwrap_or(camera);
+        self.zoom = (0.5 * game.field_of_view().to_radians()).tan().recip();
         self.draw(map, camera, time);
+        self.layer(Layer::Effects);
+        let view = View::camera(camera);
+        game.ordnance
+            .visuals(&map.ordnance, game.time, |visual| match visual {
+                crate::game::ordnance::Visual::Sprite(position, image, scale, glow) => {
+                    self.world_sprite(&view, position, image, scale, glow)
+                }
+                crate::game::ordnance::Visual::Mesh(position, direction, pose, scale) => {
+                    let model = view.in_model(position, direction, scale);
+                    self.draw_faces_in_view(pose.current, &model, time, false, Some(pose), None);
+                }
+            });
+        if let Some(death) = &game.death {
+            let motion = &map.player_deaths[death.animation];
+            let age = (game.time - death.started).min((motion.duration() - 0.001).max(0.0));
+            if let Some(pose) = motion.sample(age) {
+                let model = view.in_model(
+                    death.position,
+                    Vec3(death.yaw.cos(), death.yaw.sin(), 0.0),
+                    1.0,
+                );
+                self.draw_faces_in_view(pose.current, &model, time, false, Some(pose), None);
+            }
+        }
         for effect in game.visible_effects() {
             self.effect(camera, effect);
         }
-        if let Some(weapon) = map.arsenal.get(&game.weapon) {
+        if let Some(assets) = shock::assets(map) {
+            let view = View::camera(camera);
+            game.shock
+                .visuals(assets, game.time, |visual| match visual {
+                    Visual::Sprite {
+                        position,
+                        image,
+                        scale,
+                        glow,
+                    } => self.world_sprite(&view, position, image, scale, glow),
+                    Visual::Ring {
+                        position,
+                        direction,
+                        pose,
+                        scale,
+                        glow,
+                    } => {
+                        let model = view.in_model(position, direction, scale);
+                        self.draw_faces_in_view(
+                            pose.current,
+                            &model,
+                            time,
+                            false,
+                            Some(pose),
+                            Some(glow),
+                        );
+                    }
+                });
+        }
+        if let Some(beam) = &game.pulse_beam {
+            let delta = beam.end - beam.start;
+            let length = delta.dot(delta).sqrt();
+            if let Some(art) = map
+                .arsenal
+                .get(&crate::game::Weapon::Pulse)
+                .map(|weapon| &weapon.pulse_beam)
+                && !art.is_empty()
+            {
+                if length > 0.0 {
+                    let forward = delta * length.recip();
+                    let view = View::camera(camera);
+                    for segment in 0..(length / 81.0).ceil() as usize {
+                        let along = segment as f32 * 81.0;
+                        let scale = ((length - along) / 81.0).min(1.0);
+                        let animation = ((game.time - beam.started) / 0.05) as usize;
+                        let faces = &art[(animation + segment) % art.len()];
+                        let model = view.scaled_model(
+                            beam.start + forward * along,
+                            forward,
+                            Vec3(scale, 1.0, 1.0),
+                        );
+                        self.draw_faces_in_view(faces, &model, time, false, None, Some(1.0));
+                    }
+                }
+            } else {
+                self.effect(
+                    camera,
+                    crate::game::Effect {
+                        origin: beam.start,
+                        end: beam.end,
+                        color: 0x75ff98,
+                        expires: game.time,
+                    },
+                );
+            }
+        }
+        self.zoom = 1.0;
+        if game.death.is_none()
+            && !game.scoped()
+            && let Some(weapon) = map.arsenal.get(&game.weapon)
+        {
             if game.muzzle > game.time
                 && let Some(flash) = &weapon.flash
             {
                 let texture = &flash.textures[game.shots as usize % flash.textures.len()];
                 let (w, h) = texture.size();
-                let scale = flash.scale * WIDTH as f32 / 640.0;
+                let scale = flash.scale * self.width as f32 / 640.0;
                 let mut x = flash.x;
                 let mut y = flash.y;
                 if game.weapon == crate::game::Weapon::Enforcer && game.alternate_flash() {
@@ -122,14 +317,15 @@ impl Frame {
                 self.blit_tile(
                     texture.image(0.0),
                     [
-                        ((0.5 + x) * WIDTH as f32 - w * scale * 0.5).round() as i32,
-                        ((0.5 + y) * HEIGHT as f32 - h * scale * 0.5).round() as i32,
+                        ((0.5 + x) * self.width as f32 - w * scale * 0.5).round() as i32,
+                        ((0.5 + y) * self.height as f32 - h * scale * 0.5).round() as i32,
                         (w * scale).round() as i32,
                         (h * scale).round() as i32,
                     ],
                     [0.0, 0.0, w, h],
                     [1.0; 3],
                     true,
+                    None,
                 );
             }
             let view = Camera {
@@ -138,13 +334,102 @@ impl Frame {
                 pitch: 0.0,
             };
             self.depth.fill(0.0);
+            self.layer(Layer::Weapon);
             let pose = game.pose(weapon);
             self.draw_faces_blended(pose.current, &view, time, false, Some(pose));
         }
-        map.hud.draw(self, game);
-        if map.hud.crosshair.is_none() {
+        self.layer(Layer::Hud);
+        let flash = ((game.hit_flash_until - game.time) / 0.20).clamp(0.0, 1.0) * 0.22;
+        if flash > 0.0 {
+            if let Some(commands) = &mut self.commands {
+                quad(
+                    commands,
+                    [self.width, self.height],
+                    [0, 0, self.width as i32, self.height as i32],
+                    [0.0, 0.0, 1.0, 1.0],
+                    [flash, 0.0, 0.0, 0.0],
+                    None,
+                    Mode::Screen,
+                    commands::WHITE,
+                );
+            } else {
+                let tint = pack([flash, 0.0, 0.0], 255.0);
+                for pixel in &mut self.pixels {
+                    *pixel = blend_light(tint, *pixel);
+                }
+            }
+        }
+        map.hud.draw(self, game, &map.arsenal);
+        if game.death.is_some() {
+            return;
+        } else if game.scoped() {
+            if let Some(scope) = map
+                .arsenal
+                .get(&game.weapon)
+                .and_then(|weapon| weapon.scope.as_ref())
+            {
+                let (w, h) = scope.size();
+                let scale = (self.width as f32 / 640.0).min(self.height as f32 / 256.0);
+                let (dw, dh) = ((w * scale).round() as i32, (h * scale).round() as i32);
+                self.translucent_tile(
+                    scope.image(0.0),
+                    [
+                        (self.width as i32 - dw) / 2,
+                        (self.height as i32 - dh) / 2,
+                        dw,
+                        dh,
+                    ],
+                    [0.0, 0.0, w, h],
+                    [1.0; 3],
+                );
+            } else {
+                self.draw_crosshair();
+            }
+        } else if map.hud.crosshair.is_none() {
             self.draw_crosshair();
         }
+    }
+
+    fn world_sprite(
+        &mut self,
+        view: &View,
+        position: Vec3,
+        image: &TextureImage,
+        scale: f32,
+        glow: f32,
+    ) {
+        let position = view.point(position);
+        if position.2 < NEAR {
+            return;
+        }
+        let screen = project(
+            Vertex {
+                position,
+                u: 0.0,
+                v: 0.0,
+            },
+            self.width,
+            self.height,
+            self.zoom,
+        )
+        .position;
+        let (w, h) = image.size();
+        let size = self.focal_length() * screen.2 * scale;
+        let width = (w * size).round() as i32;
+        let height = (h * size).round() as i32;
+        self.blit_tile(
+            image,
+            [
+                screen.0.round() as i32 - width / 2,
+                screen.1.round() as i32 - height / 2,
+                width,
+                height,
+            ],
+            [0.0, 0.0, w, h],
+            [glow; 3],
+            true,
+            Some(screen.2),
+        );
     }
 
     pub fn tile(
@@ -154,7 +439,40 @@ impl Frame {
         source: [f32; 4],
         tint: [f32; 3],
     ) {
-        self.blit_tile(texture, rect, source, tint, false);
+        self.blit_tile(texture, rect, source, tint, false, None);
+    }
+
+    pub fn translucent_tile(
+        &mut self,
+        texture: &TextureImage,
+        rect: [i32; 4],
+        source: [f32; 4],
+        tint: [f32; 3],
+    ) {
+        self.blit_tile(texture, rect, source, tint, true, None);
+    }
+
+    pub fn solid(&mut self, rect: [i32; 4], color: [f32; 3]) {
+        if let Some(commands) = &mut self.commands {
+            quad(
+                commands,
+                [self.width, self.height],
+                rect,
+                [0.0, 0.0, 1.0, 1.0],
+                [color[0], color[1], color[2], 0.0],
+                None,
+                Mode::Ui,
+                commands::WHITE,
+            );
+        } else {
+            let [x, y, w, h] = rect;
+            let color = pack(color, 255.0);
+            for py in y.max(0)..(y + h).min(self.height as i32) {
+                for px in x.max(0)..(x + w).min(self.width as i32) {
+                    self.pixels[py as usize * self.width + px as usize] = color;
+                }
+            }
+        }
     }
 
     fn blit_tile(
@@ -164,30 +482,48 @@ impl Frame {
         source: [f32; 4],
         tint: [f32; 3],
         translucent: bool,
+        inverse_depth: Option<f32>,
     ) {
         let [x, y, w, h] = rect;
         let [u, v, uw, vh] = source;
         if w <= 0 || h <= 0 {
             return;
         }
+        if let Some(commands) = &mut self.commands {
+            let (id, [tw, th]) = commands.texture(Some(texture));
+            let mode = match (translucent, inverse_depth) {
+                (true, Some(_)) => Mode::ScreenDepth,
+                (true, None) => Mode::Screen,
+                _ => Mode::Ui,
+            };
+            quad(
+                commands,
+                [self.width, self.height],
+                rect,
+                [u / tw, v / th, uw / tw, vh / th],
+                [tint[0], tint[1], tint[2], 0.25],
+                inverse_depth,
+                mode,
+                id,
+            );
+            return;
+        }
         for py in y.max(0)..(y + h).min(HEIGHT as i32) {
             for px in x.max(0)..(x + w).min(WIDTH as i32) {
+                let index = py as usize * WIDTH + px as usize;
+                if inverse_depth.is_some_and(|depth| depth <= self.depth[index]) {
+                    continue;
+                }
                 let u = u + (px - x) as f32 / w as f32 * uw;
                 let v = v + (py - y) as f32 / h as f32 * vh;
                 if let Some([r, g, b]) = texture.sample(u, v, true) {
                     let c = |value: f32, gain: f32| (value * gain).clamp(0.0, 255.0) as u32;
-                    let pixel = &mut self.pixels[py as usize * WIDTH + px as usize];
-                    let mix = |src: u32, shift: u32| {
-                        let dst = (*pixel >> shift) & 255;
-                        if translucent {
-                            src + dst * (255 - src) / 255
-                        } else {
-                            src
-                        }
+                    let color = (c(r, tint[0]) << 16) | (c(g, tint[1]) << 8) | c(b, tint[2]);
+                    self.pixels[index] = if translucent {
+                        blend_light(color, self.pixels[index])
+                    } else {
+                        color
                     };
-                    *pixel = (mix(c(r, tint[0]), 16) << 16)
-                        | (mix(c(g, tint[1]), 8) << 8)
-                        | mix(c(b, tint[2]), 0);
                 }
             }
         }
@@ -211,16 +547,26 @@ impl Frame {
         } else if b.2 < NEAR {
             b = b + (a - b) * ((NEAR - b.2) / (a.2 - b.2));
         }
+        let dimensions = (self.width, self.height);
         let to_screen = |position| {
-            project(Vertex {
-                position,
-                u: 0.0,
-                v: 0.0,
-            })
+            project(
+                Vertex {
+                    position,
+                    u: 0.0,
+                    v: 0.0,
+                },
+                dimensions.0,
+                dimensions.1,
+                self.zoom,
+            )
             .position
         };
         let a = to_screen(a);
         let b = to_screen(b);
+        if let Some(commands) = &mut self.commands {
+            effect_geometry(commands, dimensions, a, b, effect.color);
+            return;
+        }
         let delta = b - a;
         let length = delta.0.abs().max(delta.1.abs());
         if length < 1.0 {
@@ -272,12 +618,18 @@ impl Frame {
         sky: bool,
         pose: Option<crate::game::Pose<'_>>,
     ) {
-        let flat_forward = camera.forward();
-        let right = camera.right();
-        let up = Vec3(0.0, 0.0, 1.0);
-        let (sine, cosine) = camera.pitch.sin_cos();
-        let forward = flat_forward * cosine + up * sine;
-        let up = up * cosine - flat_forward * sine;
+        self.draw_faces_in_view(faces, &View::camera(camera), time, sky, pose, None);
+    }
+
+    fn draw_faces_in_view(
+        &mut self,
+        faces: &[Face],
+        view: &View,
+        time: f32,
+        sky: bool,
+        pose: Option<crate::game::Pose<'_>>,
+        glow: Option<f32>,
+    ) {
         let mut transformed = Vec::new();
         let mut clipped = Vec::new();
 
@@ -299,16 +651,15 @@ impl Frame {
                 face.normal + (next.normal - face.normal) * t
             });
             if face.flags & 0x100 == 0
-                && (camera.position - position(0, face.vertices[0])).dot(normal) < 0.0
+                && (view.eye - position(0, face.vertices[0])).dot(normal) < 0.0
             {
                 continue;
             }
             transformed.clear();
             transformed.extend(face.vertices.iter().enumerate().map(|(i, &vertex)| {
-                let offset = position(i, vertex) - camera.position;
                 let texture_point = vertex - face.origin;
                 Vertex {
-                    position: Vec3(offset.dot(right), offset.dot(up), offset.dot(forward)),
+                    position: view.point(position(i, vertex)),
                     u: texture_point.dot(face.u_axis),
                     v: texture_point.dot(face.v_axis),
                 }
@@ -334,20 +685,34 @@ impl Frame {
             };
             let pan = [face.pan[0] + u_pan, face.pan[1] + v_pan];
             let texture = face.texture.as_ref().map(|texture| texture.image(time));
-            let a = project(clipped[0]);
+            let a = project(clipped[0], self.width, self.height, self.zoom);
             for pair in clipped[1..].windows(2) {
                 self.triangle(
                     a,
-                    project(pair[0]),
-                    project(pair[1]),
+                    project(pair[0], self.width, self.height, self.zoom),
+                    project(pair[1], self.width, self.height, self.zoom),
                     face,
                     ([light, pan[0], pan[1]], texture),
+                    glow,
                 );
             }
         }
     }
 
     fn draw_crosshair(&mut self) {
+        if self.commands.is_some() {
+            let (x, y) = (self.width as i32 / 2, self.height as i32 / 2);
+            let color = [0.81, 0.88, 0.91];
+            for rect in [
+                [x - 6, y, 4, 1],
+                [x + 3, y, 4, 1],
+                [x, y - 6, 1, 4],
+                [x, y + 3, 1, 4],
+            ] {
+                self.solid(rect, color);
+            }
+            return;
+        }
         let center = (HEIGHT / 2) * WIDTH + WIDTH / 2;
         for offset in [3, 4, 5, 6] {
             for pixel in [
@@ -368,10 +733,65 @@ impl Frame {
         vc: Vertex,
         face: &Face,
         ([light, pan_u, pan_v], texture): ([f32; 3], Option<&TextureImage>),
+        glow: Option<f32>,
     ) {
         let [a, b, c] = [va.position, vb.position, vc.position];
         let area = edge(a, b, c.0, c.1);
         if area.abs() < 0.01 || !area.is_finite() {
+            return;
+        }
+        if let Some(commands) = &mut self.commands {
+            let dimensions = [self.width, self.height];
+            if [a, b, c].iter().all(|p| p.0 < 0.0)
+                || [a, b, c].iter().all(|p| p.1 < 0.0)
+                || [a, b, c].iter().all(|p| p.0 > dimensions[0] as f32)
+                || [a, b, c].iter().all(|p| p.1 > dimensions[1] as f32)
+            {
+                return;
+            }
+            let (id, [tw, th]) = commands.texture(texture);
+            let mode = if face.flags & 0x80 != 0 {
+                Mode::SkyMask
+            } else if glow.is_some() || face.flags & 4 != 0 {
+                Mode::ScreenDepth
+            } else {
+                Mode::World
+            };
+            let mut bounds = [0.0; 4];
+            let mut light_transform = [0.0; 4];
+            let tint = if let Some(glow) = glow {
+                bounds[3] = -1.0;
+                glow
+            } else if let Some((transform, limits)) = face
+                .lightmap
+                .as_deref()
+                .and_then(|lm| commands.lighting(lm))
+            {
+                bounds = limits;
+                light_transform = transform;
+                1.0
+            } else {
+                light
+            };
+            let base = if texture.is_some() {
+                [1.0; 3]
+            } else {
+                face.color.map(|c| c / 255.0)
+            };
+            let [r, g, b] = base.map(|c| c * tint);
+            let mask = if face.flags & 2 != 0 { 0.25 } else { 0.0 };
+            let vertices = [va, vb, vc].map(|v| {
+                let z = v.position.2;
+                let [du, dv, ou, ov] = light_transform;
+                GpuVertex {
+                    position: ndc(v.position, dimensions),
+                    uv: [(v.u + pan_u * z) / tw, (v.v + pan_v * z) / th],
+                    light_uv: [v.u * du + ou * z, v.v * dv + ov * z],
+                    bounds,
+                    color: [r, g, b, mask],
+                }
+            });
+            commands.push(Material { texture: id, mode }, &vertices);
             return;
         }
         let left = a.0.min(b.0).min(c.0).floor().max(0.0) as usize;
@@ -406,15 +826,21 @@ impl Frame {
                             Some(face.color)
                         };
                         if let Some(color) = color {
-                            self.depth[index] = inverse_depth;
-                            let exposure = light * (0.62 + 0.38 * (inverse_depth * 680.0).min(1.0));
-                            let color = if let Some(lightmap) = &face.lightmap {
-                                let lighting = lightmap.sample(u, v);
-                                std::array::from_fn(|i| color[i] * lighting[i])
+                            if let Some(glow) = glow {
+                                self.pixels[index] =
+                                    blend_light(pack(color, glow), self.pixels[index]);
                             } else {
-                                color.map(|channel| channel * exposure)
-                            };
-                            self.pixels[index] = pack(color, 1.0);
+                                self.depth[index] = inverse_depth;
+                                let exposure =
+                                    light * (0.62 + 0.38 * (inverse_depth * 680.0).min(1.0));
+                                let color = if let Some(lightmap) = &face.lightmap {
+                                    let lighting = lightmap.sample(u, v);
+                                    std::array::from_fn(|i| color[i] * lighting[i])
+                                } else {
+                                    color.map(|channel| channel * exposure)
+                                };
+                                self.pixels[index] = pack(color, 1.0);
+                            }
                         }
                     }
                 }
@@ -449,6 +875,10 @@ impl Frame {
         }
         file.flush()
     }
+
+    fn focal_length(&self) -> f32 {
+        focal_length(self.width, self.height) * self.zoom
+    }
 }
 
 fn edge(a: Vec3, b: Vec3, x: f32, y: f32) -> f32 {
@@ -458,6 +888,15 @@ fn edge(a: Vec3, b: Vec3, x: f32, y: f32) -> f32 {
 fn pack(color: [f32; 3], light: f32) -> u32 {
     let [r, g, b] = color.map(|channel| (channel * light).clamp(0.0, 255.0) as u32);
     (r << 16) | (g << 8) | b
+}
+
+fn blend_light(source: u32, destination: u32) -> u32 {
+    let channel = |shift: u32| -> u32 {
+        let src = (source >> shift) & 255u32;
+        let dst = (destination >> shift) & 255u32;
+        src + dst * (255 - src) / 255
+    };
+    (channel(16) << 16) | (channel(8) << 8) | channel(0)
 }
 
 fn clip_near(vertices: &[Vertex], clipped: &mut Vec<Vertex>) {
@@ -480,14 +919,94 @@ fn clip_near(vertices: &[Vertex], clipped: &mut Vec<Vertex>) {
     }
 }
 
-fn project(vertex: Vertex) -> Vertex {
+fn focal_length(width: usize, height: usize) -> f32 {
+    (width as f32).max(height as f32 * (16.0 / 9.0)) * 0.48
+}
+
+fn ndc(p: Vec3, [w, h]: [usize; 2]) -> [f32; 3] {
+    [p.0 * 2.0 / w as f32 - 1.0, 1.0 - p.1 * 2.0 / h as f32, p.2]
+}
+
+fn quad(
+    commands: &mut DrawList,
+    dimensions: [usize; 2],
+    [x, y, w, h]: [i32; 4],
+    [u, v, uw, vh]: [f32; 4],
+    color: [f32; 4],
+    depth: Option<f32>,
+    mode: Mode,
+    texture: usize,
+) {
+    if w <= 0
+        || h <= 0
+        || x >= dimensions[0] as i32
+        || y >= dimensions[1] as i32
+        || x + w <= 0
+        || y + h <= 0
+    {
+        return;
+    }
+    let z = depth.unwrap_or(0.25);
+    let vertex = |x, y, u, v| GpuVertex {
+        position: ndc(Vec3(x as f32, y as f32, z), dimensions),
+        uv: [u * z, v * z],
+        light_uv: [0.0; 2],
+        bounds: [0.0, 0.0, 0.0, -1.0],
+        color,
+    };
+    let a = vertex(x, y, u, v);
+    let b = vertex(x + w, y, u + uw, v);
+    let c = vertex(x + w, y + h, u + uw, v + vh);
+    let d = vertex(x, y + h, u, v + vh);
+    commands.push(Material { texture, mode }, &[a, b, c, a, c, d]);
+}
+
+fn effect_geometry(commands: &mut DrawList, (w, h): (usize, usize), a: Vec3, b: Vec3, color: u32) {
+    let delta = b - a;
+    let length = delta.0.hypot(delta.1);
+    let color = [
+        ((color >> 16) & 255) as f32 / 255.0,
+        ((color >> 8) & 255) as f32 / 255.0,
+        (color & 255) as f32 / 255.0,
+        0.0,
+    ];
+    let pixel_scale = h as f32 / HEIGHT as f32;
+    let corners = if length < 1.0 {
+        let size = (b.2 * 960.0).clamp(3.0, 13.0) * pixel_scale;
+        [
+            b + Vec3(-size, 0.0, 0.0),
+            b + Vec3(0.0, -size, 0.0),
+            b + Vec3(size, 0.0, 0.0),
+            b + Vec3(0.0, size, 0.0),
+        ]
+    } else {
+        let cross = Vec3(-delta.1, delta.0, 0.0) * (pixel_scale.max(1.0) / length);
+        [a - cross, a + cross, b + cross, b - cross]
+    };
+    let [a, b, c, d] = corners.map(|p| GpuVertex {
+        position: ndc(p, [w, h]),
+        uv: [0.0; 2],
+        light_uv: [0.0; 2],
+        bounds: [0.0, 0.0, 0.0, -1.0],
+        color,
+    });
+    commands.push(
+        Material {
+            texture: commands::WHITE,
+            mode: Mode::ScreenDepth,
+        },
+        &[a, b, c, a, c, d],
+    );
+}
+
+fn project(vertex: Vertex, width: usize, height: usize, zoom: f32) -> Vertex {
     let p = vertex.position;
     let inverse_depth = p.2.recip();
-    let scale = WIDTH as f32 * 0.48 * inverse_depth;
+    let scale = focal_length(width, height) * inverse_depth * zoom;
     Vertex {
         position: Vec3(
-            WIDTH as f32 * 0.5 + p.0 * scale,
-            HEIGHT as f32 * 0.5 - p.1 * scale,
+            width as f32 * 0.5 + p.0 * scale,
+            height as f32 * 0.5 - p.1 * scale,
             inverse_depth,
         ),
         u: vertex.u * inverse_depth,

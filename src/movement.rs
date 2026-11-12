@@ -11,6 +11,7 @@ pub struct Profile {
     pub eye_height: f32,
     pub step_height: f32,
     pub bob: f32,
+    pub mass: f32,
 }
 
 impl Default for Profile {
@@ -24,6 +25,7 @@ impl Default for Profile {
             eye_height: 27.0,
             step_height: 25.0,
             bob: 0.016,
+            mass: 100.0,
         }
     }
 }
@@ -34,6 +36,8 @@ pub struct PlayerAudio {
     pub jump: Option<Arc<Wave>>,
     pub land: Option<Arc<Wave>>,
     pub water_step: Option<Arc<Wave>>,
+    pub pain: [Option<Arc<Wave>>; 4],
+    pub death: [Option<Arc<Wave>>; 3],
 }
 
 #[derive(Clone, Copy, Debug)]

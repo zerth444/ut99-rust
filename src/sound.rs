@@ -169,6 +169,7 @@ pub struct Mixer {
     cursors: Vec<f64>,
     mix: Vec<[f32; 2]>,
     voices: Vec<(Arc<Wave>, f64)>,
+    weapon_loop: Option<(Arc<Wave>, f64)>,
 }
 
 impl Mixer {
@@ -177,6 +178,7 @@ impl Mixer {
             cursors: Vec::new(),
             mix: Vec::new(),
             voices: Vec::new(),
+            weapon_loop: None,
         }
     }
 
@@ -212,6 +214,21 @@ impl Mixer {
                 let sample = a + (b - a) * cursor.fract() as f32;
                 frame[0] += sample * left;
                 frame[1] += sample * right;
+                *cursor = (*cursor + step) % count as f64;
+            }
+        }
+        if let Some((wave, cursor)) = &mut self.weapon_loop {
+            let step = f64::from(wave.rate) / f64::from(MIX_RATE);
+            let count = wave.samples.len();
+            for frame in &mut self.mix {
+                let index = *cursor as usize;
+                let a = wave.samples[index];
+                let b = wave.samples[(index + 1) % count];
+                let sample = (a + (b - a) * cursor.fract() as f32) * 0.45;
+                if !muted {
+                    frame[0] += sample;
+                    frame[1] += sample;
+                }
                 *cursor = (*cursor + step) % count as f64;
             }
         }
@@ -313,6 +330,18 @@ pub mod device {
                 self.mixer.voices.remove(0);
             }
             self.mixer.voices.push((wave, 0.0));
+        }
+
+        pub fn set_weapon_loop(&mut self, wave: Option<&Arc<Wave>>) {
+            if self
+                .mixer
+                .weapon_loop
+                .as_ref()
+                .map(|(wave, _)| Arc::as_ptr(wave))
+                != wave.map(Arc::as_ptr)
+            {
+                self.mixer.weapon_loop = wave.map(|wave| (Arc::clone(wave), 0.0));
+            }
         }
 
         pub fn update(

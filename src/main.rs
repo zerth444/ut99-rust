@@ -9,6 +9,8 @@ mod movement;
 mod mover;
 mod music;
 mod package;
+#[cfg(windows)]
+mod present;
 mod props;
 mod render;
 mod script;
@@ -160,6 +162,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         cycle: 0,
                     },
                     false,
+                    None,
                 );
                 frame.draw_practice(&map, &camera, 0.0, &practice);
             } else {

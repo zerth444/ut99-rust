@@ -258,12 +258,17 @@ impl Texture {
     }
 
     pub fn size(&self) -> (f32, f32) {
-        (self.frames[0].width as f32, self.frames[0].height as f32)
+        self.frames[0].size()
     }
 
     pub fn image(&self, time: f32) -> &TextureImage {
         let frame = (time * self.rate).floor() as usize % self.frames.len();
         &self.frames[frame]
+    }
+
+    pub fn image_once(&self, progress: f32) -> &TextureImage {
+        let frame = (progress * self.frames.len() as f32) as usize;
+        &self.frames[frame.min(self.frames.len() - 1)]
     }
 }
 
@@ -273,6 +278,35 @@ fn wrapped_distance(delta: f32, period: usize) -> f32 {
 }
 
 impl TextureImage {
+    #[cfg(windows)]
+    pub(crate) fn glyph_mask(width: usize, height: usize, pixels: Vec<u8>) -> Self {
+        let palette = (0..=255).map(|value| [value as f32; 3]).collect();
+        Self {
+            width,
+            height,
+            pixels,
+            palette,
+        }
+    }
+    pub(crate) fn bgra(&self) -> Vec<u32> {
+        let palette: Vec<_> = self
+            .palette
+            .iter()
+            .enumerate()
+            .map(|(i, color)| {
+                let [r, g, b] = color.map(|c| c.clamp(0.0, 255.0) as u32);
+                (u32::from(i != 0) * 255 << 24) | (r << 16) | (g << 8) | b
+            })
+            .collect();
+        self.pixels
+            .iter()
+            .map(|&index| palette[index as usize])
+            .collect()
+    }
+    pub fn size(&self) -> (f32, f32) {
+        (self.width as f32, self.height as f32)
+    }
+
     pub fn sample(&self, u: f32, v: f32, masked: bool) -> Option<[f32; 3]> {
         let x = (u.floor() as isize).rem_euclid(self.width as isize) as usize;
         let y = (v.floor() as isize).rem_euclid(self.height as isize) as usize;

@@ -103,6 +103,9 @@ pub struct Lightmap {
 }
 
 impl Lightmap {
+    pub(crate) fn gpu_data(&self) -> (usize, usize, [f32; 2], [f32; 2], &[[f32; 3]]) {
+        (self.width, self.height, self.pan, self.scale, &self.colors)
+    }
     pub fn bake(
         face: &Face,
         index: &LightIndex,
