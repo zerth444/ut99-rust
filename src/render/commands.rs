@@ -9,6 +9,7 @@ pub const LIGHTMAPS: usize = 1;
 pub enum Mode {
     World,
     SkyMask,
+    Modulated,
     ScreenDepth,
     Screen,
     Ui,

@@ -6,6 +6,7 @@ use crate::render::Camera;
 use crate::sound::Wave;
 
 pub mod ballistics;
+pub mod decals;
 pub mod ordnance;
 pub mod shock;
 
@@ -129,6 +130,8 @@ pub struct WeaponAssets {
     pub down_motion: Motion,
     pub select_sound: Option<Arc<Wave>>,
     pub flash: Option<Flash>,
+    pub muzzle_triangle: Option<usize>,
+    pub case_triangle: Option<usize>,
     pub fire: Option<Arc<Wave>>,
     pub alternate: Option<Arc<Wave>>,
     pub shock: Option<shock::Assets>,
@@ -136,6 +139,7 @@ pub struct WeaponAssets {
     pub pulse_beam: Vec<Vec<Face>>,
     pub pulse_starter: Vec<Vec<Face>>,
     pub pulse_tip: [Option<Arc<crate::texture::Texture>>; 2],
+    pub pulse_scorch: Option<(Arc<crate::texture::Texture>, f32)>,
     pub attack_start: Motion,
     pub attack_end: Motion,
     pub spin_down: Motion,
@@ -146,6 +150,28 @@ pub struct WeaponAssets {
     pub guided_hud: [Option<Arc<crate::texture::Texture>>; 3],
     pub rocket_lock: [Option<Arc<Wave>>; 2],
     pub lock_reticle: Option<Arc<crate::texture::Texture>>,
+}
+
+impl WeaponAssets {
+    pub fn muzzle_position(&self, pose: Pose<'_>) -> Option<Vec3> {
+        pose.edge_center(self.muzzle_triangle?)
+    }
+}
+
+impl Pose<'_> {
+    fn edge_center(self, triangle: usize) -> Option<Vec3> {
+        let triangle = Some(triangle);
+        let center = |faces: &[Face]| {
+            let index = faces
+                .binary_search_by_key(&triangle, |face| face.mesh_triangle)
+                .ok()?;
+            let vertices = &faces[index].vertices;
+            Some((vertices[0] + vertices[2]) * 0.5)
+        };
+        let current = center(self.current)?;
+        let next = center(self.next).unwrap_or(current);
+        Some(current + (next - current) * self.fraction)
+    }
 }
 
 pub struct Flash {
@@ -291,7 +317,7 @@ pub struct PulseBeam {
     pub start: Vec3,
     pub end: Vec3,
     pub started: f32,
-    pub wall: bool,
+    pub wall: Option<Vec3>,
     pub blocked: bool,
     pub hit_player: bool,
 }
@@ -390,6 +416,7 @@ pub struct Practice {
     attack_end: Option<(Weapon, bool, f32)>,
     pub ordnance: ordnance::Shots,
     pub ballistics: ballistics::Effects,
+    pub decals: decals::Marks,
     pub death: Option<Death>,
     charge: Option<Charge>,
     hit_taken: u16,
@@ -442,6 +469,7 @@ impl Practice {
             attack_end: None,
             ordnance: ordnance::Shots::default(),
             ballistics: ballistics::Effects::default(),
+            decals: decals::Marks::default(),
             death: None,
             charge: None,
             hit_taken: 0,
@@ -512,11 +540,6 @@ impl Practice {
         self.pulse_last_contact = -1.0;
         self.pulse_contact = false;
         self.zoom = SniperZoom::default();
-    }
-
-    pub fn alternate_flash(&self) -> bool {
-        self.last_fire
-            .is_some_and(|(id, alt, _)| id == self.weapon && alt)
     }
 
     pub fn pose<'a>(&self, weapon: &'a WeaponAssets) -> Pose<'a> {
@@ -898,6 +921,7 @@ impl Practice {
     ) -> Vec<Arc<Wave>> {
         self.time += dt;
         self.effects.retain(|effect| effect.expires > self.time);
+        self.decals.update(self.time);
         let mut sounds = Vec::new();
         self.ballistics
             .update(map, self.target.as_ref(), self.time, dt, &mut sounds);
@@ -981,6 +1005,22 @@ impl Practice {
             &mut sounds,
         );
         self.update_pulse_contact(dt);
+        if let Some(beam) = &self.pulse_beam
+            && let Some(normal) = beam.wall
+            && let Some((texture, scale)) = map
+                .arsenal
+                .get(&Weapon::Pulse)
+                .and_then(|art| art.pulse_scorch.as_ref())
+        {
+            self.decals.project(
+                &map.faces,
+                beam.end,
+                normal,
+                texture,
+                *scale,
+                self.time + 5.0,
+            );
+        }
         let mut blasts = self
             .shock
             .update(map, dt, self.time, &mut sounds, self.target.as_ref());
@@ -1184,11 +1224,14 @@ impl Practice {
         let offset = direction * 17.5 + right * 14.0 - up * 10.0;
         let start = camera.position + offset;
         let obstruction = map.collision.ray(camera.position, offset);
-        let wall = map.collision.ray(start, direction * 810.0);
+        let wall = obstruction
+            .is_none()
+            .then(|| map.collision.ray_surface(start, direction * 810.0))
+            .flatten();
         let end = if obstruction.is_some() {
             start
         } else {
-            wall.unwrap_or(start + direction * 810.0)
+            wall.map_or(start + direction * 810.0, |(point, _)| point)
         };
         let started = self
             .pulse_beam
@@ -1198,7 +1241,7 @@ impl Practice {
             start,
             end,
             started,
-            wall: wall.is_some(),
+            wall: wall.map(|(_, normal)| normal),
             blocked: obstruction.is_some(),
             hit_player: false,
         });
@@ -1216,7 +1259,7 @@ impl Practice {
             && let Some(fraction) = target.ray(beam.start, delta)
         {
             beam.end = beam.start + delta * fraction;
-            beam.wall = false;
+            beam.wall = None;
             beam.hit_player = true;
             if !self.pulse_contact {
                 let initial = (0.5 * (self.time - self.pulse_last_contact)).min(0.1);
@@ -1672,7 +1715,16 @@ impl Practice {
                 Weapon::Minigun => (30.0, 5.0, -5.0),
                 _ => (30.0, 5.0, -1.0),
             };
-            let offset = forward * ahead + right * side + up * height;
+            let case_origin = map
+                .arsenal
+                .get(&weapon)
+                .and_then(|art| self.pose(art).edge_center(art.case_triangle?))
+                .filter(|point| point.0 > 0.0);
+            let offset =
+                case_origin.map_or(forward * ahead + right * side + up * height, |point| {
+                    // Keep the ejection distance while matching the projected viewmodel.
+                    (forward * point.0 + right * point.1 + up * point.2) * (ahead / point.0)
+                });
             if map.collision.ray(camera.position, offset).is_none() {
                 let velocity = (forward * (0.55 + 0.15 * self.jitter())
                     + right * (0.3 + 0.1 * self.jitter())
@@ -1692,6 +1744,18 @@ impl Practice {
             }
         }
         if let Some((point, normal)) = wall {
+            let pock = ((self.jitter() + 1.0) * 1.5) as usize;
+            let expires = self.time + 19.0 + (self.jitter() + 1.0) * 2.5;
+            if let Some(texture) = &map.ballistics.pock[pock] {
+                self.decals.project(
+                    &map.faces,
+                    point,
+                    normal,
+                    texture,
+                    map.ballistics.pock_scale,
+                    expires,
+                );
+            }
             let sound = (((self.jitter() + 1.0) * 2.0) as usize).min(3);
             if let Some(sound) = map.ballistics.wall_sounds.get(sound) {
                 sounds.extend(sound.iter().cloned());
@@ -1758,7 +1822,7 @@ fn shot_sound(
     alt: bool,
 ) -> Option<Arc<Wave>> {
     let assets = arsenal.get(&weapon)?;
-    if alt && assets.alternate.is_some() {
+    if alt && weapon != Weapon::Enforcer && assets.alternate.is_some() {
         return assets.alternate.clone();
     }
     assets.fire.clone()
@@ -1776,6 +1840,41 @@ mod tests {
             slot: None,
             cycle: 0,
         }
+    }
+
+    #[test]
+    #[ignore = "requires the local GOTY game packages"]
+    fn deck16_bullet_holes_attach_to_walls_and_survive_respawn() {
+        let path = std::path::Path::new("local/goty/Maps/DM-Deck16][.unr");
+        let bytes = std::fs::read(path).unwrap();
+        let map = Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap();
+        assert!(map.ballistics.pock.iter().all(Option::is_some));
+        assert!((map.ballistics.pock_scale - 0.19).abs() < 0.001);
+        let mut game = Practice::new(&map);
+        let mut camera = Camera::from_start(map.starts[11]);
+        for _ in 0..8 {
+            game.trace_bullet(&map, &camera, Weapon::Enforcer, false, &mut Vec::new());
+            if game.decals.visible().next().is_some() {
+                break;
+            }
+            camera.yaw += std::f32::consts::FRAC_PI_4;
+        }
+        assert!(
+            game.decals.visible().next().is_some(),
+            "a bullet should mark the Deck16 BSP"
+        );
+        let mut frame = crate::render::Frame::hardware(&map);
+        frame.draw_practice(&map, &camera, game.time, &game);
+        use crate::render::commands::{Layer, Mode};
+        assert!(
+            frame.commands.as_ref().unwrap().passes[Layer::Effects as usize]
+                .batches()
+                .any(|(material, _)| material.mode == Mode::Modulated)
+        );
+        game.reset_player(&map.arsenal);
+        assert!(game.decals.visible().next().is_some());
+        game.decals.update(24.0);
+        assert!(game.decals.visible().next().is_none());
     }
 
     #[test]
@@ -1881,7 +1980,14 @@ mod tests {
                         );
                         assert_eq!(game.shots, 1);
                         assert_eq!(game.ammo(), Some(9));
-                        assert!(game.alternate_flash() && !sounds.is_empty());
+                        assert!(
+                            game.last_fire
+                                .is_some_and(|(id, alt, _)| id == Weapon::Enforcer && alt)
+                        );
+                        assert!(Arc::ptr_eq(
+                            &sounds[0],
+                            map.arsenal[&Weapon::Enforcer].fire.as_ref().unwrap()
+                        ));
                         game.update(
                             &mut map,
                             &camera,
@@ -2160,6 +2266,7 @@ mod tests {
         assert_eq!(pulse.pulse_starter.len(), 5);
         assert!(pulse.pulse_starter.iter().all(|faces| !faces.is_empty()));
         assert!(pulse.pulse_tip.iter().all(Option::is_some));
+        assert!((pulse.pulse_scorch.as_ref().unwrap().1 - 0.2).abs() < 0.001);
         assert_eq!(pulse.attack_start.frames.len(), 15);
         assert_eq!(pulse.attack_end.frames.len(), 5);
         assert_eq!(pulse.primary_motion.frames.len(), 40);
@@ -2263,6 +2370,21 @@ mod tests {
             .expect("Original Enforcer muzzle flash");
         assert_eq!(flash.textures.len(), 5);
         assert!((flash.length - 0.02).abs() < 0.001);
+        let barrel = |motion: &Motion, frame: f32| {
+            model
+                .muzzle_position(motion.sample(frame / motion.rate).unwrap())
+                .unwrap()
+        };
+        let normal = barrel(&model.primary_motion, 0.0);
+        let sideways = barrel(&model.alternate_motion, 0.0);
+        assert!(sideways.1 > normal.1 + 30.0 && sideways.2 < normal.2 - 30.0);
+        let recoiled = barrel(&model.alternate_motion, 1.0);
+        let between = barrel(&model.alternate_motion, 0.5);
+        assert!((recoiled - sideways).dot(recoiled - sideways) > 1.0);
+        assert!(
+            (between - (sideways + recoiled) * 0.5).dot(between - (sideways + recoiled) * 0.5)
+                < 0.001
+        );
         let pose = model
             .primary_motion
             .sample(0.5 / model.primary_motion.rate)

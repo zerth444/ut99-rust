@@ -18,6 +18,8 @@ pub struct Art {
     pub wall_sounds: [Option<Arc<Wave>>; 3],
     pub flesh: Option<Arc<Wave>>,
     pub shell: Option<Arc<Wave>>,
+    pub pock: [Option<Arc<Texture>>; 3],
+    pub pock_scale: f32,
 }
 
 #[derive(Default)]

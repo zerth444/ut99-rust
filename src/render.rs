@@ -1,7 +1,10 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-use crate::game::shock::{self, Visual};
+use crate::game::{
+    decals::MODULATED,
+    shock::{self, Visual},
+};
 use crate::map::{Face, Map, Start, Vec3};
 use crate::texture::TextureImage;
 
@@ -210,6 +213,9 @@ impl Frame {
         self.draw(map, camera, time);
         self.layer(Layer::Effects);
         let view = View::camera(camera);
+        for mark in game.decals.visible() {
+            self.draw_faces_in_view(mark, &view, time, false, None, None);
+        }
         if let Some(target) = &game.target {
             let motion = if target.health == 0 {
                 &map.player_deaths[0]
@@ -317,9 +323,9 @@ impl Frame {
                     }
                 }
                 if !beam.hit_player
-                    && let Some(tip) = &art.pulse_tip[usize::from(beam.wall)]
+                    && let Some(tip) = &art.pulse_tip[usize::from(beam.wall.is_some())]
                 {
-                    let inset = if beam.wall { 5.0 } else { 4.0 };
+                    let inset = if beam.wall.is_some() { 5.0 } else { 4.0 };
                     self.world_sprite(&view, beam.end - forward * inset, tip.image(age), 0.65, 1.0);
                 }
             }
@@ -330,18 +336,40 @@ impl Frame {
             && !game.scoped()
             && let Some(weapon) = map.arsenal.get(&game.weapon)
         {
+            let view = Camera {
+                position: Vec3::default(),
+                yaw: 0.0,
+                pitch: 0.0,
+            };
+            let pose = game.pose(weapon);
             if game.muzzle > game.time
                 && let Some(flash) = &weapon.flash
             {
                 let texture = &flash.textures[game.shots as usize % flash.textures.len()];
                 let (w, h) = texture.size();
                 let scale = flash.scale * self.width as f32 / 640.0;
-                let mut x = flash.x;
-                let mut y = flash.y;
-                if game.weapon == crate::game::Weapon::Enforcer && game.alternate_flash() {
-                    x *= 0.3;
-                    y *= 2.5;
-                }
+                let [x, y] = weapon.muzzle_position(pose).map_or_else(
+                    || {
+                        [
+                            (0.5 + flash.x) * self.width as f32,
+                            (0.5 + flash.y) * self.height as f32,
+                        ]
+                    },
+                    |position| {
+                        let muzzle = project(
+                            Vertex {
+                                position: View::camera(&view).point(position),
+                                u: 0.0,
+                                v: 0.0,
+                            },
+                            self.width,
+                            self.height,
+                            self.zoom,
+                        )
+                        .position;
+                        [muzzle.0, muzzle.1]
+                    },
+                );
                 let offset = if flash.half_offset > 0.0 {
                     [flash.half_offset; 2]
                 } else {
@@ -350,8 +378,8 @@ impl Frame {
                 self.blit_tile(
                     texture.image(0.0),
                     [
-                        ((0.5 + x) * self.width as f32 - offset[0] * scale).round() as i32,
-                        ((0.5 + y) * self.height as f32 - offset[1] * scale).round() as i32,
+                        (x - offset[0] * scale).round() as i32,
+                        (y - offset[1] * scale).round() as i32,
                         (w * scale).round() as i32,
                         (h * scale).round() as i32,
                     ],
@@ -361,14 +389,8 @@ impl Frame {
                     None,
                 );
             }
-            let view = Camera {
-                position: Vec3::default(),
-                yaw: 0.0,
-                pitch: 0.0,
-            };
             self.depth.fill(0.0);
             self.layer(Layer::Weapon);
-            let pose = game.pose(weapon);
             self.draw_faces_blended(pose.current, &view, time, false, Some(pose));
         }
         self.layer(Layer::Hud);
@@ -820,6 +842,7 @@ impl Frame {
         if area.abs() < 0.01 || !area.is_finite() {
             return;
         }
+        let modulated = face.flags & MODULATED != 0;
         if let Some(commands) = &mut self.commands {
             let dimensions = [self.width, self.height];
             if [a, b, c].iter().all(|p| p.0 < 0.0)
@@ -832,6 +855,8 @@ impl Frame {
             let (id, [tw, th]) = commands.texture(texture);
             let mode = if face.flags & 0x80 != 0 {
                 Mode::SkyMask
+            } else if modulated {
+                Mode::Modulated
             } else if glow.is_some() || face.flags & 4 != 0 {
                 Mode::ScreenDepth
             } else {
@@ -839,7 +864,10 @@ impl Frame {
             };
             let mut bounds = [0.0; 4];
             let mut light_transform = [0.0; 4];
-            let tint = if let Some(glow) = glow {
+            let tint = if modulated {
+                bounds[3] = -1.0;
+                1.0
+            } else if let Some(glow) = glow {
                 bounds[3] = -1.0;
                 glow
             } else if let Some((transform, limits)) = face
@@ -906,7 +934,13 @@ impl Frame {
                             Some(face.color)
                         };
                         if let Some(color) = color {
-                            if let Some(glow) = glow {
+                            if modulated {
+                                let dst = self.pixels[index];
+                                let [r, g, b] =
+                                    [16, 8, 0].map(|shift| ((dst >> shift) & 255) as f32);
+                                self.pixels[index] =
+                                    pack([r * color[0], g * color[1], b * color[2]], 2.0 / 255.0);
+                            } else if let Some(glow) = glow {
                                 self.pixels[index] =
                                     blend_light(pack(color, glow), self.pixels[index]);
                             } else {

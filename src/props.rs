@@ -521,6 +521,12 @@ pub fn load(
                 find_export(&assets, "botpack", name, "Texture")
                     .and_then(|id| cached_texture(&assets, &mut textures, id))
             });
+            let scorch = find_export(&assets, "botpack", "BoltScorch", "Class");
+            let scorch = appearance(&mut assets, &mut class_cache, scorch);
+            weapon_assets.pulse_scorch = scorch
+                .texture
+                .and_then(|id| cached_texture(&assets, &mut textures, id))
+                .map(|texture| (texture, scorch.scale));
         }
         let load_sound = match weapon {
             Weapon::Hammer => find_export(&assets, "botpack", "ImpactAltFireStart", "Sound"),
@@ -610,6 +616,18 @@ pub fn load(
                 Mesh::read(package, export).ok()
             });
             if let Some(mesh) = mesh {
+                let (package, export) = assets.object(object);
+                if weapon == Weapon::Enforcer && package.name(export.name).ok() == Some("AutoML") {
+                    // Opposite corners of the front barrel opening in the GOTY view mesh.
+                    weapon_assets.muzzle_triangle = mesh
+                        .triangles
+                        .iter()
+                        .position(|triangle| triangle.vertices == [76, 84, 85]);
+                    weapon_assets.case_triangle = mesh
+                        .triangles
+                        .iter()
+                        .position(|triangle| triangle.vertices == [125, 30, 150]);
+                }
                 let rest = mesh.sequence(&["Still", "Idle"]).map_or(0, |seq| seq.start);
                 let transform =
                     |point| rotate(product(point - mesh.origin, mesh.scale), mesh.rotation);
@@ -780,6 +798,9 @@ fn read_ballistics(
     };
     let smoke = ["us1_a00", "us2_a00", "us3_a00", "us8_a00"].map(&mut texture);
     let spark = texture("Sparky");
+    let pock = ["pock0_t", "pock2_t", "pock4_t"].map(&mut texture);
+    let pock_class = find_export(assets, "botpack", "Pock", "Class");
+    let pock_scale = appearance(assets, classes, pock_class).scale;
     let mut sound = |name| {
         let object = ["botpack", "unrealshare", "unreali"]
             .into_iter()
@@ -794,6 +815,8 @@ fn read_ballistics(
         wall_sounds: ["ricochet", "Impact1", "Impact2"].map(&mut sound),
         flesh: sound("ChunkHit"),
         shell: sound("shell2"),
+        pock,
+        pock_scale,
     }
 }
 
