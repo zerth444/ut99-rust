@@ -300,9 +300,13 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize, obs: bool)
                         };
                         walker.dodge(map.collision.profile, direction)
                     });
-                    movement_audio = walker.advance(
+                    let swim = camera.look_direction() * axis(b'W' as u16, b'S' as u16)
+                        + camera.right() * (0.5 * axis(b'D' as u16, b'A' as u16))
+                        + Vec3(0.0, 0.0, f32::from(key(VK_SPACE) || key(VK_CONTROL)) * 0.5);
+                    movement_audio = walker.advance_with_swim(
                         &map.collision,
                         movement * (speed / movement.dot(movement).sqrt().max(1.0)),
+                        swim,
                         jump.then(|| game.jump_speed(map.collision.profile.jump_speed)),
                         dt,
                     );
@@ -408,6 +412,10 @@ unsafe fn message_loop(window: HWND, map: &mut Map, mut start: usize, obs: bool)
                     map.arsenal
                         .get(&Weapon::Pulse)
                         .and_then(|weapon| weapon.alternate.as_ref())
+                } else if game.pulse_primary_since.is_some() {
+                    map.arsenal
+                        .get(&Weapon::Pulse)
+                        .and_then(|weapon| weapon.fire.as_ref())
                 } else if game.minigun_firing {
                     map.arsenal
                         .get(&Weapon::Minigun)

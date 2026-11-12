@@ -247,7 +247,10 @@ impl Shots {
         let right = camera.right();
         let up = forward.cross(right);
         let offset = match kind {
-            Kind::Pulse => forward * 24.0 + right * 14.0 - up * 8.0,
+            Kind::Pulse => {
+                let (sin, cos) = variation.sin_cos();
+                forward * 16.5 + right * (15.0 - 4.0 * sin) + up * (4.0 * cos - 10.78)
+            }
             Kind::Rocket | Kind::Grenade => forward * 20.0 + right * (8.0 + side) - up * 9.0,
             Kind::FlakShell | Kind::Chunk => forward * 20.0 + right * (11.0 + side) - up * 15.0,
             Kind::Razor | Kind::RazorAlt => forward * 20.0 + right * 15.0 - up * 13.0,

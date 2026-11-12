@@ -5,7 +5,8 @@ use crate::movement::{Profile, Regions};
 use crate::package::invalid;
 
 pub(crate) const PLAYER_RADIUS: f32 = 17.0;
-const PLAYER: Vec3 = Vec3(PLAYER_RADIUS, PLAYER_RADIUS, 39.0);
+pub(crate) const PLAYER_HEIGHT: f32 = 39.0;
+const PLAYER: Vec3 = Vec3(PLAYER_RADIUS, PLAYER_RADIUS, PLAYER_HEIGHT);
 const SKIN: f32 = 0.15;
 const UP: Vec3 = Vec3(0.0, 0.0, 1.0);
 const FLOOR_NORMAL: f32 = 0.7;
@@ -155,7 +156,7 @@ impl Collision {
     fn slide(&self, mut position: Vec3, mut delta: Vec3) -> Vec3 {
         let mut normals = Vec::new();
         for _ in 0..4 {
-            if delta.dot(delta) < 0.0001 {
+            if delta.dot(delta) < 1e-8 {
                 break;
             }
             let Some(hit) = self.trace(position, delta) else {
@@ -360,6 +361,17 @@ impl Walker {
         jump_speed: Option<f32>,
         dt: f32,
     ) -> MotionEvents {
+        self.advance_with_swim(world, desired, desired, jump_speed, dt)
+    }
+
+    pub fn advance_with_swim(
+        &mut self,
+        world: &Collision,
+        desired: Vec3,
+        swim: Vec3,
+        jump_speed: Option<f32>,
+        dt: f32,
+    ) -> MotionEvents {
         let mut events = MotionEvents::default();
         if dt <= 0.0 {
             return events;
@@ -369,6 +381,7 @@ impl Walker {
         let steps = (dt * 120.0).ceil().max(1.0) as usize;
         let step = dt / steps as f32;
         if self.grounded
+            && !world.regions.at(self.position).water
             && let Some(jump_speed) = jump_speed
         {
             self.velocity.2 = jump_speed;
@@ -383,6 +396,33 @@ impl Walker {
         };
         for _ in 0..steps {
             let zone = world.regions.at(self.position);
+            if zone.water {
+                self.grounded = false;
+                self.dodging = false;
+                let intent = limit(swim, 1.0);
+                let retained = (1.0 - 0.5 * zone.fluid_friction * step).max(0.0);
+                let buoyancy = profile.buoyancy / profile.mass.max(1.0);
+                let acceleration = intent * profile.acceleration + zone.gravity * (1.0 - buoyancy);
+                self.velocity = limit(
+                    self.velocity * retained + acceleration * step,
+                    profile.water_speed,
+                );
+                let flow = zone.flow * 25.0;
+                let origin = self.position;
+                self.position = world.slide(origin, (self.velocity + flow) * step);
+                self.velocity = (self.position - origin) * step.recip() - flow;
+                if !world.regions.at(self.position).water && intent.2 > 0.0 {
+                    let ahead = crate::mover::unit(Vec3(intent.0, intent.1, 0.0));
+                    let reach = ahead * (PLAYER_RADIUS + 8.0);
+                    if world.trace(self.position, reach).is_some()
+                        && world.trace(self.position, UP * PLAYER.2).is_none()
+                        && world.trace(self.position + UP * PLAYER.2, reach).is_none()
+                    {
+                        self.velocity.2 = 330.0 + 2.0 * PLAYER_RADIUS;
+                    }
+                }
+                continue;
+            }
             let speed = horizontal_length(self.velocity);
             let mut horizontal = Vec3(self.velocity.0, self.velocity.1, 0.0);
             if self.grounded {

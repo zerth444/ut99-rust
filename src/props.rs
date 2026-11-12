@@ -83,6 +83,7 @@ struct Appearance {
     flash_y: Option<f32>,
     flash_o: Option<f32>,
     flash_length: Option<f32>,
+    flash_size: Option<u32>,
     fire_offset: Option<Vec3>,
     ammo_class: Option<Object>,
     pickup_ammo: Option<u16>,
@@ -115,6 +116,7 @@ struct VisualProperties {
     flash_y: Option<f32>,
     flash_o: Option<f32>,
     flash_length: Option<f32>,
+    flash_size: Option<u32>,
     fire_offset: Option<Vec3>,
     ammo_class: Option<i32>,
     pickup_ammo: Option<u16>,
@@ -151,6 +153,7 @@ impl VisualProperties {
             flash_y: None,
             flash_o: None,
             flash_length: None,
+            flash_size: None,
             fire_offset: None,
             ammo_class: None,
             pickup_ammo: None,
@@ -188,6 +191,7 @@ impl VisualProperties {
                 "FlashY" => props_out.flash_y = Some(value.f32()?),
                 "FlashO" => props_out.flash_o = Some(value.f32()?),
                 "FlashLength" => props_out.flash_length = Some(value.f32()?),
+                "FlashS" => props_out.flash_size = Some(value.u32()?),
                 "FireOffset" => props_out.fire_offset = Some(Vec3::read(&mut value)?),
                 "AmmoName" => props_out.ammo_class = Some(value.compact()?),
                 "PickupAmmoCount" => props_out.pickup_ammo = u16::try_from(value.u32()?).ok(),
@@ -258,6 +262,7 @@ impl VisualProperties {
         parent.flash_y = self.flash_y.or(parent.flash_y);
         parent.flash_o = self.flash_o.or(parent.flash_o);
         parent.flash_length = self.flash_length.or(parent.flash_length);
+        parent.flash_size = self.flash_size.or(parent.flash_size);
         parent.fire_offset = self.fire_offset.or(parent.fire_offset);
         parent.player_offset = self.player_offset.or(parent.player_offset);
         parent.player_scale = self.player_scale.or(parent.player_scale);
@@ -357,9 +362,16 @@ pub struct Scene {
     pub player_idle: Motion,
     pub ordnance: ordnance::Arsenal,
     pub ballistics: crate::game::ballistics::Art,
+    pub zones: Vec<crate::movement::Zone>,
 }
 
-pub fn load(map: &Package<'_>, actors: &[&Export], path: &Path) -> io::Result<Scene> {
+pub fn load(
+    map: &Package<'_>,
+    actors: &[&Export],
+    path: &Path,
+    zone_actors: &[i32],
+    level: crate::movement::Zone,
+) -> io::Result<Scene> {
     let Some(folder) = path.parent() else {
         return Ok(Scene::default());
     };
@@ -502,13 +514,20 @@ pub fn load(map: &Package<'_>, actors: &[&Export], path: &Path) -> io::Result<Sc
         }
         if weapon == Weapon::Pulse {
             weapon_assets.pulse_beam =
-                pulse_beam(&mut assets, &mut class_cache, &mut textures).unwrap_or_default();
+                pulse_beam(&mut assets, &mut class_cache, &mut textures, false).unwrap_or_default();
+            weapon_assets.pulse_starter =
+                pulse_beam(&mut assets, &mut class_cache, &mut textures, true).unwrap_or_default();
+            weapon_assets.pulse_tip = ["phit_a00", "pEnd_a00"].map(|name| {
+                find_export(&assets, "botpack", name, "Texture")
+                    .and_then(|id| cached_texture(&assets, &mut textures, id))
+            });
         }
         let load_sound = match weapon {
             Weapon::Hammer => find_export(&assets, "botpack", "ImpactAltFireStart", "Sound"),
             Weapon::Minigun => find_export(&assets, "botpack", "M2WindDown", "Sound"),
             Weapon::Rocket => find_export(&assets, "unrealshare", "Loading", "Sound"),
             Weapon::Bio => find_export(&assets, "botpack", "BioAltRep", "Sound"),
+            Weapon::Pulse => find_export(&assets, "botpack", "PulseDown", "Sound"),
             _ => None,
         };
         weapon_assets.load_sound = cached_wave(&assets, &mut waves, load_sound);
@@ -581,6 +600,7 @@ pub fn load(map: &Package<'_>, actors: &[&Export], path: &Path) -> io::Result<Sc
                     x: -visual.fire_offset.unwrap_or_default().1 * visual.flash_o.unwrap_or(0.0),
                     y: visual.flash_y.unwrap_or(0.0),
                     length: visual.flash_length.unwrap_or(0.02),
+                    half_offset: visual.flash_size.unwrap_or(0) as f32 * 0.5,
                 });
             }
         }
@@ -644,6 +664,16 @@ pub fn load(map: &Package<'_>, actors: &[&Export], path: &Path) -> io::Result<Sc
                     if weapon == Weapon::Minigun {
                         weapon_assets.alternate_motion = motion(&["Shoot1"], 1.3);
                     }
+                    if weapon == Weapon::Pulse {
+                        weapon_assets.primary_motion = motion(&["ShootLoop"], 1.5);
+                        weapon_assets.attack_start = motion(&["BoltStart"], 1.0);
+                        weapon_assets.attack_end = motion(&["BoltEnd"], 1.0);
+                        weapon_assets.spin_down = motion(&["SpinDown"], 1.0);
+                    }
+                    if weapon == Weapon::Enforcer {
+                        weapon_assets.attack_start = motion(&["T1"], 1.3);
+                        weapon_assets.attack_end = motion(&["T2"], 0.9);
+                    }
                     weapon_assets.view = pose(rest);
                 }
             }
@@ -688,6 +718,29 @@ pub fn load(map: &Package<'_>, actors: &[&Export], path: &Path) -> io::Result<Sc
         )
     });
     let ballistics = read_ballistics(&mut assets, &mut class_cache, &mut textures, &mut waves);
+    let zones = crate::movement::load_zones(map, zone_actors, level, |actor, mut zone| {
+        let mut class = assets.resolve(0, actor.class);
+        let mut visited = HashSet::new();
+        let mut chain = Vec::new();
+        while let Some(id) = class.filter(|id| visited.insert(*id)) {
+            let (_, export) = assets.object(id);
+            if assets.packages[id.package].name(export.name).ok() == Some("ZoneInfo") {
+                break;
+            }
+            chain.push(id);
+            class = assets.resolve(id.package, export.superclass);
+        }
+        if chain.is_empty() {
+            return crate::movement::stock_liquid_zone(map.object_name(actor.class), zone);
+        }
+        for id in chain.into_iter().rev() {
+            let (package, export) = assets.object(id);
+            if let Ok(properties) = class_properties(package, export) {
+                let _ = zone.apply(properties);
+            }
+        }
+        zone
+    })?;
     Ok(Scene {
         props,
         arsenal,
@@ -698,6 +751,7 @@ pub fn load(map: &Package<'_>, actors: &[&Export], path: &Path) -> io::Result<Sc
         player_idle,
         ordnance,
         ballistics,
+        zones,
     })
 }
 
@@ -895,8 +949,14 @@ fn pulse_beam(
     assets: &mut Assets<'_>,
     classes: &mut HashMap<Object, Appearance>,
     textures: &mut HashMap<Object, Option<Arc<Texture>>>,
+    starter: bool,
 ) -> Option<Vec<Vec<Face>>> {
-    let class = find_export(assets, "botpack", "PBolt", "Class")?;
+    let class = find_export(
+        assets,
+        "botpack",
+        if starter { "StarterBolt" } else { "PBolt" },
+        "Class",
+    )?;
     let mut visual = appearance(assets, classes, Some(class));
     let object = visual.mesh?;
     let (package, export) = assets.object(object);
@@ -914,8 +974,13 @@ fn pulse_beam(
         point.0 = (point.0 - min) * 81.0 / (max - min);
     }
     let mut frames = Vec::new();
-    for texture in ["pbolt0", "pbolt1", "pbolt2", "pbolt3", "pbolt4"] {
-        visual.skin = find_export(assets, "botpack", texture, "Texture");
+    let textures_names = if starter {
+        ["sbolt0", "sbolt1", "sbolt2", "sbolt3", "sbolt4"]
+    } else {
+        ["pbolt0", "pbolt1", "pbolt2", "pbolt3", "pbolt4"]
+    };
+    for name in textures_names {
+        visual.skin = find_export(assets, "botpack", name, "Texture");
         frames.push(mesh_faces(
             assets, textures, object, visual, &mesh, &vertices,
         ));
@@ -1087,6 +1152,7 @@ fn read_player(
         while let Ok(Some((name, mut value))) = props.next() {
             let field = match name {
                 "GroundSpeed" => &mut player.ground_speed,
+                "WaterSpeed" => &mut player.water_speed,
                 "AccelRate" => &mut player.acceleration,
                 "AirControl" => &mut player.air_control,
                 "JumpZ" => &mut player.jump_speed,
@@ -1094,6 +1160,8 @@ fn read_player(
                 "MaxStepHeight" => &mut player.step_height,
                 "Bob" => &mut player.bob,
                 "Mass" => &mut player.mass,
+                "Buoyancy" => &mut player.buoyancy,
+                "UnderWaterTime" => &mut player.underwater_time,
                 "Footstep1" | "Footstep2" | "Footstep3" | "JumpSound" | "Land" | "WaterStep" => {
                     if let Ok(reference) = value.compact() {
                         references.push((name.to_owned(), reference));

@@ -1,10 +1,16 @@
 use std::{io, sync::Arc};
 
-use crate::{collision::Plane, map::Vec3, package::Properties, sound::Wave};
+use crate::{
+    collision::Plane,
+    map::Vec3,
+    package::{Export, Package, Properties},
+    sound::Wave,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Profile {
     pub ground_speed: f32,
+    pub water_speed: f32,
     pub acceleration: f32,
     pub air_control: f32,
     pub jump_speed: f32,
@@ -12,6 +18,8 @@ pub struct Profile {
     pub step_height: f32,
     pub bob: f32,
     pub mass: f32,
+    pub buoyancy: f32,
+    pub underwater_time: f32,
 }
 
 impl Default for Profile {
@@ -19,6 +27,7 @@ impl Default for Profile {
         // TournamentPlayer, PlayerPawn and Pawn defaults for the stock player.
         Self {
             ground_speed: 400.0,
+            water_speed: 200.0,
             acceleration: 2048.0,
             air_control: 0.35,
             jump_speed: 325.0,
@@ -26,6 +35,8 @@ impl Default for Profile {
             step_height: 25.0,
             bob: 0.016,
             mass: 100.0,
+            buoyancy: 99.0,
+            underwater_time: 20.0,
         }
     }
 }
@@ -48,6 +59,8 @@ pub struct Zone {
     pub fluid_friction: f32,
     pub terminal: f32,
     pub water: bool,
+    pub pain: bool,
+    pub damage_per_second: i32,
 }
 
 impl Default for Zone {
@@ -59,6 +72,8 @@ impl Default for Zone {
             fluid_friction: 1.2,
             terminal: 2500.0,
             water: false,
+            pain: false,
+            damage_per_second: 0,
         }
     }
 }
@@ -74,11 +89,49 @@ impl Zone {
                 "ZoneFluidFriction" => self.fluid_friction = value.f32()?.max(0.0),
                 "ZoneTerminalVelocity" => self.terminal = value.f32()?.max(1.0),
                 "bWaterZone" => self.water = prop.boolean.unwrap_or(self.water),
+                "bPainZone" => self.pain = prop.boolean.unwrap_or(self.pain),
+                "DamagePerSec" => self.damage_per_second = value.u32()? as i32,
                 _ => {}
             }
         }
         Ok(())
     }
+}
+
+pub fn load_zones(
+    package: &Package<'_>,
+    actors: &[i32],
+    level: Zone,
+    mut defaults: impl FnMut(&Export, Zone) -> Zone,
+) -> io::Result<Vec<Zone>> {
+    actors
+        .iter()
+        .map(|&reference| {
+            let Some(actor) = usize::try_from(reference)
+                .ok()
+                .and_then(|index| index.checked_sub(1))
+                .and_then(|index| package.exports.get(index))
+            else {
+                return Ok(level);
+            };
+            let mut zone = defaults(actor, level);
+            zone.apply(package.properties(actor)?)?;
+            Ok(zone)
+        })
+        .collect()
+}
+
+pub fn stock_liquid_zone(class: Option<&str>, mut zone: Zone) -> Zone {
+    match class {
+        Some("WaterZone") => zone.water = true,
+        Some("SlimeZone" | "LavaZone") => {
+            zone.water = true;
+            zone.pain = true;
+            zone.damage_per_second = 40;
+        }
+        _ => {}
+    }
+    zone
 }
 
 pub struct RegionNode {

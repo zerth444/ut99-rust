@@ -100,8 +100,9 @@ impl Map {
             .ok_or_else(|| invalid("Package has no Level export"))?;
         let (model, actors) =
             level_data(package, level).map_err(|error| invalid(format!("Level: {error}")))?;
-        let (mut faces, mut collision, sky_origin) = read_bsp(package, model, &actors, path)
-            .map_err(|error| invalid(format!("Model: {error}")))?;
+        let (mut faces, mut collision, sky_origin, zone_actors) =
+            read_bsp(package, model, &actors, path)
+                .map_err(|error| invalid(format!("Model: {error}")))?;
         if faces.is_empty() {
             return Err(invalid("Level has no visible BSP faces"));
         }
@@ -124,10 +125,31 @@ impl Map {
             player_idle,
             ordnance,
             ballistics,
+            zones,
         } = path
-            .map(|path| crate::props::load(package, &actors, path))
+            .map(|path| {
+                crate::props::load(
+                    package,
+                    &actors,
+                    path,
+                    &zone_actors,
+                    collision.regions.level,
+                )
+            })
             .transpose()?
             .unwrap_or_default();
+        collision.regions.zones = if zones.is_empty() {
+            crate::movement::load_zones(
+                package,
+                &zone_actors,
+                collision.regions.level,
+                |actor, zone| {
+                    crate::movement::stock_liquid_zone(package.object_name(actor.class), zone)
+                },
+            )?
+        } else {
+            zones
+        };
         collision.profile = player;
         let teleporters = crate::teleport::load(package, &actors)?;
         let mut starts = Vec::new();
@@ -364,7 +386,7 @@ fn read_bsp(
     export: &Export,
     actors: &[&Export],
     path: Option<&Path>,
-) -> io::Result<(Vec<Face>, Collision, Option<Vec3>)> {
+) -> io::Result<(Vec<Face>, Collision, Option<Vec3>, Vec<i32>)> {
     let Model {
         vectors,
         points,
@@ -431,20 +453,6 @@ fn read_bsp(
     {
         level_zone.apply(package.properties(level)?)?;
     }
-    let zones = zones
-        .into_iter()
-        .map(|actor| {
-            let mut zone = level_zone;
-            if let Some(export) = usize::try_from(actor)
-                .ok()
-                .and_then(|index| index.checked_sub(1))
-                .and_then(|index| package.exports.get(index))
-            {
-                zone.apply(package.properties(export)?)?;
-            }
-            Ok::<_, io::Error>(zone)
-        })
-        .collect::<io::Result<_>>()?;
     collision.regions = crate::movement::Regions {
         nodes: nodes
             .iter()
@@ -454,7 +462,7 @@ fn read_bsp(
                 zones: node.zones,
             })
             .collect(),
-        zones,
+        zones: Vec::new(),
         level: level_zone,
     };
 
@@ -541,7 +549,7 @@ fn read_bsp(
         }
         faces.push(face);
     }
-    Ok((faces, collision, sky_origin))
+    Ok((faces, collision, sky_origin, zones))
 }
 
 fn read_vectors(reader: &mut Reader<'_>) -> io::Result<Vec<Vec3>> {
@@ -566,6 +574,61 @@ pub(crate) fn material_color(name: Option<&str>) -> [f32; 3] {
 mod tests {
     use super::*;
     use crate::collision::Walker;
+
+    #[test]
+    #[ignore = "requires the local GOTY map files"]
+    fn deck16_swimmer_can_surface_and_dive() {
+        let path = Path::new("local/goty/Maps/DM-Deck16][.unr");
+        let bytes = std::fs::read(path).unwrap();
+        let map = Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap();
+        let world = &map.collision;
+        let up = Vec3(0.0, 0.0, 1.0);
+        let location = map
+            .faces
+            .iter()
+            .filter(|face| face.normal.2.abs() > 0.95)
+            .map(|face| {
+                face.vertices
+                    .iter()
+                    .copied()
+                    .fold(Vec3::default(), |sum, point| sum + point)
+                    * (1.0 / face.vertices.len() as f32)
+            })
+            .find(|&point| {
+                world.regions.at(point - up * 80.0).water
+                    && !world.regions.at(point + up * 8.0).water
+                    && world.ray(point - up * 80.0, up * 160.0).is_none()
+            })
+            .expect("open water surface on Deck16");
+        let start = location - up * 80.0;
+        let slime = world.regions.at(start);
+        assert!(slime.pain);
+        assert_eq!(slime.damage_per_second, 40);
+        let mut lower = start.2;
+        let mut upper = location.2 + 8.0;
+        for _ in 0..12 {
+            let middle = (lower + upper) * 0.5;
+            if world.regions.at(Vec3(start.0, start.1, middle)).water {
+                lower = middle;
+            } else {
+                upper = middle;
+            }
+        }
+        let mut walker = Walker::spawn(world, start);
+        let dt = 1.0 / 240.0;
+        let mut surfaced = false;
+        for _ in 0..240 {
+            let events = walker.advance_with_swim(world, Vec3::default(), up * 0.5, None, dt);
+            assert!(events.landing.is_none());
+            surfaced |= !world.regions.at(walker.position).water;
+        }
+        assert!(surfaced, "surface z={upper} {:?}", walker.position);
+        for _ in 0..240 {
+            walker.advance_with_swim(world, Vec3::default(), up * -1.0, None, dt);
+        }
+        assert!(world.regions.at(walker.position).water);
+        assert!(walker.position.2 < upper - 20.0);
+    }
 
     #[test]
     #[ignore = "requires the local GOTY map files"]

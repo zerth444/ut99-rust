@@ -134,6 +134,11 @@ pub struct WeaponAssets {
     pub shock: Option<shock::Assets>,
     pub status_icon: Option<Arc<crate::texture::Texture>>,
     pub pulse_beam: Vec<Vec<Face>>,
+    pub pulse_starter: Vec<Vec<Face>>,
+    pub pulse_tip: [Option<Arc<crate::texture::Texture>>; 2],
+    pub attack_start: Motion,
+    pub attack_end: Motion,
+    pub spin_down: Motion,
     pub scope: Option<Arc<crate::texture::Texture>>,
     pub load: Motion,
     pub load_sound: Option<Arc<Wave>>,
@@ -149,6 +154,7 @@ pub struct Flash {
     pub x: f32,
     pub y: f32,
     pub length: f32,
+    pub half_offset: f32,
 }
 
 #[derive(Default)]
@@ -285,6 +291,9 @@ pub struct PulseBeam {
     pub start: Vec3,
     pub end: Vec3,
     pub started: f32,
+    pub wall: bool,
+    pub blocked: bool,
+    pub hit_player: bool,
 }
 
 pub struct Death {
@@ -357,6 +366,8 @@ impl SniperZoom {
 
 pub struct Practice {
     pub health: u16,
+    pub score: i16,
+    pub pickup_time: f32,
     armor: [u16; 3],
     pub weapon: Weapon,
     pub effects: Vec<Effect>,
@@ -373,6 +384,10 @@ pub struct Practice {
     respawn: Vec<f32>,
     pub shock: shock::Shots,
     pub pulse_beam: Option<PulseBeam>,
+    pub pulse_primary_since: Option<f32>,
+    pulse_angle: f32,
+    enforcer_windup: Option<f32>,
+    attack_end: Option<(Weapon, bool, f32)>,
     pub ordnance: ordnance::Shots,
     pub ballistics: ballistics::Effects,
     pub death: Option<Death>,
@@ -380,6 +395,8 @@ pub struct Practice {
     hit_taken: u16,
     pub hit_flash_until: f32,
     last_pain: f32,
+    zone_pain_at: Option<f32>,
+    drown_at: Option<f32>,
     hammer_since: Option<f32>,
     was_guiding: bool,
     guide_trigger_held: bool,
@@ -389,7 +406,9 @@ pub struct Practice {
     pub rocket_locked: bool,
     pub minigun_firing: bool,
     enforcer_alt_accuracy: f32,
-    target_damage_fraction: f32,
+    pulse_contact_time: f32,
+    pulse_last_contact: f32,
+    pulse_contact: bool,
     zoom: SniperZoom,
     next_shot: f32,
     rng: u32,
@@ -399,6 +418,8 @@ impl Practice {
     pub fn new(map: &Map) -> Self {
         let mut game = Self {
             health: 100,
+            score: 0,
+            pickup_time: -1.0,
             armor: [0; 3],
             weapon: Weapon::Enforcer,
             effects: Vec::new(),
@@ -415,6 +436,10 @@ impl Practice {
             respawn: vec![0.0; map.props.len()],
             shock: shock::Shots::default(),
             pulse_beam: None,
+            pulse_primary_since: None,
+            pulse_angle: 0.0,
+            enforcer_windup: None,
+            attack_end: None,
             ordnance: ordnance::Shots::default(),
             ballistics: ballistics::Effects::default(),
             death: None,
@@ -422,6 +447,8 @@ impl Practice {
             hit_taken: 0,
             hit_flash_until: 0.0,
             last_pain: -1.0,
+            zone_pain_at: None,
+            drown_at: None,
             hammer_since: None,
             was_guiding: false,
             guide_trigger_held: false,
@@ -431,7 +458,9 @@ impl Practice {
             rocket_locked: false,
             minigun_firing: false,
             enforcer_alt_accuracy: 0.4,
-            target_damage_fraction: 0.0,
+            pulse_contact_time: 0.0,
+            pulse_last_contact: -1.0,
+            pulse_contact: false,
             zoom: SniperZoom::default(),
             next_shot: 0.0,
             rng: 0x9916_cafe,
@@ -457,6 +486,10 @@ impl Practice {
         self.effects.clear();
         self.shock = shock::Shots::default();
         self.pulse_beam = None;
+        self.pulse_primary_since = None;
+        self.pulse_angle = 0.0;
+        self.enforcer_windup = None;
+        self.attack_end = None;
         self.ordnance = ordnance::Shots::default();
         self.ballistics = ballistics::Effects::default();
         self.death = None;
@@ -464,6 +497,8 @@ impl Practice {
         self.hit_taken = 0;
         self.hit_flash_until = self.time;
         self.last_pain = self.time - 1.0;
+        self.zone_pain_at = None;
+        self.drown_at = None;
         self.hammer_since = None;
         self.was_guiding = false;
         self.guide_trigger_held = false;
@@ -473,7 +508,9 @@ impl Practice {
         self.rocket_locked = false;
         self.minigun_firing = false;
         self.enforcer_alt_accuracy = 0.4;
-        self.target_damage_fraction = 0.0;
+        self.pulse_contact_time = 0.0;
+        self.pulse_last_contact = -1.0;
+        self.pulse_contact = false;
         self.zoom = SniperZoom::default();
     }
 
@@ -514,10 +551,36 @@ impl Practice {
             })
             .or_else(|| {
                 let beam = self.pulse_beam.as_ref()?;
+                let age = self.time - beam.started;
+                let start = weapon.attack_start.duration();
+                if age < start {
+                    return weapon.attack_start.sample(age);
+                }
                 let duration = weapon.alternate_motion.duration();
                 (duration > 0.0)
-                    .then(|| (self.time - beam.started).rem_euclid(duration))
+                    .then(|| (age - start).rem_euclid(duration))
                     .and_then(|elapsed| weapon.alternate_motion.sample(elapsed))
+            })
+            .or_else(|| {
+                weapon
+                    .attack_start
+                    .sample(self.time - self.enforcer_windup?)
+            })
+            .or_else(|| {
+                let age = self.time - self.pulse_primary_since?;
+                let duration = weapon.primary_motion.duration();
+                (duration > 0.0)
+                    .then(|| age.rem_euclid(duration))
+                    .and_then(|elapsed| weapon.primary_motion.sample(elapsed))
+            })
+            .or_else(|| {
+                let (id, alt, started) = self.attack_end.filter(|(id, _, _)| *id == self.weapon)?;
+                let motion = if id == Weapon::Pulse && !alt {
+                    &weapon.spin_down
+                } else {
+                    &weapon.attack_end
+                };
+                motion.sample(self.time - started)
             })
             .or_else(|| {
                 let (_, alternate, at) = self.last_fire.filter(|(id, _, _)| *id == self.weapon)?;
@@ -719,6 +782,7 @@ impl Practice {
 
     pub fn begin_death(&mut self, position: Vec3, yaw: f32, map: &Map) -> Option<Arc<Wave>> {
         let choice = ((self.jitter() + 1.0) * 1.5) as usize % 3;
+        self.score = self.score.saturating_sub(1);
         self.death = Some(Death {
             position,
             yaw,
@@ -726,6 +790,8 @@ impl Practice {
             animation: choice,
         });
         self.pulse_beam = None;
+        self.pulse_primary_since = None;
+        self.enforcer_windup = None;
         self.charge = None;
         self.hammer_since = None;
         self.zoom = SniperZoom::default();
@@ -851,6 +917,7 @@ impl Practice {
                 && self.pickup(item, &map.arsenal)
             {
                 prop.visible = false;
+                self.pickup_time = self.time;
                 self.respawn[index] = self.time + prop.respawn_time.unwrap_or(25.0);
                 if let Some(sound) = &prop.pickup_sound {
                     sounds.push(Arc::clone(sound));
@@ -897,9 +964,6 @@ impl Practice {
             );
         }
         self.minigun_firing = minigun;
-        if self.weapon != Weapon::Enforcer || input.primary || !input.alternate {
-            self.enforcer_alt_accuracy = 0.4;
-        }
         self.update_rocket_lock(map, camera, ready, &mut sounds);
         self.zoom
             .update(input.alternate, dt, ready && self.weapon == Weapon::Sniper);
@@ -911,20 +975,12 @@ impl Practice {
                 && input.alternate
                 && (!input.primary || self.pulse_beam.is_some()),
         );
-        if let Some(beam) = &self.pulse_beam
-            && let Some(target) = &mut self.target
-            && let Some(fraction) = target.ray(beam.start, beam.end - beam.start)
-        {
-            self.target_damage_fraction += 72.0 * dt;
-            let damage = self.target_damage_fraction as u16;
-            self.target_damage_fraction -= f32::from(damage);
-            target.damage(damage);
-            if let Some(beam) = &mut self.pulse_beam {
-                beam.end = beam.start + (beam.end - beam.start) * fraction;
-            }
-        } else {
-            self.target_damage_fraction = 0.0;
-        }
+        self.update_pulse_primary(
+            map,
+            ready && input.primary && self.pulse_beam.is_none(),
+            &mut sounds,
+        );
+        self.update_pulse_contact(dt);
         let mut blasts = self
             .shock
             .update(map, dt, self.time, &mut sounds, self.target.as_ref());
@@ -954,16 +1010,22 @@ impl Practice {
         }
         let charging = self.update_charge(map, camera, &input, ready, &mut sounds, &mut blasts);
         let hammer_hit = self.update_hammer(map, camera, &input, ready, &mut sounds);
-        let alternate_shot =
+        let mut alternate_shot =
             input.alternate && !matches!(self.weapon, Weapon::Sniper | Weapon::Pulse);
+        let mut primary_shot = input.primary;
+        if self.weapon == Weapon::Enforcer {
+            let firing = self.update_enforcer_alt(map, ready, input);
+            alternate_shot = firing;
+            primary_shot &= !firing && self.enforcer_windup.is_none();
+        }
         if !charging
             && self.weapon != Weapon::Hammer
             && self.pulse_beam.is_none()
-            && (input.primary || alternate_shot)
+            && (primary_shot || alternate_shot)
             && self.time >= self.next_shot
             && ready
         {
-            blasts.extend(self.fire(map, camera, !input.primary && alternate_shot, &mut sounds));
+            blasts.extend(self.fire(map, camera, !primary_shot && alternate_shot, &mut sounds));
         }
         self.was_guiding = self.ordnance.guided_view().is_some();
         if let Some(target) = &mut self.target {
@@ -981,6 +1043,7 @@ impl Practice {
             }
         }
         if let Some(player) = player {
+            self.update_liquid_damage(map, player.position, camera.position);
             if let Some((damage, momentum)) = hammer_hit {
                 player.apply_self_damage_momentum(momentum, map.collision.profile);
                 self.splash_damage(damage);
@@ -1094,6 +1157,7 @@ impl Practice {
         if !held {
             if self.pulse_beam.take().is_some() {
                 self.next_shot = self.time;
+                self.attack_end = Some((Weapon::Pulse, true, self.time));
             }
             return;
         }
@@ -1104,6 +1168,7 @@ impl Practice {
             let ammo = &mut self.ammo[Weapon::Pulse.ammo_pool()];
             if *ammo == 0 {
                 self.pulse_beam = None;
+                self.attack_end = Some((Weapon::Pulse, true, self.time));
                 self.next_shot = self.time + 0.24;
                 return;
             }
@@ -1116,14 +1181,14 @@ impl Practice {
         let direction = camera.look_direction();
         let right = camera.right();
         let up = direction.cross(right);
-        let offset = direction * 16.0 + right * 14.0 - up * 8.0;
+        let offset = direction * 17.5 + right * 14.0 - up * 10.0;
         let start = camera.position + offset;
-        let end = if map.collision.ray(camera.position, offset).is_some() {
+        let obstruction = map.collision.ray(camera.position, offset);
+        let wall = map.collision.ray(start, direction * 810.0);
+        let end = if obstruction.is_some() {
             start
         } else {
-            map.collision
-                .ray(start, direction * 810.0)
-                .unwrap_or(start + direction * 810.0)
+            wall.unwrap_or(start + direction * 810.0)
         };
         let started = self
             .pulse_beam
@@ -1133,7 +1198,102 @@ impl Practice {
             start,
             end,
             started,
+            wall: wall.is_some(),
+            blocked: obstruction.is_some(),
+            hit_player: false,
         });
+    }
+
+    fn update_pulse_contact(&mut self, dt: f32) {
+        let (Some(beam), Some(target)) = (&mut self.pulse_beam, &mut self.target) else {
+            self.pulse_contact_time = 0.0;
+            self.pulse_last_contact = -1.0;
+            self.pulse_contact = false;
+            return;
+        };
+        let delta = beam.end - beam.start;
+        if !beam.blocked
+            && let Some(fraction) = target.ray(beam.start, delta)
+        {
+            beam.end = beam.start + delta * fraction;
+            beam.wall = false;
+            beam.hit_player = true;
+            if !self.pulse_contact {
+                let initial = (0.5 * (self.time - self.pulse_last_contact)).min(0.1);
+                target.damage((72.0 * initial) as u16);
+            }
+            self.pulse_contact = true;
+            self.pulse_last_contact = self.time;
+            self.pulse_contact_time += dt;
+            if self.pulse_contact_time > 0.22 {
+                target.damage((72.0 * self.pulse_contact_time) as u16);
+                self.pulse_contact_time = 0.0;
+            }
+        } else {
+            if self.pulse_contact_time > 0.0 {
+                target.damage((72.0 * self.pulse_contact_time) as u16);
+                self.pulse_contact_time = 0.0;
+            }
+            self.pulse_contact = false;
+        }
+    }
+
+    fn update_pulse_primary(&mut self, map: &Map, held: bool, sounds: &mut Vec<Arc<Wave>>) {
+        if held && self.weapon == Weapon::Pulse && self.ammo().is_some_and(|ammo| ammo > 0) {
+            if self.pulse_primary_since.is_none() && self.time >= self.next_shot {
+                self.pulse_primary_since = Some(self.time);
+                self.pulse_angle = 0.0;
+                self.attack_end = None;
+            }
+        } else if self.pulse_primary_since.take().is_some() {
+            self.attack_end = Some((Weapon::Pulse, false, self.time));
+            if self.last_fire.is_some_and(|(id, _, _)| id == Weapon::Pulse) {
+                self.last_fire = None;
+            }
+            sounds.extend(
+                map.arsenal
+                    .get(&Weapon::Pulse)
+                    .and_then(|art| art.load_sound.clone()),
+            );
+        }
+    }
+
+    fn update_enforcer_alt(&mut self, map: &Map, ready: bool, input: Input) -> bool {
+        let art = map.arsenal.get(&Weapon::Enforcer);
+        let held = input.alternate && !input.primary;
+        let repeating = self
+            .last_fire
+            .is_some_and(|(id, alt, _)| id == Weapon::Enforcer && alt);
+        if !ready {
+            self.enforcer_windup = None;
+            self.enforcer_alt_accuracy = 0.4;
+            return false;
+        }
+        if self.enforcer_windup.is_some() {
+            if self.time < self.next_shot {
+                return false;
+            }
+            self.enforcer_windup = None;
+            return true;
+        }
+        if repeating {
+            if self.time < self.next_shot || (held && self.ammo().is_some_and(|ammo| ammo > 0)) {
+                return true;
+            }
+            self.attack_end = Some((Weapon::Enforcer, true, self.time));
+            self.next_shot = self.time + art.map_or(0.0, |art| art.attack_end.duration());
+            self.last_fire = None;
+            self.enforcer_alt_accuracy = 0.4;
+        } else if held && self.time >= self.next_shot && self.ammo().is_some_and(|ammo| ammo > 0) {
+            self.attack_end = None;
+            let duration = art.map_or(0.0, |art| art.attack_start.duration());
+            if duration == 0.0 {
+                return true;
+            }
+            self.enforcer_windup = Some(self.time);
+            self.next_shot = self.time + duration;
+        }
+        false
     }
 
     fn update_charge(
@@ -1276,6 +1436,43 @@ impl Practice {
         }
     }
 
+    fn update_liquid_damage(&mut self, map: &Map, center: Vec3, eye: Vec3) {
+        if self.health == 0 {
+            return;
+        }
+        let regions = &map.collision.regions;
+        let feet = regions.at(center - Vec3(0.0, 0.0, crate::collision::PLAYER_HEIGHT));
+        let head = regions.at(eye);
+        if feet.pain {
+            self.drown_at = None;
+            let next = self.zone_pain_at.get_or_insert(self.time + 0.01);
+            if self.time >= *next {
+                *next += 1.0;
+                let depth =
+                    0.4 + 0.4 * f32::from(regions.at(center).pain) + 0.2 * f32::from(head.pain);
+                let damage = (feet.damage_per_second as f32 * depth) as i32;
+                if damage > 0 {
+                    self.splash_damage(damage.min(i32::from(u16::MAX)) as u16);
+                } else if damage < 0 && self.health < 100 {
+                    self.health = i32::from(self.health).saturating_sub(damage).min(100) as u16;
+                }
+            }
+        } else {
+            self.zone_pain_at = None;
+            if head.water {
+                let next = self
+                    .drown_at
+                    .get_or_insert(self.time + map.collision.profile.underwater_time);
+                if self.time >= *next {
+                    *next += 2.0;
+                    self.splash_damage(5);
+                }
+            } else {
+                self.drown_at = None;
+            }
+        }
+    }
+
     pub fn visible_effects(&self) -> impl Iterator<Item = Effect> + '_ {
         self.effects.iter().map(|effect| Effect { ..*effect })
     }
@@ -1305,7 +1502,7 @@ impl Practice {
                 .map_or(0.0, |flash| flash.length);
         self.last_fire = Some((weapon, alternate, self.time));
         self.shots += 1;
-        if weapon != Weapon::Minigun {
+        if !matches!(weapon, Weapon::Minigun | Weapon::Pulse) {
             sounds.extend(shot_sound(&map.arsenal, weapon, alternate));
         }
         if weapon == Weapon::Shock {
@@ -1341,6 +1538,13 @@ impl Practice {
             _ => None,
         };
         if let Some(kind) = kind {
+            let variation = if weapon == Weapon::Pulse {
+                let angle = self.pulse_angle;
+                self.pulse_angle += 1.8;
+                angle
+            } else {
+                0.0
+            };
             self.next_shot = self.time
                 + match weapon {
                     Weapon::Pulse => 0.18,
@@ -1357,7 +1561,7 @@ impl Practice {
                 0.0,
                 1.0,
                 self.time,
-                0.0,
+                variation,
                 sounds,
             );
         }
@@ -1398,11 +1602,23 @@ impl Practice {
         sounds: &mut Vec<Arc<Wave>>,
     ) {
         let (cooldown, accuracy, damage, side, height) = match (weapon, alternate) {
-            (Weapon::Enforcer, false) => (0.32, 0.2, 17, 3.5, -1.4),
+            (Weapon::Enforcer, false) => (0.32, 0.2, 17, 5.5, -4.4),
             (Weapon::Enforcer, true) => {
                 let accuracy = self.enforcer_alt_accuracy;
-                self.enforcer_alt_accuracy = (accuracy + 0.5).min(3.0);
-                (0.19, accuracy, 17, 3.5, -1.4)
+                if accuracy < 3.0 {
+                    self.enforcer_alt_accuracy += 0.5;
+                }
+                let cooldown = map
+                    .arsenal
+                    .get(&weapon)
+                    .map_or(0.0, |art| art.alternate_motion.duration());
+                (
+                    if cooldown > 0.0 { cooldown } else { 0.19 },
+                    accuracy,
+                    17,
+                    5.5,
+                    -4.4,
+                )
             }
             (Weapon::Minigun, alt) => {
                 let random_damage = 9 + (((self.jitter() + 1.0) * 3.0) as i32).min(5);
@@ -1419,7 +1635,10 @@ impl Practice {
         let forward = camera.look_direction();
         let right = camera.right();
         let up = forward.cross(right);
-        let start = camera.position + right * side + up * height;
+        let mut start = camera.position + right * side + up * height;
+        if weapon == Weapon::Enforcer {
+            start = start + forward * 3.3;
+        }
         let delta =
             forward * 10_000.0 + (right * self.jitter() + up * self.jitter()) * (500.0 * accuracy);
         let mut wall = map.collision.ray_surface(start, delta);
@@ -1644,6 +1863,35 @@ mod tests {
                         assert!(game.pulse_beam.is_some());
                         assert_eq!(game.ammo(), Some(9));
                     }
+                    (Weapon::Enforcer, true) => {
+                        let enforcer = &map.arsenal[&Weapon::Enforcer];
+                        let windup = enforcer.attack_start.duration();
+                        assert_eq!(enforcer.attack_start.frames.len(), 6);
+                        assert_eq!(enforcer.attack_end.frames.len(), 7);
+                        assert_eq!(enforcer.flash.as_ref().unwrap().half_offset, 64.0);
+                        assert_eq!(game.shots, 0);
+                        assert_eq!(game.ammo(), Some(10));
+                        let sounds = game.update(
+                            &mut map,
+                            &camera,
+                            windup + 0.01,
+                            fire_input(false, false),
+                            false,
+                            None,
+                        );
+                        assert_eq!(game.shots, 1);
+                        assert_eq!(game.ammo(), Some(9));
+                        assert!(game.alternate_flash() && !sounds.is_empty());
+                        game.update(
+                            &mut map,
+                            &camera,
+                            1.0,
+                            fire_input(false, false),
+                            false,
+                            None,
+                        );
+                        assert_eq!(game.attack_end, Some((Weapon::Enforcer, true, game.time)));
+                    }
                     (Weapon::Hammer, false) | (Weapon::Rocket, _) | (Weapon::Bio, true) => {
                         assert_eq!(game.shots, 0, "{weapon:?} charges before release");
                         game.update(
@@ -1659,7 +1907,7 @@ mod tests {
                     _ => {
                         assert!(game.shots > 0, "{weapon:?}, alternate={alternate}");
                         assert_eq!(game.ammo(), (weapon != Weapon::Hammer).then_some(9));
-                        if weapon != Weapon::Minigun {
+                        if !matches!(weapon, Weapon::Minigun | Weapon::Pulse) {
                             assert!(
                                 !sounds.is_empty(),
                                 "{weapon:?}, alternate={alternate} sound"
@@ -1909,6 +2157,14 @@ mod tests {
         let pulse = &map.arsenal[&Weapon::Pulse];
         assert_eq!(pulse.pulse_beam.len(), 5);
         assert!(pulse.pulse_beam.iter().all(|faces| !faces.is_empty()));
+        assert_eq!(pulse.pulse_starter.len(), 5);
+        assert!(pulse.pulse_starter.iter().all(|faces| !faces.is_empty()));
+        assert!(pulse.pulse_tip.iter().all(Option::is_some));
+        assert_eq!(pulse.attack_start.frames.len(), 15);
+        assert_eq!(pulse.attack_end.frames.len(), 5);
+        assert_eq!(pulse.primary_motion.frames.len(), 40);
+        assert_eq!(pulse.spin_down.frames.len(), 25);
+        assert!(pulse.fire.is_some() && pulse.load_sound.is_some());
         assert!(pulse.alternate.is_some() && !pulse.alternate_motion.frames.is_empty());
         assert!(map.arsenal[&Weapon::Sniper].scope.is_some());
         assert_eq!(Weapon::Sniper.slot(), 0);

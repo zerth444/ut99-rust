@@ -289,41 +289,39 @@ impl Frame {
                     }
                 });
         }
-        if let Some(beam) = &game.pulse_beam {
+        if let Some(beam) = &game.pulse_beam
+            && !beam.blocked
+            && let Some(art) = map.arsenal.get(&crate::game::Weapon::Pulse)
+        {
             let delta = beam.end - beam.start;
             let length = delta.dot(delta).sqrt();
-            if let Some(art) = map
-                .arsenal
-                .get(&crate::game::Weapon::Pulse)
-                .map(|weapon| &weapon.pulse_beam)
-                && !art.is_empty()
-            {
-                if length > 0.0 {
-                    let forward = delta * length.recip();
-                    let view = View::camera(camera);
-                    for segment in 0..(length / 81.0).ceil() as usize {
-                        let along = segment as f32 * 81.0;
-                        let scale = ((length - along) / 81.0).min(1.0);
-                        let animation = ((game.time - beam.started) / 0.05) as usize;
-                        let faces = &art[(animation + segment) % art.len()];
-                        let model = view.scaled_model(
-                            beam.start + forward * along,
+            if length > 0.0 {
+                let forward = delta * length.recip();
+                let view = View::camera(camera);
+                let age = game.time - beam.started;
+                let animation = (age / 0.05) as usize;
+                for segment in 0..((length / 81.0).ceil() as usize).min(10) {
+                    let frames = if segment == 0 {
+                        &art.pulse_starter
+                    } else {
+                        &art.pulse_beam
+                    };
+                    if !frames.is_empty() {
+                        let faces = &frames[animation % frames.len()];
+                        let model = view.in_model(
+                            beam.start + forward * (segment as f32 * 81.0),
                             forward,
-                            Vec3(scale, 1.0, 1.0),
+                            1.0,
                         );
                         self.draw_faces_in_view(faces, &model, time, false, None, Some(1.0));
                     }
                 }
-            } else {
-                self.effect(
-                    camera,
-                    crate::game::Effect {
-                        origin: beam.start,
-                        end: beam.end,
-                        color: 0x75ff98,
-                        expires: game.time,
-                    },
-                );
+                if !beam.hit_player
+                    && let Some(tip) = &art.pulse_tip[usize::from(beam.wall)]
+                {
+                    let inset = if beam.wall { 5.0 } else { 4.0 };
+                    self.world_sprite(&view, beam.end - forward * inset, tip.image(age), 0.65, 1.0);
+                }
             }
         }
         self.zoom = 1.0;
@@ -344,11 +342,16 @@ impl Frame {
                     x *= 0.3;
                     y *= 2.5;
                 }
+                let offset = if flash.half_offset > 0.0 {
+                    [flash.half_offset; 2]
+                } else {
+                    [w * 0.5, h * 0.5]
+                };
                 self.blit_tile(
                     texture.image(0.0),
                     [
-                        ((0.5 + x) * self.width as f32 - w * scale * 0.5).round() as i32,
-                        ((0.5 + y) * self.height as f32 - h * scale * 0.5).round() as i32,
+                        ((0.5 + x) * self.width as f32 - offset[0] * scale).round() as i32,
+                        ((0.5 + y) * self.height as f32 - offset[1] * scale).round() as i32,
                         (w * scale).round() as i32,
                         (h * scale).round() as i32,
                     ],

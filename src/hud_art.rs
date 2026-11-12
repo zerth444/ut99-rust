@@ -4,9 +4,9 @@ use crate::game::{ArmorKind, Practice, Weapon, WeaponAssets};
 use crate::render::Frame;
 use crate::texture::{Texture, TextureImage};
 
-const BLUE: [f32; 3] = [0.63, 0.79, 1.0];
+const BLUE: [f32; 3] = [0.0, 0.0, 254.0 / 255.0];
 const WHITE: [f32; 3] = [1.0; 3];
-const GOLD: [f32; 3] = [1.0, 0.78, 0.28];
+const GOLD: [f32; 3] = [1.0, 1.0, 0.0];
 
 #[derive(Default)]
 pub struct Art {
@@ -30,11 +30,12 @@ impl Art {
     ) {
         let width = frame.width as f32;
         let height = frame.height as f32;
-        let scale = (width / 1280.0).min(height / 480.0);
+        let scale = width / 1280.0;
         if let (Some(elements), Some(weapons)) = (&self.elements, &self.weapons) {
             self.status(frame, game, elements.image(0.0), width, scale);
-            let weapon_scale = 0.8 * scale;
-            let row_width = 1024.0 * scale;
+            let bar_fraction = if width < 400.0 { 1.0 } else { 0.8 };
+            let weapon_scale = bar_fraction * scale;
+            let row_width = bar_fraction * width;
             let ammo_y = height
                 - if row_width <= width - 255.0 * scale {
                     63.5
@@ -54,7 +55,7 @@ impl Art {
                 number(
                     frame,
                     elements,
-                    ammo,
+                    i32::from(ammo),
                     ammo_x + 4.0 * scale,
                     ammo_y + 16.0 * scale,
                     scale,
@@ -69,6 +70,22 @@ impl Art {
                 weapons.image(0.0),
                 row_width,
                 weapon_scale,
+            );
+            art(
+                frame,
+                elements,
+                [0.0, ammo_y, 128.0 * scale, 64.0 * scale],
+                [0.0, 128.0, 128.0, 64.0],
+                BLUE,
+            );
+            number(
+                frame,
+                elements,
+                i32::from(game.score),
+                40.0 * scale,
+                ammo_y + 16.0 * scale,
+                scale,
+                WHITE,
             );
         }
 
@@ -90,13 +107,18 @@ impl Art {
             } else {
                 (0.1 + width / 640.0).floor().clamp(1.0, 2.0)
             };
-            let (dw, dh) = (w * crosshair_scale, h * crosshair_scale);
+            let age = game.time - game.pickup_time;
+            let pickup_pulse = 1.0 + (1.0 - (age * 5.0 - 1.0).abs()).max(0.0);
+            let (dw, dh) = (
+                w * crosshair_scale * pickup_pulse,
+                h * crosshair_scale * pickup_pulse,
+            );
             art(
                 frame,
                 crosshair.image(0.0),
                 [(width - dw) * 0.5, (height - dh) * 0.5, dw, dh],
                 [0.0, 0.0, w, h],
-                [0.5, 1.0, 0.5],
+                [0.0, 240.0 / 255.0, 0.0],
             );
         }
     }
@@ -109,8 +131,13 @@ impl Art {
         width: f32,
         scale: f32,
     ) {
-        let doll_x = width - 128.0 * scale;
-        if let Some(doll) = &self.doll {
+        let show_doll = width >= 400.0 && self.doll.is_some();
+        let doll_x = if show_doll {
+            width - 128.0 * scale
+        } else {
+            width
+        };
+        if let Some(doll) = self.doll.as_ref().filter(|_| show_doll) {
             let doll = doll.image(0.0);
             art(
                 frame,
@@ -130,12 +157,13 @@ impl Art {
                         doll,
                         [doll_x, y * scale, 128.0 * scale, 64.0 * scale],
                         [128.0, y, 128.0, 64.0],
-                        BLUE.map(|channel| channel * amount),
+                        BLUE.map(|channel| channel * amount.min(1.0)),
                     );
                 }
             }
         }
-        if game.armor_charge(ArmorKind::Belt) > 0
+        if show_doll
+            && game.armor_charge(ArmorKind::Belt) > 0
             && let Some(belt) = &self.belt
         {
             let (w, h) = belt.size();
@@ -149,9 +177,18 @@ impl Art {
         }
         let x = doll_x - 140.0 * scale;
         let health_y = 64.0 * scale;
+        let blink = if game.health < 50 {
+            1.5 * game.time.rem_euclid(0.5)
+        } else {
+            0.0
+        };
+        let panel_tint = if game.health < 50 {
+            BLUE.map(|color| 1.0 - blink + (color - 1.0) * blink)
+        } else {
+            BLUE
+        };
         let health_tint = if game.health < 50 {
-            let pulse = (game.time * 8.0).sin() * 0.20 + 0.8;
-            [1.0, pulse, pulse]
+            panel_tint.map(|color| color * (1.0 - blink) + (1.0 - color) * blink)
         } else {
             WHITE
         };
@@ -167,12 +204,12 @@ impl Art {
             elements,
             [x, health_y, 128.0 * scale, 64.0 * scale],
             [128.0, 128.0, 128.0, 64.0],
-            BLUE,
+            panel_tint,
         );
         number(
             frame,
             elements,
-            game.armor(),
+            i32::from(game.armor().min(150)),
             x + 4.0 * scale,
             16.0 * scale,
             scale,
@@ -181,7 +218,7 @@ impl Art {
         number(
             frame,
             elements,
-            game.health,
+            i32::from(game.health),
             x + 4.0 * scale,
             health_y + 16.0 * scale,
             scale,
@@ -303,15 +340,26 @@ fn weapon_bar(
 fn number(
     frame: &mut Frame,
     texture: &TextureImage,
-    value: u16,
+    value: i32,
     x: f32,
     y: f32,
     scale: f32,
     tint: [f32; 3],
 ) {
-    let digits = value.min(9999).to_string();
-    let step = 16.0 * scale;
+    let digits = value.unsigned_abs().min(9999).to_string();
+    let step = (16.0 * scale).floor();
     let mut x = x + (3 - digits.len() as i32) as f32 * step;
+    if value < 0 {
+        x -= step;
+        art(
+            frame,
+            texture,
+            [x, y, 25.0 * scale, 64.0 * scale],
+            [0.0, 64.0, 25.0, 64.0],
+            tint,
+        );
+        x += 25.0 * scale;
+    }
     for digit in digits.bytes() {
         x -= step * if digit == b'1' { 0.625 } else { 0.25 };
         art(
