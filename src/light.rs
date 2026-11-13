@@ -1,8 +1,9 @@
 use std::collections::HashMap;
-use std::io;
+use std::{io, path::Path, sync::Arc};
 
 use crate::map::{Face, Vec3};
 use crate::package::{Package, Reader};
+use crate::texture::Texture;
 
 pub struct LightIndex {
     offset: i32,
@@ -33,6 +34,91 @@ pub struct Light {
     position: Vec3,
     color: [f32; 3],
     radius: f32,
+}
+
+pub struct Corona {
+    pub position: Vec3,
+    pub tag: Option<usize>,
+    pub attach_tag: Option<usize>,
+    pub scale: f32,
+    pub color: [f32; 3],
+    pub texture: Arc<Texture>,
+}
+
+pub fn read_coronas(package: &Package<'_>, path: &Path) -> io::Result<Vec<Corona>> {
+    let mut pending = Vec::new();
+    for actor in &package.exports {
+        if !matches!(
+            package.object_name(actor.class),
+            Some("Light" | "TriggerLight" | "Spotlight")
+        ) {
+            continue;
+        }
+        let mut props = package.properties(actor)?;
+        let (mut corona, mut skin, mut position, mut scale, mut hue, mut saturation) =
+            (false, 0, Vec3::default(), 1.0, 0, 255);
+        let mut tag = None;
+        let mut attach_tag = None;
+        while let Some(prop) = props.next_tag()? {
+            let mut value = prop.value;
+            match prop.name {
+                "bCorona" => corona = prop.boolean.unwrap_or(false),
+                "Skin" => skin = value.compact()?,
+                "Location" => position = Vec3::read(&mut value)?,
+                "Tag" => tag = Some(value.index()?),
+                "AttachTag" => attach_tag = Some(value.index()?),
+                "DrawScale" => scale = value.f32()?,
+                "LightHue" => hue = value.byte()?,
+                "LightSaturation" => saturation = value.byte()?,
+                _ => {}
+            }
+        }
+        if corona && skin != 0 && scale > 0.0 {
+            pending.push((
+                position,
+                scale,
+                hue_color(hue, saturation, 255).map(|channel| channel / 1.85),
+                skin,
+                tag,
+                attach_tag,
+            ));
+        }
+    }
+    let textures =
+        crate::texture::load_materials(package, path, pending.iter().map(|entry| entry.3));
+    Ok(pending
+        .into_iter()
+        .filter_map(|(position, scale, color, skin, tag, attach_tag)| {
+            Some(Corona {
+                position,
+                tag,
+                attach_tag,
+                scale,
+                color,
+                texture: textures.get(&skin)?.clone(),
+            })
+        })
+        .collect())
+}
+
+pub fn actor_lighting(lights: &[Light], position: Vec3, normal: Vec3) -> [f32; 3] {
+    let mut color = [0.22_f32; 3];
+    for light in lights {
+        let offset = light.position - position;
+        let distance = offset.dot(offset).sqrt();
+        if distance < light.radius {
+            let facing = if distance > 0.01 {
+                normal.dot(offset) / distance
+            } else {
+                1.0
+            };
+            let strength = (1.0 - distance / light.radius).powi(2) * (0.2 + 0.8 * facing.max(0.0));
+            for (channel, source) in color.iter_mut().zip(light.color) {
+                *channel += source * strength;
+            }
+        }
+    }
+    color.map(|channel| channel.min(1.8))
 }
 
 pub fn read_lights(package: &Package<'_>, refs: &[i32]) -> io::Result<HashMap<i32, Light>> {

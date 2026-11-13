@@ -70,6 +70,8 @@ pub struct Start {
 }
 
 pub struct Map {
+    pub scene_lights: Vec<crate::light::Light>,
+    pub coronas: Vec<crate::light::Corona>,
     pub faces: Vec<Face>,
     pub starts: Vec<Start>,
     pub collision: Collision,
@@ -177,7 +179,32 @@ impl Map {
         if starts.is_empty() {
             return Err(invalid("Level has no PlayerStart for the preview camera"));
         }
+        let city_intro = path.filter(|path| {
+            path.file_stem()
+                .is_some_and(|stem| stem.eq_ignore_ascii_case("CityIntro"))
+        });
         Ok(Self {
+            coronas: city_intro
+                .map(|path| crate::light::read_coronas(package, path))
+                .transpose()?
+                .unwrap_or_default(),
+            scene_lights: if city_intro.is_some() {
+                let refs: Vec<_> = package
+                    .exports
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, actor)| {
+                        matches!(
+                            package.object_name(actor.class),
+                            Some("Light" | "TriggerLight" | "Spotlight")
+                        )
+                    })
+                    .map(|(index, _)| index as i32 + 1)
+                    .collect();
+                read_lights(package, &refs)?.into_values().collect()
+            } else {
+                Vec::new()
+            },
             faces,
             starts,
             collision,

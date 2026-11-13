@@ -3,6 +3,7 @@ use std::{collections::HashMap, fs, io, path::Path, sync::Arc};
 use crate::package::{Export, Package, invalid};
 
 pub struct Texture {
+    pub poly_flags: u32,
     frames: Vec<TextureImage>,
     rate: f32,
 }
@@ -23,6 +24,7 @@ impl Texture {
         let mut frame = export;
         let mut seen = std::collections::HashSet::new();
         let mut rate = 0.0;
+        let mut poly_flags = 0;
         loop {
             if !seen.insert(frame.data.start) {
                 break;
@@ -38,6 +40,7 @@ impl Texture {
                 match name {
                     "AnimNext" => next = value.compact()?,
                     "MaxFrameRate" if frames.is_empty() => rate = value.f32()?,
+                    "PolyFlags" if frames.is_empty() => poly_flags = value.u32()?,
                     _ => {}
                 }
             }
@@ -53,6 +56,7 @@ impl Texture {
             frame = next;
         }
         Ok(Self {
+            poly_flags,
             frames,
             rate: if rate > 0.0 { rate } else { 10.0 },
         })
@@ -66,6 +70,7 @@ impl Texture {
         let mut heat = 230;
         let mut rising = false;
         let mut rate = 25.0_f32;
+        let mut poly_flags = 0;
         while let Some(prop) = props.next_tag()? {
             let mut value = prop.value;
             match prop.name {
@@ -75,6 +80,7 @@ impl Texture {
                 "RenderHeat" => heat = value.byte()?,
                 "bRising" => rising = prop.boolean.unwrap_or(false),
                 "MaxFrameRate" => rate = value.f32()?,
+                "PolyFlags" => poly_flags = value.u32()?,
                 _ => {}
             }
         }
@@ -138,6 +144,7 @@ impl Texture {
             }
         }
         Ok(Self {
+            poly_flags,
             frames,
             rate: if rate > 0.0 { rate } else { 25.0 },
         })
@@ -153,12 +160,14 @@ impl Texture {
         let mut drops = Vec::new();
         let mut amplitude = 32;
         let mut rate = 20.0;
+        let mut poly_flags = 0;
         while let Some(prop) = props.next_tag()? {
             let mut value = prop.value;
             match prop.name {
                 "SourceTexture" => source = value.compact()?,
                 "WaveAmp" => amplitude = value.byte()?,
                 "MaxFrameRate" => rate = value.f32()?.max(1.0),
+                "PolyFlags" => poly_flags = value.u32()?,
                 "Drops" if value.remaining.len() == 8 => {
                     drops.push((value.byte()?, value.byte()?, value.byte()?, value.byte()?));
                 }
@@ -192,6 +201,7 @@ impl Texture {
         };
         if drops.is_empty() {
             return Ok(Self {
+                poly_flags,
                 frames: vec![image],
                 rate,
             });
@@ -254,7 +264,11 @@ impl Texture {
                 palette: image.palette.clone(),
             });
         }
-        Ok(Self { frames, rate })
+        Ok(Self {
+            frames,
+            rate,
+            poly_flags,
+        })
     }
 
     pub fn size(&self) -> (f32, f32) {

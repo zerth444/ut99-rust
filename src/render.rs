@@ -161,7 +161,9 @@ impl Frame {
         roll: f32,
         flash: f32,
     ) {
-        self.zoom = (0.5 * fov.clamp(20.0, 150.0).to_radians()).tan().recip();
+        // UE1 specifies the cinematic FOV across the viewport width.
+        self.zoom = (self.width as f32 * 0.5 / focal_length(self.width, self.height))
+            * (0.5 * fov.clamp(20.0, 150.0).to_radians()).tan().recip();
         self.roll = roll;
         self.draw(map, camera, time);
         self.roll = 0.0;
@@ -210,49 +212,118 @@ impl Frame {
         self.clear();
         self.draw_faces(&map.faces, camera, time, false);
         for mover in &map.movers {
-            let local_camera = Camera {
-                position: camera.position - mover.offset,
-                yaw: camera.yaw,
-                pitch: camera.pitch,
-            };
-            if mover.scene_rotation.dot(mover.scene_rotation) > 0.0 {
-                let mut view = self.camera_view(&local_camera);
-                let [x, y, z] = [
-                    Vec3(1.0, 0.0, 0.0),
-                    Vec3(0.0, 1.0, 0.0),
-                    Vec3(0.0, 0.0, 1.0),
-                ]
-                .map(|axis| crate::mover::rotate(axis, mover.scene_rotation));
-                let inverse = |p: Vec3| Vec3(p.dot(x), p.dot(y), p.dot(z));
-                view.eye = mover.pivot + inverse(view.eye - mover.pivot);
-                view.forward = inverse(view.forward);
-                view.up = inverse(view.up);
-                view.right = inverse(view.right);
-                self.draw_faces_in_view(&mover.faces, &view, time, false, None, None);
-            } else {
-                self.draw_faces(&mover.faces, &local_camera, time, false);
-            }
+            let view = self.mover_view(camera, mover);
+            self.draw_lit_faces(
+                &mover.faces,
+                &view,
+                time,
+                false,
+                None,
+                None,
+                &map.scene_lights,
+                Some(mover),
+            );
         }
-        let (sin, cos) = camera.pitch.sin_cos();
-        let forward = camera.forward() * cos + Vec3(0.0, 0.0, sin);
         for prop in map.props.iter().filter(|prop| prop.visible) {
-            let offset = prop.position - camera.position;
-            if offset.dot(forward) + prop.radius >= NEAR {
+            let parent = prop.tag.and_then(|tag| {
+                map.movers
+                    .iter()
+                    .find(|mover| mover.attach_tag == Some(tag))
+            });
+            let view = parent.map_or_else(
+                || self.camera_view(camera),
+                |mover| self.mover_view(camera, mover),
+            );
+            if view.point(prop.position).2 + prop.radius >= NEAR {
                 let pose = prop.cinematic.as_ref().and_then(|actor| {
                     let time = time - actor.started?;
                     actor
                         .animation
                         .sample(time.min((actor.animation.duration() - 0.001).max(0.0)))
                 });
-                self.draw_faces_blended(
+                self.draw_lit_faces(
                     pose.map_or(prop.faces.as_slice(), |pose| pose.current),
-                    camera,
+                    &view,
                     time,
                     false,
                     pose,
+                    None,
+                    &map.scene_lights,
+                    parent,
                 );
             }
         }
+        self.layer(Layer::Effects);
+        let view = self.camera_view(camera);
+        for corona in &map.coronas {
+            let world = map
+                .movers
+                .iter()
+                .find(|mover| {
+                    corona.tag.is_some_and(|tag| mover.attach_tag == Some(tag))
+                        || corona.attach_tag.is_some_and(|tag| mover.tag == Some(tag))
+                })
+                .map_or(corona.position, |mover| {
+                    mover.pivot
+                        + mover.offset
+                        + crate::mover::rotate(corona.position - mover.pivot, mover.scene_rotation)
+                });
+            let position = view.point(world);
+            if position.2 < NEAR
+                || map
+                    .collision
+                    .ray(camera.position, world - camera.position)
+                    .is_some_and(|hit| {
+                        let gap = world - hit;
+                        gap.dot(gap) > 16.0
+                    })
+            {
+                continue;
+            }
+            let projected = project(
+                Vertex {
+                    position,
+                    u: 0.0,
+                    v: 0.0,
+                },
+                self.width,
+                self.height,
+                self.zoom,
+            )
+            .position;
+            let size = (0.8 * corona.scale * self.width as f32).round() as i32;
+            let (w, h) = corona.texture.size();
+            self.translucent_tile(
+                corona.texture.image(time),
+                [
+                    projected.0.round() as i32 - size / 2,
+                    projected.1.round() as i32 - size / 2,
+                    size,
+                    size,
+                ],
+                [0.0, 0.0, w, h],
+                corona.color,
+            );
+        }
+    }
+
+    fn mover_view(&self, camera: &Camera, mover: &crate::mover::Mover) -> View {
+        let mut view = self.camera_view(camera);
+        view.eye = view.eye - mover.offset;
+        if mover.scene_rotation.dot(mover.scene_rotation) > 0.0 {
+            let [x, y, z] = [
+                Vec3(1.0, 0.0, 0.0),
+                Vec3(0.0, 1.0, 0.0),
+                Vec3(0.0, 0.0, 1.0),
+            ]
+            .map(|axis| crate::mover::rotate(axis, mover.scene_rotation));
+            let inverse = |p: Vec3| Vec3(p.dot(x), p.dot(y), p.dot(z));
+            view.eye = mover.pivot + inverse(view.eye - mover.pivot);
+            view.forward = inverse(view.forward);
+            view.up = inverse(view.up);
+            view.right = inverse(view.right);
+        }
+        view
     }
 
     pub fn draw_practice(
@@ -821,11 +892,31 @@ impl Frame {
         pose: Option<crate::game::Pose<'_>>,
         glow: Option<f32>,
     ) {
+        self.draw_lit_faces(faces, view, time, sky, pose, glow, &[], None);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_lit_faces(
+        &mut self,
+        faces: &[Face],
+        view: &View,
+        time: f32,
+        sky: bool,
+        pose: Option<crate::game::Pose<'_>>,
+        glow: Option<f32>,
+        lights: &[crate::light::Light],
+        mover: Option<&crate::mover::Mover>,
+    ) {
         let mut transformed = Vec::new();
         let mut clipped = Vec::new();
 
         for face in faces.iter().filter(|face| face.sky == sky) {
-            if sky && face.flags & 0x80 != 0 {
+            let flags = face.flags
+                | face
+                    .texture
+                    .as_ref()
+                    .map_or(0, |texture| texture.poly_flags);
+            if flags & 1 != 0 || (sky && flags & 0x80 != 0) {
                 continue;
             }
             let next = pose.filter(|pose| pose.fraction > 0.0).and_then(|pose| {
@@ -841,9 +932,7 @@ impl Frame {
             let normal = next.map_or(face.normal, |(next, t)| {
                 face.normal + (next.normal - face.normal) * t
             });
-            if face.flags & 0x100 == 0
-                && (view.eye - position(0, face.vertices[0])).dot(normal) < 0.0
-            {
+            if flags & 0x100 == 0 && (view.eye - position(0, face.vertices[0])).dot(normal) < 0.0 {
                 continue;
             }
             transformed.clear();
@@ -863,17 +952,31 @@ impl Frame {
             if clipped.len() < 3 {
                 continue;
             }
-            let light = 0.93 + normal.dot(Vec3(-0.34, 0.43, 0.69)) * 0.32;
-            let u_pan = if face.flags & 0x200 != 0 {
-                time * 64.0
+            let light = if flags & 0x0040_0000 != 0 {
+                [1.0; 3]
+            } else if lights.is_empty() {
+                [0.93 + normal.dot(Vec3(-0.34, 0.43, 0.69)) * 0.32; 3]
             } else {
-                0.0
+                let center = face
+                    .vertices
+                    .iter()
+                    .enumerate()
+                    .fold(Vec3::default(), |sum, (index, &vertex)| {
+                        sum + position(index, vertex)
+                    })
+                    * (1.0 / face.vertices.len() as f32);
+                let (center, normal) = mover.map_or((center, normal), |mover| {
+                    (
+                        mover.pivot
+                            + mover.offset
+                            + crate::mover::rotate(center - mover.pivot, mover.scene_rotation),
+                        crate::mover::rotate(normal, mover.scene_rotation),
+                    )
+                });
+                crate::light::actor_lighting(lights, center, normal)
             };
-            let v_pan = if face.flags & 0x400 != 0 {
-                time * 64.0
-            } else {
-                0.0
-            };
+            let u_pan = if flags & 0x200 != 0 { time * 64.0 } else { 0.0 };
+            let v_pan = if flags & 0x400 != 0 { time * 64.0 } else { 0.0 };
             let pan = [face.pan[0] + u_pan, face.pan[1] + v_pan];
             let texture = face.texture.as_ref().map(|texture| texture.image(time));
             let a = project(clipped[0], self.width, self.height, self.zoom);
@@ -883,7 +986,8 @@ impl Frame {
                     project(pair[0], self.width, self.height, self.zoom),
                     project(pair[1], self.width, self.height, self.zoom),
                     face,
-                    ([light, pan[0], pan[1]], texture),
+                    flags,
+                    (light, pan, texture),
                     glow,
                 );
             }
@@ -923,7 +1027,8 @@ impl Frame {
         vb: Vertex,
         vc: Vertex,
         face: &Face,
-        ([light, pan_u, pan_v], texture): ([f32; 3], Option<&TextureImage>),
+        flags: u32,
+        (light, [pan_u, pan_v], texture): ([f32; 3], [f32; 2], Option<&TextureImage>),
         glow: Option<f32>,
     ) {
         let [a, b, c] = [va.position, vb.position, vc.position];
@@ -931,7 +1036,8 @@ impl Frame {
         if area.abs() < 0.01 || !area.is_finite() {
             return;
         }
-        let modulated = face.flags & MODULATED != 0;
+        let modulated = flags & MODULATED != 0;
+        let translucent = flags & 4 != 0;
         if let Some(commands) = &mut self.commands {
             let dimensions = [self.width, self.height];
             if [a, b, c].iter().all(|p| p.0 < 0.0)
@@ -942,11 +1048,11 @@ impl Frame {
                 return;
             }
             let (id, [tw, th]) = commands.texture(texture);
-            let mode = if face.flags & 0x80 != 0 {
+            let mode = if flags & 0x80 != 0 {
                 Mode::SkyMask
             } else if modulated {
                 Mode::Modulated
-            } else if glow.is_some() || face.flags & 4 != 0 {
+            } else if glow.is_some() || translucent {
                 Mode::ScreenDepth
             } else {
                 Mode::World
@@ -955,10 +1061,10 @@ impl Frame {
             let mut light_transform = [0.0; 4];
             let tint = if modulated {
                 bounds[3] = -1.0;
-                1.0
+                [1.0; 3]
             } else if let Some(glow) = glow {
                 bounds[3] = -1.0;
-                glow
+                [glow; 3]
             } else if let Some((transform, limits)) = face
                 .lightmap
                 .as_deref()
@@ -966,7 +1072,7 @@ impl Frame {
             {
                 bounds = limits;
                 light_transform = transform;
-                1.0
+                [1.0; 3]
             } else {
                 light
             };
@@ -975,8 +1081,8 @@ impl Frame {
             } else {
                 face.color.map(|c| c / 255.0)
             };
-            let [r, g, b] = base.map(|c| c * tint);
-            let mask = if face.flags & 2 != 0 { 0.25 } else { 0.0 };
+            let [r, g, b] = std::array::from_fn(|i| base[i] * tint[i]);
+            let mask = if flags & 2 != 0 { 0.25 } else { 0.0 };
             let vertices = [va, vb, vc].map(|v| {
                 let z = v.position.2;
                 let [du, dv, ou, ov] = light_transform;
@@ -1011,14 +1117,14 @@ impl Frame {
                 if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
                     let inverse_depth = w0 * a.2 + w1 * b.2 + w2 * c.2;
                     let index = y * WIDTH + x;
-                    if inverse_depth > self.depth[index] && face.flags & 0x80 != 0 {
+                    if inverse_depth > self.depth[index] && flags & 0x80 != 0 {
                         self.depth[index] = inverse_depth;
                         self.pixels[index] = self.sky[index];
                     } else if inverse_depth > self.depth[index] {
                         let u = (w0 * va.u + w1 * vb.u + w2 * vc.u) / inverse_depth;
                         let v = (w0 * va.v + w1 * vb.v + w2 * vc.v) / inverse_depth;
                         let color = if let Some(texture) = texture {
-                            texture.sample(u + pan_u, v + pan_v, face.flags & 2 != 0)
+                            texture.sample(u + pan_u, v + pan_v, flags & 2 != 0)
                         } else {
                             Some(face.color)
                         };
@@ -1029,18 +1135,17 @@ impl Frame {
                                     [16, 8, 0].map(|shift| ((dst >> shift) & 255) as f32);
                                 self.pixels[index] =
                                     pack([r * color[0], g * color[1], b * color[2]], 2.0 / 255.0);
-                            } else if let Some(glow) = glow {
+                            } else if let Some(glow) = glow.or(translucent.then_some(1.0)) {
                                 self.pixels[index] =
                                     blend_light(pack(color, glow), self.pixels[index]);
                             } else {
                                 self.depth[index] = inverse_depth;
-                                let exposure =
-                                    light * (0.62 + 0.38 * (inverse_depth * 680.0).min(1.0));
+                                let exposure = 0.62 + 0.38 * (inverse_depth * 680.0).min(1.0);
                                 let color = if let Some(lightmap) = &face.lightmap {
                                     let lighting = lightmap.sample(u, v);
                                     std::array::from_fn(|i| color[i] * lighting[i])
                                 } else {
-                                    color.map(|channel| channel * exposure)
+                                    std::array::from_fn(|i| color[i] * light[i] * exposure)
                                 };
                                 self.pixels[index] = pack(color, 1.0);
                             }

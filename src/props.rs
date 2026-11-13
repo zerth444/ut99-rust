@@ -342,6 +342,7 @@ fn appearance(
 }
 
 pub struct Prop {
+    pub tag: Option<usize>,
     pub faces: Vec<Face>,
     pub position: Vec3,
     pub radius: f32,
@@ -473,20 +474,20 @@ pub fn load(
             .sqrt();
         let faces = mesh_faces(&mut assets, &mut textures, object, visual, mesh, &vertices);
         if !faces.is_empty() {
+            let mut properties = map.properties(actor)?;
+            let mut tag = None;
+            while let Some((name, mut value)) = properties.next()? {
+                if name == "Tag" {
+                    tag = Some(value.index()?);
+                    break;
+                }
+            }
             let clip = match map.object_name(actor.class) {
                 Some("IntroDude") => mesh.sequence(&["Shake"]).map(|clip| (clip, 1.0)),
                 Some("IntroBoss") => mesh.sequence(&["Wave"]).map(|clip| (clip, 0.5)),
                 _ => None,
             };
             let cinematic = clip.and_then(|(clip, rate)| {
-                let mut props = map.properties(actor).ok()?;
-                let mut tag = None;
-                while let Some((name, mut value)) = props.next().ok()? {
-                    if name == "Tag" {
-                        tag = value.index().ok();
-                        break;
-                    }
-                }
                 Some(CinematicMotion {
                     event: tag?,
                     started: None,
@@ -508,6 +509,7 @@ pub fn load(
                 })
             });
             props.push(Prop {
+                tag,
                 faces,
                 position: placement.location,
                 radius,
@@ -1337,7 +1339,24 @@ fn mesh_faces(
             .or_else(|| assets.resolve(object.package, reference))
             .or(visual.texture)
             .or_else(|| visual.multiskins.iter().rev().copied().flatten().next());
-        let texture = texture_object.and_then(|id| cached_texture(assets, textures, id));
+        let texture = texture_object
+            .and_then(|id| cached_texture(assets, textures, id))
+            .or_else(|| {
+                // Some GOTY decorations have a sole assigned skin in a
+                // different slot from the serialized triangle material.
+                let mut assigned = mesh
+                    .textures
+                    .iter()
+                    .copied()
+                    .filter(|&reference| reference != 0);
+                let reference = assigned.next()?;
+                if assigned.any(|other| other != reference) {
+                    return None;
+                }
+                assets
+                    .resolve(object.package, reference)
+                    .and_then(|id| cached_texture(assets, textures, id))
+            });
         let (width, height) = texture.as_ref().map_or((256.0, 256.0), |t| t.size());
         let [uv0, uv1, uv2] = tri
             .uv

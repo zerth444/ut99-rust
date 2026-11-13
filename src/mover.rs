@@ -48,7 +48,8 @@ pub struct Mover {
     hull: Option<usize>,
     triggers: Vec<Trigger>,
     activation: Activation,
-    tag: Option<usize>,
+    pub(crate) tag: Option<usize>,
+    pub attach_tag: Option<usize>,
     #[cfg(windows)]
     scene_keys: Vec<(Vec3, Vec3)>,
     #[cfg(windows)]
@@ -122,9 +123,14 @@ impl Mover {
                     .into_iter()
                     .map(|(material, mut face)| {
                         face.texture = textures.get(&material).cloned();
-                        face
+                        (material, face)
                     })
-                    .filter(|face| face.flags & 1 == 0)
+                    .filter_map(|(material, face)| {
+                        // Untextured polygons of an attachment brush are its
+                        // carrier hull. Its visible geometry is the attached actor.
+                        (face.flags & 1 == 0 && (material != 0 || brush.mover.attach_tag.is_none()))
+                            .then_some(face)
+                    })
                     .collect();
                 let mut mover = brush.mover;
                 if brush.solid {
@@ -223,6 +229,8 @@ impl Brush {
         let mut pause: f32 = 4.0;
         let mut glide = true;
         let mut tag = None;
+        let mut attach_tag = None;
+        let mut hidden = false;
         let mut activation = Activation::Bump;
         #[cfg(windows)]
         let mut keys = [(Vec3::default(), Vec3::default()); 8];
@@ -267,6 +275,11 @@ impl Brush {
                 "StayOpenTime" => pause = value.f32()?,
                 "MoverGlideType" => glide = value.byte()? != 0,
                 "Tag" => tag = Some(value.index()?),
+                "AttachTag" => {
+                    let index = value.index()?;
+                    attach_tag = (package.name(index)? != "None").then_some(index);
+                }
+                "bHidden" => hidden = property.boolean.unwrap_or(false),
                 "InitialState" => {
                     activation = match package.name(value.index()?)? {
                         "StandOpenTimed" => Activation::Stand,
@@ -334,7 +347,7 @@ impl Brush {
                         u_axis,
                         v_axis,
                         pan,
-                        flags,
+                        flags: flags | u32::from(hidden),
                         color: material_color(package.object_name(material)),
                         texture: None,
                         lightmap: None,
@@ -373,6 +386,7 @@ impl Brush {
                 triggers,
                 activation,
                 tag,
+                attach_tag,
                 #[cfg(windows)]
                 scene_keys: keys[..key_count].to_vec(),
                 #[cfg(windows)]
