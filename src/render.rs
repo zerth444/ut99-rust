@@ -215,7 +215,23 @@ impl Frame {
                 yaw: camera.yaw,
                 pitch: camera.pitch,
             };
-            self.draw_faces(&mover.faces, &local_camera, time, false);
+            if mover.scene_rotation.dot(mover.scene_rotation) > 0.0 {
+                let mut view = self.camera_view(&local_camera);
+                let [x, y, z] = [
+                    Vec3(1.0, 0.0, 0.0),
+                    Vec3(0.0, 1.0, 0.0),
+                    Vec3(0.0, 0.0, 1.0),
+                ]
+                .map(|axis| crate::mover::rotate(axis, mover.scene_rotation));
+                let inverse = |p: Vec3| Vec3(p.dot(x), p.dot(y), p.dot(z));
+                view.eye = mover.pivot + inverse(view.eye - mover.pivot);
+                view.forward = inverse(view.forward);
+                view.up = inverse(view.up);
+                view.right = inverse(view.right);
+                self.draw_faces_in_view(&mover.faces, &view, time, false, None, None);
+            } else {
+                self.draw_faces(&mover.faces, &local_camera, time, false);
+            }
         }
         let (sin, cos) = camera.pitch.sin_cos();
         let forward = camera.forward() * cos + Vec3(0.0, 0.0, sin);
@@ -781,6 +797,10 @@ impl Frame {
         sky: bool,
         pose: Option<crate::game::Pose<'_>>,
     ) {
+        self.draw_faces_in_view(faces, &self.camera_view(camera), time, sky, pose, None);
+    }
+
+    fn camera_view(&self, camera: &Camera) -> View {
         let mut view = View::camera(camera);
         if self.roll != 0.0 {
             let (sin, cos) = self.roll.sin_cos();
@@ -789,7 +809,7 @@ impl Frame {
                 view.up * cos - view.right * sin,
             );
         }
-        self.draw_faces_in_view(faces, &view, time, sky, pose, None);
+        view
     }
 
     fn draw_faces_in_view(

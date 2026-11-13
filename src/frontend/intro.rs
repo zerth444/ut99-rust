@@ -1,7 +1,6 @@
 use std::{collections::HashMap, fs, io, path::Path, sync::Arc};
 
 use crate::{
-    collision::Walker,
     map::{Map, Vec3},
     package::{Package, invalid},
     render::Camera,
@@ -44,6 +43,7 @@ pub struct Intro {
     scheduled: Vec<(f32, usize)>,
     index: usize,
     alpha: f32,
+    previous_shot: Option<Vec3>,
     pub time: f32,
 }
 
@@ -137,6 +137,7 @@ impl Intro {
                 _ => {}
             }
         }
+        // BeginPlay resolves a Position by the first matching actor in level order.
         points.sort_by_key(|point| point.index);
         points.dedup_by_key(|point| point.index);
         if points.len() < 2 || points[0].index != 0 {
@@ -151,6 +152,7 @@ impl Intro {
             scheduled: Vec::new(),
             index: 0,
             alpha: 0.0,
+            previous_shot: None,
             time: 0.0,
         })
     }
@@ -158,6 +160,7 @@ impl Intro {
     pub fn update(&mut self, dt: f32) -> Option<(Shot, Vec<Arc<Wave>>)> {
         self.time += dt;
         let mut left = dt;
+        let mut cut = false;
         while left > 0.0 {
             let current = self.points.get(self.index)?;
             let next = self.points.get(self.index + 1)?;
@@ -179,17 +182,20 @@ impl Intro {
                 .is_some_and(|point| point.skip_next)
             {
                 self.index += 1;
+                cut = true;
             }
             self.alpha = 0.0;
         }
         let shot = self.shot()?;
         let position = shot.camera.position;
+        let previous = self
+            .previous_shot
+            .replace(position)
+            .filter(|_| !cut)
+            .unwrap_or(position);
         let mut events = Vec::new();
         for trigger in self.triggers.iter_mut().filter(|trigger| !trigger.fired) {
-            let delta = position - trigger.position;
-            if delta.0.hypot(delta.1) <= trigger.radius + 17.0
-                && delta.2.abs() <= trigger.height + 39.0
-            {
+            if trigger.touches_path(previous, position) {
                 trigger.fired = true;
                 events.push(trigger.event);
             }
@@ -227,10 +233,8 @@ impl Intro {
                 mover.scene_event(event);
             }
         }
-        let mut viewer = Walker::spawn(&self.map.collision, position);
-        viewer.position = position;
         for mover in &mut self.map.movers {
-            mover.tick(&mut self.map.collision, &mut viewer, dt);
+            mover.tick_scene(dt);
         }
         Some((shot, voices))
     }
@@ -238,8 +242,10 @@ impl Intro {
     pub fn shot(&self) -> Option<Shot> {
         let a = self.points.get(self.index)?;
         let b = self.points.get(self.index + 1)?;
-        let before = &self.points[self.index.saturating_sub(1)];
-        let after = self.points.get(self.index + 2).unwrap_or(b);
+        // InterpolationPoint links the last key to Position=0, even when
+        // the front end ends playback at the end of this pass.
+        let before = &self.points[(self.index + self.points.len() - 1) % self.points.len()];
+        let after = &self.points[(self.index + 2) % self.points.len()];
         let t = self.alpha;
         let (r0, r1, r2, r3) = (before.rotation, a.rotation, b.rotation, after.rotation);
         let rotation = spline(
@@ -259,6 +265,35 @@ impl Intro {
             roll: rotation.2,
             flash: mix(a.flash, b.flash, t),
         })
+    }
+}
+
+impl Trigger {
+    fn touches_path(&self, start: Vec3, end: Vec3) -> bool {
+        let delta = end - start;
+        let offset = self.position - start;
+        let height = self.height + 39.0;
+        let (mut lo, mut hi) = (0.0_f32, 1.0_f32);
+        if delta.2.abs() < 0.001 {
+            if offset.2.abs() > height {
+                return false;
+            }
+        } else {
+            let a = (offset.2 - height) / delta.2;
+            let b = (offset.2 + height) / delta.2;
+            lo = lo.max(a.min(b));
+            hi = hi.min(a.max(b));
+            if lo > hi {
+                return false;
+            }
+        }
+        let horizontal = delta.0 * delta.0 + delta.1 * delta.1;
+        let along = if horizontal > 0.001 {
+            ((offset.0 * delta.0 + offset.1 * delta.1) / horizontal).clamp(lo, hi)
+        } else {
+            lo
+        };
+        (offset.0 - delta.0 * along).hypot(offset.1 - delta.1 * along) <= self.radius + 17.0
     }
 }
 
@@ -325,7 +360,43 @@ fn wrapped(value: Vec3) -> Vec3 {
 }
 
 fn spline(a: Vec3, b: Vec3, c: Vec3, d: Vec3, t: f32) -> Vec3 {
-    b + (c - a) * (0.5 * t)
-        + (a * 2.0 - b * 5.0 + c * 4.0 - d) * (0.5 * t * t)
-        + (b * 3.0 - c * 3.0 + d - a) * (0.5 * t * t * t)
+    // UE1's four-point interpolation weights. The curve is pulled toward
+    // each point, so the camera need not pass through the actor itself.
+    let [w0, w1, w2, w3] = [t + 1.0, t, t - 1.0, t - 2.0].map(|offset| {
+        let squared = offset * offset;
+        let weight = 1.0 - 0.25 * squared;
+        weight * weight
+    });
+    (a * w0 + b * w1 + c * w2 + d * w3) * (w0 + w1 + w2 + w3).recip()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ue1_camera_rounds_corners_and_stays_continuous() {
+        let a = Vec3(-100.0, 0.0, 0.0);
+        let b = Vec3(0.0, 0.0, 0.0);
+        let c = Vec3(0.0, 100.0, 0.0);
+        let d = Vec3(100.0, 100.0, 0.0);
+        let start = spline(a, b, c, d, 0.0);
+        assert!(start.0 < -25.0 && start.1 > 25.0);
+        let end = spline(a, b, c, d, 1.0);
+        let next = spline(b, c, d, d, 0.0);
+        assert!((end - next).dot(end - next) < 0.001);
+    }
+
+    #[test]
+    fn scene_triggers_detect_a_fast_crossing() {
+        let trigger = Trigger {
+            position: Vec3::default(),
+            radius: 5.0,
+            height: 5.0,
+            event: 0,
+            fired: false,
+        };
+        assert!(trigger.touches_path(Vec3(-80.0, 0.0, 0.0), Vec3(80.0, 0.0, 0.0)));
+        assert!(!trigger.touches_path(Vec3(-80.0, 0.0, 50.0), Vec3(80.0, 0.0, 50.0)));
+    }
 }

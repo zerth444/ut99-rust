@@ -657,6 +657,13 @@ fn run_frontend(
                     return Ok(false);
                 }
                 if message.hwnd == window {
+                    if message.message == WM_MOUSEMOVE && intro.is_none() {
+                        menu.pointer(
+                            size,
+                            message.lParam as i16 as i32,
+                            (message.lParam >> 16) as i16 as i32,
+                        );
+                    }
                     let key = (message.message == WM_KEYDOWN && message.lParam & (1 << 30) == 0)
                         .then_some(message.wParam as u16);
                     let button = mouse_button(&message, true);
@@ -755,16 +762,6 @@ fn run_frontend(
                     shot.roll,
                     shot.flash,
                 );
-                if intro.time < 6.0 {
-                    hud.text(
-                        &mut frame,
-                        12,
-                        size[1] - 30,
-                        0.85,
-                        "ESC TO SKIP",
-                        [0.8, 0.8, 0.8],
-                    );
-                }
             } else {
                 if !frontend.has_desktop()
                     && let Some((logo, camera)) = &frontend.logo

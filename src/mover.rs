@@ -33,6 +33,8 @@ impl Trigger {
 pub struct Mover {
     pub faces: Vec<Face>,
     pub offset: Vec3,
+    pub scene_rotation: Vec3,
+    pub pivot: Vec3,
     min: Vec3,
     max: Vec3,
     travel: Vec3,
@@ -47,16 +49,39 @@ pub struct Mover {
     triggers: Vec<Trigger>,
     activation: Activation,
     tag: Option<usize>,
+    #[cfg(windows)]
+    scene_keys: Vec<(Vec3, Vec3)>,
+    #[cfg(windows)]
+    scene_progress: Option<f32>,
 }
 
 impl Mover {
     #[cfg(windows)]
     pub fn scene_event(&mut self, event: usize) {
         if self.tag == Some(event) {
-            self.opening = true;
-            self.ready = false;
-            self.countdown = self.pause;
+            self.scene_progress = Some(0.0);
         }
+    }
+
+    #[cfg(windows)]
+    pub fn tick_scene(&mut self, dt: f32) {
+        let Some(progress) = self.scene_progress else {
+            return;
+        };
+        let last = self.scene_keys.len().saturating_sub(1);
+        let progress = (progress + dt / self.time).min(last as f32);
+        let index = progress.floor() as usize;
+        let fraction = progress.fract();
+        let fraction = if self.glide {
+            fraction * fraction * (3.0 - 2.0 * fraction)
+        } else {
+            fraction
+        };
+        let (a, ar) = self.scene_keys[index];
+        let (b, br) = self.scene_keys[(index + 1).min(last)];
+        self.offset = a + (b - a) * fraction;
+        self.scene_rotation = ar + (br - ar) * fraction;
+        self.scene_progress = Some(progress);
     }
 
     pub fn load(
@@ -199,6 +224,10 @@ impl Brush {
         let mut glide = true;
         let mut tag = None;
         let mut activation = Activation::Bump;
+        #[cfg(windows)]
+        let mut keys = [(Vec3::default(), Vec3::default()); 8];
+        #[cfg(windows)]
+        let mut key_count = 2;
         while let Some(property) = props.next_tag()? {
             let mut value = property.value;
             match property.name {
@@ -207,7 +236,33 @@ impl Brush {
                 "MainScale" => scale = Vec3::read(&mut value)?,
                 "Rotation" => rotation = read_rotation(&mut value)?,
                 "Brush" => reference = value.compact()?,
-                "KeyPos" if property.array_index == 1 => travel = Vec3::read(&mut value)?,
+                "KeyPos" => {
+                    let position = Vec3::read(&mut value)?;
+                    if property.array_index == 1 {
+                        travel = position;
+                    }
+                    #[cfg(windows)]
+                    if let Some(key) = keys.get_mut(property.array_index) {
+                        key.0 = position;
+                        key_count = key_count.max(property.array_index + 1);
+                    }
+                }
+                #[cfg(windows)]
+                "KeyRot" if property.array_index < keys.len() => {
+                    let turns = read_rotation(&mut value)?;
+                    let wrap = |angle| {
+                        if angle > std::f32::consts::PI {
+                            angle - std::f32::consts::TAU
+                        } else {
+                            angle
+                        }
+                    };
+                    keys[property.array_index].1 =
+                        Vec3(wrap(turns.0), wrap(turns.1), wrap(turns.2));
+                    key_count = key_count.max(property.array_index + 1);
+                }
+                #[cfg(windows)]
+                "NumKeys" => key_count = key_count.max(usize::from(value.byte()?).min(keys.len())),
                 "MoveTime" => time = value.f32()?,
                 "StayOpenTime" => pause = value.f32()?,
                 "MoverGlideType" => glide = value.byte()? != 0,
@@ -302,6 +357,8 @@ impl Brush {
             mover: Mover {
                 faces: Vec::new(),
                 offset: Vec3::default(),
+                scene_rotation: Vec3::default(),
+                pivot: location,
                 min,
                 max,
                 travel,
@@ -316,6 +373,10 @@ impl Brush {
                 triggers,
                 activation,
                 tag,
+                #[cfg(windows)]
+                scene_keys: keys[..key_count].to_vec(),
+                #[cfg(windows)]
+                scene_progress: None,
             },
         }))
     }

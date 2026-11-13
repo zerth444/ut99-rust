@@ -27,6 +27,8 @@ pub struct Frontend {
 struct MenuArt {
     desktop: Option<[Texture; 12]>,
     bar: Option<Texture>,
+    bar_ends: [Option<Texture>; 2],
+    window: Option<Texture>,
     panel: Option<Texture>,
     highlight: Option<Texture>,
     click: Option<Arc<Wave>>,
@@ -102,6 +104,8 @@ impl MenuArt {
         Self {
             desktop,
             bar: texture("BlueBarTile"),
+            bar_ends: [texture("BlueBarL"), texture("BlueBarWin")],
+            window: texture("BlueActiveFrame"),
             panel: texture("BlueClientArea"),
             highlight: texture("BlueMenuHM"),
             font: MenuFont::load(font_path).ok(),
@@ -126,6 +130,7 @@ pub struct Menu {
     preferences: bool,
     tab: usize,
     selected: usize,
+    hover: Option<usize>,
     waiting: Option<usize>,
     pub status: String,
 }
@@ -155,6 +160,14 @@ const CONTROLS: [&str; 10] = [
 ];
 
 impl Menu {
+    pub fn pointer(&mut self, size: [i32; 2], x: i32, y: i32) {
+        self.hover = Self::top_item(Layout::new(size).local(x, y));
+    }
+
+    fn top_item([x, y]: [i32; 2]) -> Option<usize> {
+        ((0..16).contains(&y) && (16..232).contains(&x)).then(|| ((x - 16) / 72) as usize)
+    }
+
     fn rows(&self) -> &[&str] {
         match self.tab {
             0 => &VIDEO,
@@ -234,12 +247,18 @@ impl Menu {
         let ui = Layout::new(size);
         let [x, y] = ui.local(x, y);
         if !self.preferences {
-            if (0..27).contains(&y) && (8..332).contains(&x) {
-                self.selected = ((x - 8) / 108) as usize;
+            if let Some(index) = Self::top_item([x, y]) {
+                self.selected = index;
                 return self.main(self.selected);
             }
         } else {
             let [x, y] = [x - ui.panel[0], y - ui.panel[1]];
+            if (0..16).contains(&y) && (400..420).contains(&x) {
+                self.preferences = false;
+                self.selected = 1;
+                return Action::None;
+            }
+            let y = y - 16;
             if (0..31).contains(&y) && (0..420).contains(&x) {
                 if x >= 336 {
                     self.preferences = false;
@@ -321,41 +340,94 @@ impl Menu {
         ui.tile(
             frame,
             art.bar.as_ref(),
-            [0, 0, width, 27],
+            [0, 0, width, 16],
             [0.24, 0.27, 0.31],
         );
+        for (index, texture) in art.bar_ends.iter().enumerate() {
+            if let Some(texture) = texture {
+                ui.tile(
+                    frame,
+                    Some(texture),
+                    [if index == 0 { 0 } else { width - 16 }, 0, 16, 16],
+                    [0.24, 0.27, 0.31],
+                );
+            }
+        }
         for (index, label) in [
-            if self.resume { "RESUME" } else { "PLAY" },
-            "OPTIONS",
-            "EXIT",
+            if self.resume { "Resume" } else { "Play" },
+            "Options",
+            "Exit",
         ]
         .into_iter()
         .enumerate()
         {
-            let x = 8 + index as i32 * 108;
-            if self.selected == index && !self.preferences {
+            let x = 16 + index as i32 * 72;
+            if (self.selected == index || self.hover == Some(index)) && !self.preferences {
                 ui.tile(
                     frame,
                     art.highlight.as_ref(),
-                    [x, 1, 104, 25],
+                    [x, 0, 72, 16],
                     [0.25, 0.38, 0.55],
                 );
             }
-            ui.label(frame, font, art.font.as_ref(), x + 10, 5, label);
+            ui.label(frame, font, art.font.as_ref(), x + 7, 1, label);
         }
         if frontend.logo.is_none() && !frontend.has_desktop() {
             label(frame, (width - 160) / 2, 65, "UNREAL TOURNAMENT");
         }
         if !self.preferences {
+            if let Some(index) = self.hover {
+                let bottom = (frame.height as f32 / ui.scale) as i32 - 16;
+                ui.tile(
+                    frame,
+                    art.bar.as_ref(),
+                    [0, bottom, width, 16],
+                    [0.24, 0.27, 0.31],
+                );
+                label(
+                    frame,
+                    7,
+                    bottom + 1,
+                    [
+                        if self.resume {
+                            "Return to the match."
+                        } else {
+                            "Start a practice session on Deck16][."
+                        },
+                        "Change video, audio and controls.",
+                        "Exit Unreal Tournament.",
+                    ][index],
+                );
+            }
             return;
         }
         let [x, y] = ui.panel;
         ui.tile(
             frame,
             art.panel.as_ref(),
-            [x, y, 420, 322],
+            [x, y, 420, 338],
             [0.18, 0.20, 0.22],
         );
+        if let Some(texture) = &art.window {
+            for (rect, source) in [
+                ([x, y, 2, 16], [0.0, 0.0, 2.0, 16.0]),
+                ([x + 2, y, 416, 16], [32.0, 0.0, 1.0, 16.0]),
+                ([x + 418, y, 2, 16], [126.0, 0.0, 2.0, 16.0]),
+                ([x + 406, y + 3, 11, 11], [4.0, 32.0, 11.0, 11.0]),
+                ([x, y + 16, 2, 319], [0.0, 32.0, 2.0, 1.0]),
+                ([x + 418, y + 16, 2, 319], [126.0, 32.0, 2.0, 1.0]),
+                ([x, y + 335, 420, 3], [32.0, 125.0, 1.0, 3.0]),
+            ] {
+                frame.tile(
+                    texture.image(0.0),
+                    rect.map(|value| (value as f32 * ui.scale).round() as i32),
+                    source,
+                    [1.0; 3],
+                );
+            }
+        }
+        label(frame, x + 5, y + 1, "Preferences");
+        let y = y + 16;
         for (index, label) in TABS.into_iter().chain(["BACK"]).enumerate() {
             let tx = x + index as i32 * 112;
             let selected = index == self.tab;
