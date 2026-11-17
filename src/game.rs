@@ -1154,7 +1154,7 @@ impl Practice {
             ready && input.primary && self.pulse_beam.is_none(),
             &mut sounds,
         );
-        self.update_pulse_contact(dt);
+        let pulse_blast = self.update_pulse_contact(map, dt, &mut sounds);
         if let Some(beam) = &self.pulse_beam
             && let Some(normal) = beam.wall
             && let Some((texture, scale)) = map
@@ -1171,9 +1171,15 @@ impl Practice {
                 self.time + 5.0,
             );
         }
-        let mut blasts = self
-            .shock
-            .update(map, dt, self.time, &mut sounds, self.target.as_ref());
+        let mut blasts = self.shock.update(
+            map,
+            dt,
+            self.time,
+            &mut sounds,
+            self.target.as_ref(),
+            &mut self.ordnance,
+        );
+        blasts.extend(pulse_blast);
         let trigger = input.primary || input.alternate;
         blasts.extend(self.ordnance.guide(
             map,
@@ -1403,38 +1409,68 @@ impl Practice {
         });
     }
 
-    fn update_pulse_contact(&mut self, dt: f32) {
-        let (Some(beam), Some(target)) = (&mut self.pulse_beam, &mut self.target) else {
+    fn update_pulse_contact(
+        &mut self,
+        map: &Map,
+        dt: f32,
+        sounds: &mut Vec<Arc<Wave>>,
+    ) -> Option<shock::Blast> {
+        let Some(beam) = &mut self.pulse_beam else {
             self.pulse_contact_time = 0.0;
             self.pulse_last_contact = -1.0;
             self.pulse_contact = false;
-            return;
+            return None;
         };
         let delta = beam.end - beam.start;
+        let pawn = self
+            .target
+            .as_ref()
+            .and_then(|target| target.ray(beam.start, delta));
+        let projectile = self
+            .ordnance
+            .trace_target(&map.ordnance, beam.start, delta)
+            .filter(|(_, fraction)| pawn.is_none_or(|pawn| *fraction < pawn));
+        let hit = projectile.map(|(_, fraction)| fraction).or(pawn);
         if !beam.blocked
-            && let Some(fraction) = target.ray(beam.start, delta)
+            && let Some(fraction) = hit
         {
             beam.end = beam.start + delta * fraction;
-            beam.wall = None;
-            beam.hit_player = true;
+            beam.wall = projectile.map(|_| crate::mover::unit(delta) * -1.0);
+            beam.hit_player = projectile.is_none();
+            let mut damage = 0;
             if !self.pulse_contact {
                 let initial = (0.5 * (self.time - self.pulse_last_contact)).min(0.1);
-                target.damage((72.0 * initial) as u16);
+                damage = (72.0 * initial) as u16;
             }
             self.pulse_contact = true;
             self.pulse_last_contact = self.time;
             self.pulse_contact_time += dt;
             if self.pulse_contact_time > 0.22 {
-                target.damage((72.0 * self.pulse_contact_time) as u16);
+                damage += (72.0 * self.pulse_contact_time) as u16;
                 self.pulse_contact_time = 0.0;
+            }
+            if let Some((index, _)) = projectile {
+                return self.ordnance.damage_target(
+                    &map.ordnance,
+                    index,
+                    damage,
+                    self.time,
+                    sounds,
+                );
+            }
+            if let Some(target) = &mut self.target {
+                target.damage(damage);
             }
         } else {
             if self.pulse_contact_time > 0.0 {
-                target.damage((72.0 * self.pulse_contact_time) as u16);
+                if let Some(target) = &mut self.target {
+                    target.damage((72.0 * self.pulse_contact_time) as u16);
+                }
                 self.pulse_contact_time = 0.0;
             }
             self.pulse_contact = false;
         }
+        None
     }
 
     fn update_pulse_primary(&mut self, map: &Map, held: bool, sounds: &mut Vec<Arc<Wave>>) {
@@ -1521,7 +1557,7 @@ impl Practice {
             alternate
         };
         let interval = if rocket { 0.9 } else { 0.5 };
-        let limit = if rocket { 6 } else { 9 };
+        let limit = if rocket { 6 } else { 10 };
         let ammo = &mut self.ammo[weapon.ammo_pool()];
         let load_sound = || {
             map.arsenal
@@ -1586,7 +1622,7 @@ impl Practice {
         let scale = if rocket {
             1.0
         } else {
-            (1.0 + 0.4 * f32::from(charge.loaded - 1)) * 0.5
+            (1.0 + 0.4 * f32::from(charge.loaded - 1)).min(4.28) * 0.5
         };
         let forward = camera.look_direction();
         let right = camera.right();
@@ -1615,7 +1651,14 @@ impl Practice {
         }
         self.shots += u32::from(count);
         self.last_fire = Some((weapon, charge.alternate, self.time));
-        self.next_shot = self.time + if rocket { 0.6 } else { 0.4 };
+        self.next_shot = self.time
+            + if rocket {
+                0.6
+            } else {
+                map.arsenal
+                    .get(&Weapon::Bio)
+                    .map_or(0.75, |art| art.alternate_motion.duration())
+            };
         sounds.extend(shot_sound(&map.arsenal, weapon, charge.alternate));
         true
     }
@@ -1767,6 +1810,7 @@ impl Practice {
                 ammo,
                 sounds,
                 self.target.as_mut(),
+                &mut self.ordnance,
             );
         }
         let kind = match weapon {
@@ -1793,6 +1837,10 @@ impl Practice {
                     Weapon::Flak => 0.92,
                     Weapon::Ripper => 0.42,
                     Weapon::Redeemer => 1.3,
+                    Weapon::Bio => map
+                        .arsenal
+                        .get(&Weapon::Bio)
+                        .map_or(0.3 / 1.05, |art| art.primary_motion.duration()),
                     _ => 0.36,
                 };
             return self.ordnance.fire(
@@ -1831,8 +1879,7 @@ impl Practice {
             }
             return None;
         }
-        self.trace_bullet(map, camera, weapon, alternate, sounds);
-        None
+        self.trace_bullet(map, camera, weapon, alternate, sounds)
     }
 
     fn trace_bullet(
@@ -1842,7 +1889,7 @@ impl Practice {
         weapon: Weapon,
         alternate: bool,
         sounds: &mut Vec<Arc<Wave>>,
-    ) {
+    ) -> Option<shock::Blast> {
         let (cooldown, accuracy, damage, side, height) = match (weapon, alternate) {
             (Weapon::Enforcer, false) => (0.32, 0.2, 17, 5.5, -4.4),
             (Weapon::Enforcer, true) => {
@@ -1871,7 +1918,7 @@ impl Practice {
                 }
             }
             (Weapon::Sniper, _) => (0.67, 0.0, 45, 0.0, 0.0),
-            _ => return,
+            _ => return None,
         };
         self.next_shot = self.time + cooldown;
         let forward = camera.look_direction();
@@ -1885,7 +1932,30 @@ impl Practice {
             forward * 10_000.0 + (right * self.jitter() + up * self.jitter()) * (500.0 * accuracy);
         let mut wall = map.collision.ray_surface(start, delta);
         let mut visible = wall.map_or(delta, |(point, _)| point - start);
-        if let Some(target) = &mut self.target
+        let projectile = self.ordnance.trace_target(&map.ordnance, start, visible);
+        let pawn_fraction = self
+            .target
+            .as_ref()
+            .and_then(|target| target.ray(start, visible));
+        let projectile_hit = projectile
+            .is_some_and(|(_, fraction)| pawn_fraction.is_none_or(|pawn| fraction < pawn));
+        let blast = if let Some((index, fraction)) = projectile
+            && pawn_fraction.is_none_or(|pawn| fraction < pawn)
+        {
+            visible = visible * fraction;
+            wall = None;
+            self.ordnance.damage_target(
+                &map.ordnance,
+                index,
+                damage as u16 * self.damage_scale(),
+                self.time,
+                sounds,
+            )
+        } else {
+            None
+        };
+        if !projectile_hit
+            && let Some(target) = &mut self.target
             && let Some(fraction) = target.ray(start, visible)
         {
             let point = start + visible * fraction;
@@ -1978,6 +2048,7 @@ impl Practice {
                 });
             }
         }
+        blast
     }
 
     fn jitter(&mut self) -> f32 {

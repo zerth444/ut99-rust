@@ -67,6 +67,7 @@ impl<'a> Assets<'a> {
 struct Appearance {
     hidden: bool,
     unlit: bool,
+    environment_map: bool,
     draw_type: u8,
     mesh: Option<Object>,
     player_mesh: Option<Object>,
@@ -106,6 +107,7 @@ struct Appearance {
 struct VisualProperties {
     hidden: Option<bool>,
     unlit: Option<bool>,
+    environment_map: Option<bool>,
     draw_type: Option<u8>,
     mesh: Option<i32>,
     player_mesh: Option<i32>,
@@ -149,6 +151,7 @@ impl VisualProperties {
         let mut props_out = Self {
             hidden: None,
             unlit: None,
+            environment_map: None,
             draw_type: None,
             mesh: None,
             player_mesh: None,
@@ -191,6 +194,7 @@ impl VisualProperties {
             match prop.name {
                 "bHidden" => props_out.hidden = prop.boolean,
                 "bUnlit" => props_out.unlit = prop.boolean,
+                "bMeshEnviroMap" => props_out.environment_map = prop.boolean,
                 "DrawType" => props_out.draw_type = Some(value.byte()?),
                 "Mesh" => props_out.mesh = Some(value.compact()?),
                 "PlayerViewMesh" => props_out.player_mesh = Some(value.compact()?),
@@ -243,6 +247,9 @@ impl VisualProperties {
         }
         if let Some(value) = self.unlit {
             parent.unlit = value;
+        }
+        if let Some(value) = self.environment_map {
+            parent.environment_map = value;
         }
         if let Some(value) = self.draw_type {
             parent.draw_type = value;
@@ -762,6 +769,7 @@ pub fn load(
                             Weapon::Hammer => 0.65,
                             Weapon::Minigun => 1.6,
                             Weapon::Redeemer => 0.3,
+                            Weapon::Bio => 1.05,
                             _ => 1.0,
                         },
                     );
@@ -782,6 +790,9 @@ pub fn load(
                     };
                     if weapon == Weapon::Hammer {
                         weapon_assets.alternate_motion = motion(&["Shake"], 1.0);
+                    }
+                    if weapon == Weapon::Bio {
+                        weapon_assets.alternate_motion = motion(&["Fire"], 0.4);
                     }
                     if weapon == Weapon::Minigun {
                         weapon_assets.alternate_motion = motion(&["Shoot1"], 1.3);
@@ -1075,6 +1086,21 @@ fn projectile_art(
                 ],
             );
             art.stuck = effect_motion(assets, textures, object, visual, &mesh, &["Hit", "Still"]);
+            if matches!(kind, Kind::Gel | Kind::Glob | Kind::Splash) {
+                art.flight.rate *= 0.4;
+                art.dripping = effect_motion(assets, textures, object, visual, &mesh, &["Drip"]);
+                art.dripping.rate *= 0.1;
+                art.sliding = effect_motion(assets, textures, object, visual, &mesh, &["Slide"]);
+                art.sliding.rate *= 0.2;
+                art.collision_radius = visual.collision_radius.unwrap_or(2.0);
+                art.collision_height = visual.collision_height.unwrap_or(2.0);
+                let class = find_export(assets, "botpack", "BioMark", "Class");
+                let mark = appearance(assets, classes, class);
+                art.scorch = mark
+                    .texture
+                    .and_then(|id| cached_texture(assets, textures, id))
+                    .map(|texture| (texture, mark.scale, 23.0));
+            }
         }
     }
     if kind == Kind::Rocket {
@@ -1508,7 +1534,9 @@ fn mesh_faces(
             mesh_triangle: Some(index),
             normal,
             color,
-            flags: tri.flags | if visual.unlit { 0x0040_0000 } else { 0 },
+            flags: tri.flags
+                | if visual.unlit { 0x0040_0000 } else { 0 }
+                | if visual.environment_map { 0x10 } else { 0 },
             texture,
             lightmap: None,
             sky: false,

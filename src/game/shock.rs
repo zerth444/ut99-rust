@@ -238,6 +238,7 @@ impl Shots {
         ammo: &mut u16,
         sounds: &mut Vec<Arc<Wave>>,
         pawn: Option<&mut super::TrainingTarget>,
+        ordnance: &mut super::ordnance::Shots,
     ) -> Option<Blast> {
         let fallback = Assets::default();
         let assets = assets(map).unwrap_or(&fallback);
@@ -286,9 +287,11 @@ impl Shots {
             })
             .min_by(|(_, a), (_, b)| a.total_cmp(b));
         let pawn_fraction = pawn.as_ref().and_then(|pawn| pawn.ray(start, delta));
+        let projectile = ordnance.trace_target(&map.ordnance, start, delta);
         let mut blast = None;
         let beam_end = if let Some((index, fraction)) = bolt_target
             && pawn_fraction.is_none_or(|pawn| fraction < pawn)
+            && projectile.is_none_or(|(_, projectile)| fraction < projectile)
         {
             let bolt = self.bolts.remove(index);
             if *ammo >= 2 {
@@ -302,6 +305,11 @@ impl Shots {
             });
             sounds.extend(assets.combo_sound.iter().cloned());
             blast = Some(Blast::new(bolt.position, assets, true));
+            start + delta * fraction
+        } else if let Some((index, fraction)) = projectile
+            && pawn_fraction.is_none_or(|pawn| fraction < pawn)
+        {
+            blast = ordnance.damage_target(&map.ordnance, index, 40, now, sounds);
             start + delta * fraction
         } else {
             let (end, normal) = if let (Some(pawn), Some(fraction)) = (pawn, pawn_fraction) {
@@ -334,6 +342,7 @@ impl Shots {
         now: f32,
         sounds: &mut Vec<Arc<Wave>>,
         pawn: Option<&super::TrainingTarget>,
+        ordnance: &mut super::ordnance::Shots,
     ) -> Vec<Blast> {
         let fallback = Assets::default();
         let assets = assets(map).unwrap_or(&fallback);
@@ -352,6 +361,30 @@ impl Shots {
             let delta = bolt.direction * (assets.speed * dt);
             let hit = map.collision.ray_surface(bolt.position, delta);
             let visible = hit.map_or(delta, |(point, _)| point - bolt.position);
+            let projectile = ordnance.trace_target(&map.ordnance, bolt.position, visible);
+            let pawn_fraction = pawn.and_then(|pawn| pawn.ray(bolt.position, visible));
+            if let Some((index, fraction)) = projectile
+                && pawn_fraction.is_none_or(|pawn| fraction < pawn)
+            {
+                let position = bolt.position + visible * fraction;
+                blasts.extend(ordnance.damage_target(
+                    &map.ordnance,
+                    index,
+                    assets.damage as u16,
+                    now,
+                    sounds,
+                ));
+                blasts.push(Blast::new(position, assets, false));
+                self.rings.push(Ring {
+                    impact: Impact::Wall,
+                    position,
+                    direction: bolt.direction,
+                    born: now,
+                });
+                sounds.extend(assets.hit_sound.iter().cloned());
+                sounds.extend(blast_sound(assets));
+                return false;
+            }
             let hit = pawn
                 .and_then(|pawn| pawn.ray(bolt.position, visible))
                 .map(|fraction| (bolt.position + visible * fraction, bolt.direction * -1.0))
@@ -618,7 +651,8 @@ mod tests {
                     game.time,
                     &mut ammo,
                     &mut sounds,
-                    None
+                    None,
+                    &mut game.ordnance
                 )
                 .is_none()
         );
@@ -643,6 +677,7 @@ mod tests {
                 &mut ammo,
                 &mut sounds,
                 None,
+                &mut game.ordnance,
             )
             .unwrap();
         assert!(game.shock.bolts.is_empty());

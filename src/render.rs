@@ -1009,16 +1009,17 @@ impl Frame {
         let mut transformed = Vec::new();
         let mut clipped = Vec::new();
         let vertex_key = |Vec3(x, y, z): Vec3| [x.to_bits(), y.to_bits(), z.to_bits()];
-        let skin_normals = skin.map(|_| {
-            let mut normals = HashMap::<_, Vec3>::new();
-            for face in faces {
-                for &vertex in &face.vertices {
-                    let sum = normals.entry(vertex_key(vertex)).or_default();
-                    *sum = *sum + face.normal;
+        let skin_normals = (skin.is_some() || faces.iter().any(|face| face.flags & 0x10 != 0))
+            .then(|| {
+                let mut normals = HashMap::<_, Vec3>::new();
+                for face in faces {
+                    for &vertex in &face.vertices {
+                        let sum = normals.entry(vertex_key(vertex)).or_default();
+                        *sum = *sum + face.normal;
+                    }
                 }
-            }
-            normals
-        });
+                normals
+            });
 
         for face in faces.iter().filter(|face| face.sky == sky) {
             let texture = skin.or(face.texture.as_deref());
@@ -1045,8 +1046,11 @@ impl Frame {
             transformed.clear();
             transformed.extend(face.vertices.iter().enumerate().map(|(i, &vertex)| {
                 let point = position(i, vertex);
-                let (u, v) = if let (Some(skin), Some(normals)) = (skin, &skin_normals) {
-                    let (width, height) = skin.size();
+                let (u, v) = if let Some(texture) = texture
+                    && let Some(normals) = &skin_normals
+                    && (skin.is_some() || flags & 0x10 != 0)
+                {
+                    let (width, height) = texture.size();
                     let incident = crate::mover::unit(point - view.eye);
                     let normal = crate::mover::unit(
                         normals.get(&vertex_key(vertex)).copied().unwrap_or(normal),
