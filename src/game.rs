@@ -1042,6 +1042,8 @@ impl Practice {
         self.time += dt;
         self.effects.retain(|effect| effect.expires > self.time);
         self.decals.update(self.time);
+        self.decals.follow_movers(&map.movers);
+        self.ordnance.follow_movers(&map.movers);
         let mut sounds = Vec::new();
         if self.damage_amp_active() && self.time >= self.amp_warning {
             self.amp_warning += 1.0;
@@ -1202,10 +1204,6 @@ impl Practice {
         );
         self.ordnance
             .project_marks(map, &mut self.decals, self.time);
-        if self.was_guiding && self.ordnance.guided_view().is_none() {
-            self.guidance_lost_until = self.time + 0.3;
-            self.next_shot = self.time + 1.3;
-        }
         let charging = self.update_charge(map, camera, &input, ready, &mut sounds, &mut blasts);
         let hammer_hit = self.update_hammer(map, camera, &input, ready, &mut sounds);
         let mut alternate_shot =
@@ -1224,6 +1222,12 @@ impl Practice {
             && ready
         {
             blasts.extend(self.fire(map, camera, !primary_shot && alternate_shot, &mut sounds));
+        }
+        self.ordnance
+            .damage_blasts(map, &mut blasts, self.time, &mut sounds);
+        if self.was_guiding && self.ordnance.guided_view().is_none() {
+            self.guidance_lost_until = self.time + 0.3;
+            self.next_shot = self.time + 1.3;
         }
         self.was_guiding = self.ordnance.guided_view().is_some();
         if self.shots != shots_before && damage_scale > 1 {

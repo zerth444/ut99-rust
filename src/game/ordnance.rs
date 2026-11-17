@@ -102,7 +102,7 @@ pub enum Visual<'a> {
 pub struct Shots {
     projectiles: Vec<Projectile>,
     effects: Vec<Effect>,
-    marks: Vec<(Kind, Vec3, Vec3)>,
+    marks: Vec<(Kind, Vec3, Vec3, Option<usize>)>,
     pub guided_roll: f32,
 }
 
@@ -116,6 +116,7 @@ struct Projectile {
     expires: f32,
     scale: f32,
     stuck: Option<f32>,
+    base: Option<(usize, Vec3)>,
     next_trail: f32,
     wall_hits: u8,
     seeking: Option<(Vec3, f32)>,
@@ -133,6 +134,58 @@ struct Effect {
 }
 
 impl Shots {
+    pub(super) fn follow_movers(&mut self, movers: &[crate::mover::Mover]) {
+        for shot in &mut self.projectiles {
+            if let Some((index, local)) = shot.base
+                && let Some(mover) = movers.get(index)
+            {
+                shot.position = local + mover.offset;
+            }
+        }
+    }
+
+    pub(super) fn damage_blasts(
+        &mut self,
+        map: &Map,
+        blasts: &mut Vec<Blast>,
+        time: f32,
+        sounds: &mut Vec<Arc<Wave>>,
+    ) {
+        let fronts: Vec<_> = self
+            .effects
+            .iter()
+            .filter(|effect| effect.nuclear)
+            .map(|effect| (effect.position, ((time - effect.born) * 10.0).floor() * 0.1))
+            .collect();
+        for (origin, age) in fronts {
+            for index in (0..self.projectiles.len()).rev() {
+                let shot = &self.projectiles[index];
+                if (shot.kind.bio() || shot.kind.warhead())
+                    && let Some((damage, _)) = wave_hit(map, origin, shot.position, age)
+                {
+                    blasts.extend(self.damage_target(&map.ordnance, index, damage, time, sounds));
+                }
+            }
+        }
+        let mut cursor = 0;
+        while cursor < blasts.len() {
+            for index in (0..self.projectiles.len()).rev() {
+                let shot = &self.projectiles[index];
+                if !shot.kind.bio() && !shot.kind.warhead() {
+                    continue;
+                }
+                let art = &map.ordnance[shot.kind as usize];
+                let Some((damage, _)) =
+                    blasts[cursor].hit_actor(&map.collision, shot.position, art.collision_radius)
+                else {
+                    continue;
+                };
+                blasts.extend(self.damage_target(&map.ordnance, index, damage, time, sounds));
+            }
+            cursor += 1;
+        }
+    }
+
     pub(super) fn trace_target(
         &self,
         assets: &Arsenal,
@@ -271,9 +324,21 @@ impl Shots {
     }
 
     pub(super) fn project_marks(&mut self, map: &Map, marks: &mut super::decals::Marks, time: f32) {
-        for (kind, point, normal) in self.marks.drain(..) {
+        for (kind, point, normal, mover) in self.marks.drain(..) {
             if let Some((texture, scale, duration)) = &map.ordnance[kind as usize].scorch {
-                marks.project(&map.faces, point, normal, texture, *scale, time + duration);
+                if let Some(index) = mover {
+                    marks.project_mover(
+                        &map.movers,
+                        index,
+                        point,
+                        normal,
+                        texture,
+                        *scale,
+                        time + duration,
+                    );
+                } else {
+                    marks.project(&map.faces, point, normal, texture, *scale, time + duration);
+                }
             }
         }
     }
@@ -313,21 +378,12 @@ impl Shots {
                 continue;
             }
             let age = ((time - effect.born) * 10.0).floor() * 0.1;
-            if age < 0.1 {
+            let Some((force, impulse)) = wave_hit(map, effect.position, center, age) else {
                 continue;
-            }
-            let offset = center - effect.position;
-            let distance = offset.dot(offset).sqrt().max(1.0);
-            if distance > shock_size(age) * 29.0
-                || map.collision.ray(effect.position, offset).is_some()
-            {
-                continue;
-            }
+            };
             effect.struck[victim] = true;
-            let force = (1100.0 - 1.1 * distance).max(0.0);
-            let impulse = (offset * distance.recip() + Vec3(0.0, 0.0, 0.3)) * (force + 20.0);
             let (damage, velocity) = hit.get_or_insert((0u16, Vec3::default()));
-            *damage = damage.saturating_add(force as u16);
+            *damage = damage.saturating_add(force);
             *velocity = *velocity + impulse;
         }
         hit
@@ -481,6 +537,7 @@ impl Shots {
                 },
             scale,
             stuck: None,
+            base: None,
             next_trail: time + if kind.warhead() { 0.3 } else { 0.0 },
             wall_hits: 0,
             seeking: None,
@@ -488,7 +545,7 @@ impl Shots {
         if let Some((point, normal)) = map.collision.ray_surface(camera.position, offset) {
             shot.position = point + normal * 0.5;
             if art.scorch.is_some() {
-                self.marks.push((kind, point, normal));
+                self.marks.push((kind, point, normal, None));
             }
             if !matches!(
                 kind,
@@ -527,6 +584,7 @@ impl Shots {
     ) {
         self.effects
             .retain(|effect| time - effect.born < effect.duration);
+        self.follow_movers(&map.movers);
         for effect in self.effects.iter().filter(|effect| {
             effect.nuclear && time >= effect.born + 0.5 && time - dt < effect.born + 0.5
         }) {
@@ -649,13 +707,13 @@ impl Shots {
                     shot.velocity + map.collision.regions.at(shot.position).gravity * dt;
             }
             let delta = shot.velocity * dt;
-            let wall = map.collision.projectile_surface(
+            let wall = map.collision.projectile_contact(
                 shot.position,
                 delta,
                 art.collision_radius,
                 art.collision_height,
             );
-            let visible_delta = wall.map_or(delta, |(point, _)| point - shot.position);
+            let visible_delta = wall.map_or(delta, |(point, _, _)| point - shot.position);
             if let Some(target) = target.as_deref_mut()
                 && let Some(fraction) = target.ray(shot.position, visible_delta)
             {
@@ -674,7 +732,7 @@ impl Shots {
                 blasts.extend(blast);
                 return false;
             }
-            let Some((point, normal)) = wall else {
+            let Some((point, normal, hull)) = wall else {
                 shot.position = shot.position + delta;
                 if shot.velocity.dot(shot.velocity) > 1.0 {
                     shot.direction = unit(shot.velocity);
@@ -737,6 +795,7 @@ impl Shots {
                             expires: time + 12.0,
                             scale: 0.55,
                             stuck: None,
+                            base: None,
                             next_trail: time,
                             wall_hits: 0,
                             seeking: None,
@@ -746,10 +805,17 @@ impl Shots {
                 }
                 shot.direction = normal;
                 shot.stuck = Some(time);
+                shot.base = map
+                    .movers
+                    .iter()
+                    .enumerate()
+                    .find(|(_, mover)| mover.collision_hull() == Some(hull))
+                    .map(|(index, mover)| (index, shot.position - mover.offset));
                 shot.expires = time + 3.8;
                 if art.scorch.is_some() {
                     let contact = map.collision.ray(point, normal * -8.0).unwrap_or(point);
-                    self.marks.push((kind, contact, normal));
+                    self.marks
+                        .push((kind, contact, normal, shot.base.map(|(index, _)| index)));
                 }
                 sounds.extend(art.contact.iter().cloned());
                 true
@@ -769,6 +835,7 @@ impl Shots {
                             expires: time + 2.9,
                             scale: 1.0,
                             stuck: None,
+                            base: None,
                             next_trail: time,
                             wall_hits: 0,
                             seeking: None,
@@ -777,7 +844,11 @@ impl Shots {
                 }
                 if art.scorch.is_some() {
                     let contact = map.collision.ray(point, normal * -32.0).unwrap_or(point);
-                    self.marks.push((kind, contact, normal));
+                    let mover = map
+                        .movers
+                        .iter()
+                        .position(|mover| mover.collision_hull() == Some(hull));
+                    self.marks.push((kind, contact, normal, mover));
                 }
                 blasts.extend(explode_at(
                     shot,
@@ -1024,10 +1095,346 @@ fn shock_size(age: f32) -> f32 {
     13.0 * age + 3.5 / ((1.5 - age) / 1.5 + 0.05)
 }
 
+fn wave_hit(map: &Map, origin: Vec3, center: Vec3, age: f32) -> Option<(u16, Vec3)> {
+    if !(0.1..=1.5).contains(&age) {
+        return None;
+    }
+    let offset = center - origin;
+    let distance = offset.dot(offset).sqrt().max(1.0);
+    if distance > shock_size(age) * 29.0 || map.collision.ray(origin, offset).is_some() {
+        return None;
+    }
+    let force = (1100.0 - 1.1 * distance).max(0.0);
+    let impulse = (offset * distance.recip() + Vec3(0.0, 0.0, 0.3)) * (force + 20.0);
+    Some((force as u16, impulse))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{collision::Collision, package::Package};
+
+    #[test]
+    #[ignore = "requires the local GOTY game packages"]
+    fn nuclear_wave_reaches_other_projectiles_and_guidance_ends_on_blast_damage() {
+        use super::super::{Input, Practice};
+        let path = std::path::Path::new("local/goty/Maps/DM-Deck16][.unr");
+        let bytes = std::fs::read(path).unwrap();
+        let mut map = Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap();
+        let camera = Camera {
+            position: Vec3(0.0, 0.0, 65.0),
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        for covered in [false, true] {
+            map.collision = Collision::read(&[], std::iter::empty(), &[]).unwrap();
+            if covered {
+                map.collision
+                    .add_box(Vec3(250.0, -200.0, -200.0), Vec3(270.0, 200.0, 300.0));
+            }
+            let mut shots = Shots::default();
+            let mut sounds = Vec::new();
+            shots.fire(
+                &map,
+                &camera,
+                Kind::Warhead,
+                camera.forward(),
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                &mut sounds,
+            );
+            let mut source = shots.projectiles.remove(0);
+            source.position = camera.position;
+            let _ = explode(
+                &source,
+                &map.ordnance[Kind::Warhead as usize],
+                &mut shots.effects,
+                &mut sounds,
+                0.0,
+            );
+            shots.fire(
+                &map,
+                &camera,
+                Kind::Warhead,
+                camera.forward(),
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                &mut sounds,
+            );
+            shots.projectiles[0].position = Vec3(500.0, 0.0, 81.0);
+            shots.fire(
+                &map,
+                &camera,
+                Kind::Gel,
+                camera.forward(),
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                &mut sounds,
+            );
+            shots.projectiles[1].position = Vec3(700.0, 0.0, 81.0);
+            let mut blasts = Vec::new();
+            shots.damage_blasts(&map, &mut blasts, 0.1, &mut sounds);
+            assert_eq!(shots.projectiles.len(), 2);
+            shots.damage_blasts(&map, &mut blasts, 1.0, &mut sounds);
+            assert_eq!(
+                shots
+                    .projectiles
+                    .iter()
+                    .filter(|shot| shot.kind.warhead())
+                    .count(),
+                usize::from(covered)
+            );
+            assert_eq!(
+                shots.effects.iter().filter(|effect| effect.nuclear).count(),
+                1
+            );
+            let gel = shots
+                .projectiles
+                .iter()
+                .find(|shot| shot.kind.bio())
+                .unwrap();
+            assert_eq!(gel.expires <= 1.3, !covered);
+        }
+        map.collision = Collision::read(&[], std::iter::empty(), &[]).unwrap();
+        let mut game = Practice::new(&map);
+        let mut sounds = Vec::new();
+        game.ordnance.fire(
+            &map,
+            &camera,
+            Kind::GuidedWarhead,
+            camera.forward(),
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            &mut sounds,
+        );
+        game.ordnance.projectiles[0].position = Vec3(100.0, 0.0, 65.0);
+        game.was_guiding = true;
+        game.ordnance.fire(
+            &map,
+            &camera,
+            Kind::Grenade,
+            camera.forward(),
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            &mut sounds,
+        );
+        let grenade = game.ordnance.projectiles.last_mut().unwrap();
+        grenade.position = Vec3(100.0, 20.0, 65.0);
+        grenade.expires = 0.005;
+        game.update(
+            &mut map,
+            &camera,
+            0.01,
+            Input {
+                primary: false,
+                alternate: false,
+                slot: None,
+                cycle: 0,
+            },
+            false,
+            None,
+        );
+        assert!(game.ordnance.guided_view().is_none());
+        assert!(game.guidance_lost_until > game.time);
+        assert!(game.next_shot >= game.time + 1.3 - 0.001);
+    }
+
+    #[test]
+    #[ignore = "requires the local GOTY game packages"]
+    fn explosions_propagate_through_projectiles_and_stop_at_cover() {
+        let path = std::path::Path::new("local/goty/Maps/DM-Deck16][.unr");
+        let bytes = std::fs::read(path).unwrap();
+        let mut map = Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap();
+        let camera = Camera {
+            position: Vec3(0.0, 0.0, 65.0),
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        for covered in [false, true] {
+            map.collision = Collision::read(&[], std::iter::empty(), &[]).unwrap();
+            if covered {
+                map.collision
+                    .add_box(Vec3(155.0, -200.0, -200.0), Vec3(165.0, 200.0, 300.0));
+            }
+            let mut shots = Shots::default();
+            let mut sounds = Vec::new();
+            for x in [100.0, 210.0, 320.0] {
+                shots.fire(
+                    &map,
+                    &camera,
+                    Kind::Gel,
+                    camera.forward(),
+                    0.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    &mut sounds,
+                );
+                let shot = shots.projectiles.last_mut().unwrap();
+                shot.position = Vec3(x, 0.0, 65.0);
+                shot.velocity = Vec3::default();
+                shot.stuck = Some(0.0);
+            }
+            let mut seed = vec![Blast::radial(camera.position, 120.0, 75.0, 50_000.0)];
+            shots.damage_blasts(&map, &mut seed, 0.0, &mut sounds);
+            assert!(shots.projectiles[0].expires <= 0.3);
+            assert!(shots.projectiles[1].expires > 3.0);
+            let mut count = 0;
+            for tick in 1..=100 {
+                let time = tick as f32 * 0.01;
+                let mut blasts = Vec::new();
+                shots.update(&map, None, time, 0.01, &mut sounds, &mut blasts);
+                shots.damage_blasts(&map, &mut blasts, time, &mut sounds);
+                count += blasts.len();
+            }
+            assert_eq!(count, if covered { 1 } else { 3 });
+            assert_eq!(shots.projectiles.len(), if covered { 2 } else { 0 });
+        }
+        map.collision = Collision::read(&[], std::iter::empty(), &[]).unwrap();
+        let mut shots = Shots::default();
+        let mut sounds = Vec::new();
+        for x in [100.0, 400.0, 700.0, 1000.0] {
+            shots.fire(
+                &map,
+                &camera,
+                Kind::Warhead,
+                camera.forward(),
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                &mut sounds,
+            );
+            shots.projectiles.last_mut().unwrap().position = Vec3(x, 0.0, 65.0);
+        }
+        let mut blasts = vec![Blast::radial(camera.position, 150.0, 75.0, 50_000.0)];
+        shots.damage_blasts(&map, &mut blasts, 0.0, &mut sounds);
+        assert!(shots.projectiles.is_empty());
+        assert_eq!(blasts.len(), 5);
+        assert_eq!(shots.effects.len(), 4);
+        assert!(shots.effects.iter().all(|effect| !effect.nuclear));
+    }
+
+    #[test]
+    #[ignore = "requires the local GOTY game packages"]
+    fn deck16_gel_and_its_mark_follow_the_lift() {
+        use crate::collision::Walker;
+        let path = std::path::Path::new("local/goty/Maps/DM-Deck16][.unr");
+        let bytes = std::fs::read(path).unwrap();
+        let mut map = Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap();
+        let index = 0;
+        let face = map.movers[index]
+            .faces
+            .iter()
+            .filter(|face| face.normal.2 > 0.95)
+            .max_by(|a, b| a.vertices[0].2.total_cmp(&b.vertices[0].2))
+            .unwrap();
+        let center = face
+            .vertices
+            .iter()
+            .copied()
+            .fold(Vec3::default(), |sum, point| sum + point)
+            * (1.0 / face.vertices.len() as f32);
+        let up = Vec3(0.0, 0.0, 1.0);
+        let mut walker = Walker::spawn(&map.collision, center + up * 39.2);
+        let camera = Camera {
+            position: center + up * 80.0,
+            yaw: 0.0,
+            pitch: -std::f32::consts::FRAC_PI_2,
+        };
+        let mut shots = Shots::default();
+        let mut sounds = Vec::new();
+        let mut blasts = Vec::new();
+        shots.fire(
+            &map,
+            &camera,
+            Kind::Gel,
+            camera.look_direction(),
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            &mut sounds,
+        );
+        for tick in 1..=80 {
+            shots.update(
+                &map,
+                None,
+                tick as f32 / 240.0,
+                1.0 / 240.0,
+                &mut sounds,
+                &mut blasts,
+            );
+        }
+        assert_eq!(
+            shots.projectiles[0].base.map(|(index, _)| index),
+            Some(index)
+        );
+        let initial = shots.projectiles[0].position;
+        let mut marks = super::super::decals::Marks::default();
+        shots.project_marks(&map, &mut marks, 1.0 / 3.0);
+        let mark_origin = marks.visible().next().expect("BioMark on the lift")[0].origin;
+        for tick in 81..=440 {
+            let dt = 1.0 / 240.0;
+            map.movers[index].tick(&mut map.collision, &mut walker, dt);
+            walker.advance(&map.collision, Vec3::default(), None, dt);
+            shots.update(&map, None, tick as f32 * dt, dt, &mut sounds, &mut blasts);
+            marks.follow_movers(&map.movers);
+        }
+        let delta = map.movers[index].offset;
+        assert!(delta.2 > 64.0, "lift displacement {delta:?}");
+        let error = shots.projectiles[0].position - initial - delta;
+        assert!(error.dot(error) < 0.001);
+        let error = marks.visible().next().unwrap()[0].origin - mark_origin - delta;
+        assert!(error.dot(error) < 0.001);
+        map.movers[index].tick(&mut map.collision, &mut walker, 0.05);
+        let (_, local) = shots.projectiles[0].base.unwrap();
+        let target = local + map.movers[index].offset;
+        let anchor = target + up * 20.0;
+        let offset = Vec3(-150.0, -70.0, 110.0);
+        let position = map
+            .collision
+            .ray(anchor, offset)
+            .map_or(anchor + offset, |point| point - unit(offset) * 8.0);
+        let look = target - position;
+        let camera = Camera {
+            position,
+            yaw: look.1.atan2(look.0),
+            pitch: look.2.atan2(look.0.hypot(look.1)),
+        };
+        let mut practice = super::super::Practice::new(&map);
+        practice.time = 440.0 / 240.0;
+        practice.weapon = super::super::Weapon::Sniper;
+        practice.ammo[super::super::Weapon::Sniper.ammo_pool()] = 1;
+        practice.ordnance = shots;
+        practice.update(
+            &mut map,
+            &camera,
+            1.0 / 240.0,
+            super::super::Input {
+                primary: true,
+                alternate: false,
+                slot: None,
+                cycle: 0,
+            },
+            false,
+            None,
+        );
+        assert!(
+            practice.ordnance.projectiles[0].expires <= practice.time + 0.3,
+            "the sniper trace must use the current lift position"
+        );
+    }
 
     #[test]
     #[ignore = "requires the local GOTY game packages"]

@@ -32,6 +32,7 @@ pub struct Collision {
 struct Hit {
     fraction: f32,
     normal: Vec3,
+    hull: Option<usize>,
 }
 
 impl Collision {
@@ -119,7 +120,7 @@ impl Collision {
         let lo = Vec3(start.0.min(end.0), start.1.min(end.1), start.2.min(end.2)) - extent;
         let hi = Vec3(start.0.max(end.0), start.1.max(end.1), start.2.max(end.2)) + extent;
         let mut best: Option<Hit> = None;
-        for hull in &self.hulls {
+        for (index, hull) in self.hulls.iter().enumerate() {
             if hi.0 < hull.min.0
                 || hi.1 < hull.min.1
                 || hi.2 < hull.min.2
@@ -129,11 +130,12 @@ impl Collision {
             {
                 continue;
             }
-            if let Some(hit) = hull.sweep(start, delta, extent)
+            if let Some(mut hit) = hull.sweep(start, delta, extent)
                 && best
                     .as_ref()
                     .is_none_or(|best| hit.fraction < best.fraction)
             {
+                hit.hull = Some(index);
                 best = Some(hit);
             }
         }
@@ -156,8 +158,19 @@ impl Collision {
         radius: f32,
         height: f32,
     ) -> Option<(Vec3, Vec3)> {
+        self.projectile_contact(start, delta, radius, height)
+            .map(|(point, normal, _)| (point, normal))
+    }
+
+    pub fn projectile_contact(
+        &self,
+        start: Vec3,
+        delta: Vec3,
+        radius: f32,
+        height: f32,
+    ) -> Option<(Vec3, Vec3, usize)> {
         self.sweep(start, delta, Vec3(radius, radius, height))
-            .map(|hit| (start + delta * hit.fraction, hit.normal))
+            .and_then(|hit| Some((start + delta * hit.fraction, hit.normal, hit.hull?)))
     }
 
     fn trace(&self, start: Vec3, delta: Vec3) -> Option<Hit> {
@@ -265,6 +278,7 @@ impl Hull {
         ((-0.0001..=1.0).contains(&enter) && exit > 0.0).then_some(Hit {
             fraction: enter.max(0.0),
             normal,
+            hull: None,
         })
     }
 }

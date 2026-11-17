@@ -109,10 +109,18 @@ impl Blast {
         collision: &crate::collision::Collision,
         center: Vec3,
     ) -> Option<(u16, Vec3)> {
+        self.hit_actor(collision, center, crate::collision::PLAYER_RADIUS)
+    }
+
+    pub(super) fn hit_actor(
+        &self,
+        collision: &crate::collision::Collision,
+        center: Vec3,
+        radius: f32,
+    ) -> Option<(u16, Vec3)> {
         let offset = center - self.position;
         let distance = offset.dot(offset).sqrt();
-        let scale =
-            1.0 - (distance.max(1.0) - crate::collision::PLAYER_RADIUS).max(0.0) / self.radius;
+        let scale = 1.0 - (distance.max(1.0) - radius).max(0.0) / self.radius;
         // Stop just short of the origin so the surface hit by the projectile does
         // not occlude the explosion on its own side of the wall.
         if scale <= 0.0

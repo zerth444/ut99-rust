@@ -57,6 +57,10 @@ pub struct Mover {
 }
 
 impl Mover {
+    pub(crate) fn collision_hull(&self) -> Option<usize> {
+        self.hull
+    }
+
     #[cfg(windows)]
     pub fn scene_event(&mut self, event: usize) {
         if self.tag == Some(event) {

@@ -15,6 +15,7 @@ pub struct Marks {
 struct Mark {
     expires: f32,
     faces: Vec<Face>,
+    base: Option<(usize, Vec3)>,
 }
 
 impl Marks {
@@ -27,12 +28,50 @@ impl Marks {
         scale: f32,
         expires: f32,
     ) {
+        self.project_attached(world, point, normal, texture, scale, expires, None);
+    }
+
+    pub fn project_mover(
+        &mut self,
+        movers: &[crate::mover::Mover],
+        index: usize,
+        point: Vec3,
+        normal: Vec3,
+        texture: &Arc<Texture>,
+        scale: f32,
+        expires: f32,
+    ) {
+        if let Some(mover) = movers.get(index) {
+            self.project_attached(
+                &mover.faces,
+                point - mover.offset,
+                normal,
+                texture,
+                scale,
+                expires,
+                Some((index, mover.offset)),
+            );
+        }
+    }
+
+    fn project_attached(
+        &mut self,
+        world: &[Face],
+        point: Vec3,
+        normal: Vec3,
+        texture: &Arc<Texture>,
+        scale: f32,
+        expires: f32,
+        base: Option<(usize, Vec3)>,
+    ) {
+        let offset = base.map_or(Vec3::default(), |(_, offset)| offset);
         let (width, height) = texture.size();
         let spacing = width.min(height) * scale * 0.25;
         if self.marks.iter().any(|mark| {
             let face = &mark.faces[0];
-            let delta = face.origin - point;
-            face.normal.dot(normal) > 0.99
+            let delta = face.origin - point - offset;
+            mark.base.map(|(index, _)| index) == base.map(|(index, _)| index)
+                && face.normal.dot(normal) > 0.99
                 && delta.dot(delta) < spacing * spacing
                 && face
                     .texture
@@ -84,7 +123,7 @@ impl Marks {
             if polygon.len() >= 3 {
                 let bias = normal * (distance + 0.04);
                 for vertex in &mut polygon {
-                    *vertex = *vertex + bias;
+                    *vertex = *vertex + bias + offset;
                 }
                 faces.push(Face {
                     vertices: polygon,
@@ -95,7 +134,7 @@ impl Marks {
                     sky: false,
                     texture: Some(Arc::clone(texture)),
                     lightmap: None,
-                    origin: point + bias,
+                    origin: point + bias + offset,
                     u_axis: right * scale.recip(),
                     v_axis: up * -scale.recip(),
                     pan: [width * 0.5, height * 0.5],
@@ -106,12 +145,33 @@ impl Marks {
             if self.marks.len() >= 128 {
                 self.marks.pop_front();
             }
-            self.marks.push_back(Mark { expires, faces });
+            self.marks.push_back(Mark {
+                expires,
+                faces,
+                base,
+            });
         }
     }
 
     pub fn update(&mut self, time: f32) {
         self.marks.retain(|mark| mark.expires > time);
+    }
+
+    pub fn follow_movers(&mut self, movers: &[crate::mover::Mover]) {
+        for mark in &mut self.marks {
+            if let Some((index, previous)) = &mut mark.base
+                && let Some(mover) = movers.get(*index)
+            {
+                let delta = mover.offset - *previous;
+                for face in &mut mark.faces {
+                    face.origin = face.origin + delta;
+                    for vertex in &mut face.vertices {
+                        *vertex = *vertex + delta;
+                    }
+                }
+                *previous = mover.offset;
+            }
+        }
     }
 
     pub fn visible(&self) -> impl Iterator<Item = &[Face]> {
