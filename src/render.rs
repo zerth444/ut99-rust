@@ -159,7 +159,7 @@ impl Frame {
         time: f32,
         fov: f32,
         roll: f32,
-        flash: f32,
+        (flash, fog): (f32, Vec3),
     ) {
         // UE1 specifies the cinematic FOV across the viewport width.
         self.zoom = (self.width as f32 * 0.5 / focal_length(self.width, self.height))
@@ -169,23 +169,30 @@ impl Frame {
         self.roll = 0.0;
         self.zoom = 1.0;
         self.begin_ui(false);
-        if flash < 0.999 {
+        let gain = flash.clamp(0.0, 1.0);
+        if gain < 0.999 || fog.dot(fog) > 0.0 {
             if let Some(commands) = &mut self.commands {
-                let gain = flash.clamp(0.0, 1.0) * 0.5;
                 quad(
                     commands,
                     [self.width, self.height],
                     [0, 0, self.width as i32, self.height as i32],
                     [0.0, 0.0, 1.0, 1.0],
-                    [gain, gain, gain, 0.0],
+                    [fog.0, fog.1, fog.2, 1.0 - gain],
                     None,
-                    Mode::ModulatedScreen,
+                    Mode::Flash,
                     commands::WHITE,
                 );
             } else {
                 for pixel in &mut self.pixels {
                     let color = [16, 8, 0].map(|shift| ((*pixel >> shift) & 255) as f32);
-                    *pixel = pack(color, flash);
+                    *pixel = pack(
+                        [
+                            color[0] * gain + 255.0 * fog.0,
+                            color[1] * gain + 255.0 * fog.1,
+                            color[2] * gain + 255.0 * fog.2,
+                        ],
+                        1.0,
+                    );
                 }
             }
         }
@@ -367,8 +374,10 @@ impl Frame {
         self.draw(map, camera, time);
         self.layer(Layer::Effects);
         let view = View::camera(camera);
-        for mark in game.decals.visible() {
-            self.draw_faces_in_view(mark, &view, time, false, None, None);
+        if game.show_decals {
+            for mark in game.decals.visible() {
+                self.draw_faces_in_view(mark, &view, time, false, None, None);
+            }
         }
         if let Some(target) = &game.target {
             let motion = if target.health == 0 {
@@ -1261,11 +1270,16 @@ fn quad(
         return;
     }
     let z = depth.unwrap_or(0.25);
+    let bounds = if mode == Mode::Flash {
+        [0.0, 0.0, 0.0, -2.0]
+    } else {
+        [0.0, 0.0, 0.0, -1.0]
+    };
     let vertex = |x, y, u, v| GpuVertex {
         position: ndc(Vec3(x as f32, y as f32, z), dimensions),
         uv: [u * z, v * z],
         light_uv: [0.0; 2],
-        bounds: [0.0, 0.0, 0.0, -1.0],
+        bounds,
         color,
     };
     let a = vertex(x, y, u, v);

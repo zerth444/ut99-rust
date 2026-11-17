@@ -8,6 +8,7 @@ pub const RESOLUTIONS: [(u32, u32); 6] = [
     (1600, 900),
     (1920, 1080),
 ];
+pub const GUI_SKINS: [(&str, &str); 3] = [("Ice", "Blue"), ("Gold", "Gold"), ("Metal", "Metal")];
 
 pub const BINDINGS: [(&str, u16); 8] = [
     ("FORWARD", b'W' as u16),
@@ -27,6 +28,9 @@ pub struct Settings {
     pub vsync: bool,
     pub intro: bool,
     pub show_fps: bool,
+    pub show_decals: bool,
+    pub dodging: bool,
+    pub gui_skin: usize,
     pub field_of_view: u32,
     pub hud_scale: u32,
     pub music_volume: u32,
@@ -44,6 +48,9 @@ impl Default for Settings {
             vsync: true,
             intro: true,
             show_fps: false,
+            show_decals: true,
+            dodging: true,
+            gui_skin: 0,
             field_of_view: 90,
             hud_scale: 100,
             music_volume: 100,
@@ -77,6 +84,9 @@ impl Settings {
                 "vsync" => settings.vsync = value != 0,
                 "intro" => settings.intro = value != 0,
                 "show_fps" => settings.show_fps = value != 0,
+                "show_decals" => settings.show_decals = value != 0,
+                "dodging" => settings.dodging = value != 0,
+                "gui_skin" => settings.gui_skin = (value as usize).min(GUI_SKINS.len() - 1),
                 "fov" => settings.field_of_view = value.clamp(75, 120),
                 "hud_scale" => settings.hud_scale = value.clamp(50, 150),
                 "music" => settings.music_volume = value.min(100),
@@ -117,12 +127,15 @@ impl Settings {
 
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let mut text = format!(
-            "fullscreen={}\nresolution={}\nvsync={}\nintro={}\nshow_fps={}\nfov={}\nhud_scale={}\nmusic={}\neffects={}\nsensitivity={}\ninvert_mouse={}\n",
+            "fullscreen={}\nresolution={}\nvsync={}\nintro={}\nshow_fps={}\nshow_decals={}\ndodging={}\ngui_skin={}\nfov={}\nhud_scale={}\nmusic={}\neffects={}\nsensitivity={}\ninvert_mouse={}\n",
             u8::from(self.fullscreen),
             self.resolution,
             u8::from(self.vsync),
             u8::from(self.intro),
             u8::from(self.show_fps),
+            u8::from(self.show_decals),
+            u8::from(self.dodging),
+            self.gui_skin,
             self.field_of_view,
             self.hud_scale,
             self.music_volume,
@@ -171,6 +184,9 @@ mod tests {
         settings.music_volume = 20;
         settings.fullscreen = true;
         settings.intro = false;
+        settings.gui_skin = 2;
+        settings.show_decals = false;
+        settings.dodging = false;
         settings.bind(0, b'I' as u16);
         settings.bind(6, 2);
         settings.save(&path).unwrap();

@@ -104,8 +104,12 @@ impl Map {
             .ok_or_else(|| invalid("Package has no Level export"))?;
         let (model, actors) =
             level_data(package, level).map_err(|error| invalid(format!("Level: {error}")))?;
+        let city_intro = path.filter(|path| {
+            path.file_stem()
+                .is_some_and(|stem| stem.eq_ignore_ascii_case("CityIntro"))
+        });
         let (mut faces, mut collision, sky_origin, zone_actors) =
-            read_bsp(package, model, &actors, path)
+            read_bsp(package, model, &actors, path, city_intro.is_some())
                 .map_err(|error| invalid(format!("Model: {error}")))?;
         if faces.is_empty() {
             return Err(invalid("Level has no visible BSP faces"));
@@ -181,10 +185,6 @@ impl Map {
         if starts.is_empty() {
             return Err(invalid("Level has no PlayerStart for the preview camera"));
         }
-        let city_intro = path.filter(|path| {
-            path.file_stem()
-                .is_some_and(|stem| stem.eq_ignore_ascii_case("CityIntro"))
-        });
         Ok(Self {
             #[cfg(windows)]
             smoke: city_intro
@@ -420,6 +420,7 @@ fn read_bsp(
     export: &Export,
     actors: &[&Export],
     path: Option<&Path>,
+    use_zone_ambient: bool,
 ) -> io::Result<(Vec<Face>, Collision, Option<Vec3>, Vec<i32>)> {
     let Model {
         vectors,
@@ -432,6 +433,11 @@ fn read_bsp(
         ..
     } = read_model(package, export)?;
     let mut sky_zones = [false; 64];
+    let mut ambient = [if use_zone_ambient {
+        [0.0; 3]
+    } else {
+        [0.30; 3]
+    }; 64];
     let mut sky_origin = None;
     for (sky, actor) in sky_zones.iter_mut().zip(zones.iter().copied()) {
         if let Some(export) = usize::try_from(actor)
@@ -447,6 +453,11 @@ fn read_bsp(
                     *sky = true;
                 }
             }
+        }
+    }
+    if use_zone_ambient {
+        for (color, &actor) in ambient.iter_mut().zip(&zones) {
+            *color = crate::light::zone_ambient(package, actor)?;
         }
     }
     let light_indices = (0..reader.count(30)?)
@@ -574,10 +585,17 @@ fn read_bsp(
                 .ok()
                 .and_then(|index| light_indices.get(index))
         {
+            let zone = if use_zone_ambient {
+                node.zones[usize::from(node.plane.normal.dot(normal) >= 0.0)]
+            } else {
+                0
+            };
+            let ambient = ambient.get(zone as usize).copied().unwrap_or_default();
             face.lightmap = lightmaps
-                .entry(node.surface)
+                .entry((node.surface, zone))
                 .or_insert_with(|| {
-                    Lightmap::bake(&face, index, light_masks, &light_refs, &lights).map(Arc::new)
+                    Lightmap::bake(&face, index, light_masks, &light_refs, &lights, ambient)
+                        .map(Arc::new)
                 })
                 .clone();
         }

@@ -32,6 +32,9 @@ Fragment vertex_main(Input input) {
 }
 
 float4 pixel_main(Fragment input) : SV_Target {
+    if (input.bounds.w == -2.0) {
+        return saturate(input.color);
+    }
     float depth = rcp(max(input.inverseDepth, 0.000001));
     float4 texel = Surface.Sample(SurfaceSampler, input.uv * depth);
     clip(texel.a - input.color.a);

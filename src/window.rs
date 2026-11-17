@@ -7,7 +7,7 @@ use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::Input::{
@@ -286,7 +286,7 @@ unsafe fn message_loop(
                             walker = Walker::spawn(&map.collision, map.starts[start].position);
                         }
                         key if key == settings.bindings[4] => jump = true,
-                        key if settings.bindings[..4].contains(&key) => {
+                        key if settings.dodging && settings.bindings[..4].contains(&key) => {
                             let pressed = Instant::now();
                             if last_direction.is_some_and(|(previous, time)| {
                                 key == previous
@@ -346,6 +346,7 @@ unsafe fn message_loop(
             tick = now;
             game.base_fov = settings.field_of_view as f32;
             game.hud_scale = settings.hud_scale as f32 / 100.0;
+            game.show_decals = settings.show_decals;
             let [forward, back, left, right, jump_key, walk, fire, alt_fire] = settings.bindings;
             let mut movement_audio = MotionEvents::default();
             let focused = GetForegroundWindow() == window;
@@ -650,6 +651,7 @@ fn run_frontend(
             let mut client = RECT::default();
             GetClientRect(window, &mut client);
             let size = [client.right, client.bottom];
+            menu.dpi = GetDpiForWindow(window);
             let mut message = MSG::default();
             let mut skip = false;
             while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
@@ -657,6 +659,28 @@ fn run_frontend(
                     return Ok(false);
                 }
                 if message.hwnd == window {
+                    if intro.is_none() {
+                        match message.message {
+                            WM_LBUTTONDOWN => {
+                                let x = message.lParam as i16 as i32;
+                                let y = (message.lParam >> 16) as i16 as i32;
+                                if menu.start_drag(size, x, y) {
+                                    SetCapture(window);
+                                }
+                            }
+                            WM_LBUTTONUP if menu.end_drag() => {
+                                ReleaseCapture();
+                                continue;
+                            }
+                            WM_MOUSEMOVE if GetCapture() != window => {
+                                menu.end_drag();
+                            }
+                            WM_KEYDOWN if message.wParam as u16 == VK_ESCAPE && menu.end_drag() => {
+                                ReleaseCapture();
+                            }
+                            _ => {}
+                        }
+                    }
                     if message.message == WM_MOUSEMOVE && intro.is_none() {
                         menu.pointer(
                             size,
@@ -760,13 +784,13 @@ fn run_frontend(
                     intro.time,
                     shot.fov,
                     shot.roll,
-                    shot.flash,
+                    (shot.flash, shot.fog),
                 );
             } else {
                 if !frontend.has_desktop()
                     && let Some((logo, camera)) = &frontend.logo
                 {
-                    frame.draw_cinematic(logo, camera, time, 90.0, 0.0, 1.0);
+                    frame.draw_cinematic(logo, camera, time, 90.0, 0.0, (1.0, Vec3::default()));
                 } else {
                     frame.begin_ui(true);
                 }

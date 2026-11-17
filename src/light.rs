@@ -180,6 +180,26 @@ fn hue_color(hue: u8, saturation: u8, brightness: u8) -> [f32; 3] {
     color.map(|channel| channel * value)
 }
 
+pub(crate) fn zone_ambient(package: &Package<'_>, actor: i32) -> io::Result<[f32; 3]> {
+    let (mut hue, mut saturation, mut brightness) = (0, 255, 0);
+    if let Some(export) = usize::try_from(actor)
+        .ok()
+        .and_then(|index| index.checked_sub(1))
+        .and_then(|index| package.exports.get(index))
+    {
+        let mut props = package.properties(export)?;
+        while let Some((name, mut value)) = props.next()? {
+            match name {
+                "AmbientHue" => hue = value.byte()?,
+                "AmbientSaturation" => saturation = value.byte()?,
+                "AmbientBrightness" => brightness = value.byte()?,
+                _ => {}
+            }
+        }
+    }
+    Ok(hue_color(hue, saturation, brightness))
+}
+
 pub struct Lightmap {
     width: usize,
     height: usize,
@@ -198,6 +218,7 @@ impl Lightmap {
         masks: &[u8],
         refs: &[i32],
         lights: &HashMap<i32, Light>,
+        ambient: [f32; 3],
     ) -> Option<Self> {
         let width = index.width;
         let height = index.height;
@@ -224,7 +245,7 @@ impl Lightmap {
         let origin = face.origin
             + u_cross * (index.pan[0] / determinant)
             + face.normal.cross(face.u_axis) * (index.pan[1] / determinant);
-        let mut colors = vec![[0.30; 3]; width.checked_mul(height)?];
+        let mut colors = vec![ambient; width.checked_mul(height)?];
         for (slot, id) in actors[..end].iter().enumerate() {
             let Some(light) = lights.get(id).filter(|light| light.radius > 0.0) else {
                 continue;

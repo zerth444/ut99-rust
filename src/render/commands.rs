@@ -10,8 +10,7 @@ pub enum Mode {
     World,
     SkyMask,
     Modulated,
-    #[cfg(windows)]
-    ModulatedScreen,
+    Flash,
     ScreenDepth,
     Screen,
     Ui,

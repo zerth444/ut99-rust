@@ -11,11 +11,11 @@ use crate::{
     map::Map,
     package::Package,
     render::{Camera, Frame},
-    settings::{BINDINGS, RESOLUTIONS, Settings},
+    settings::{BINDINGS, GUI_SKINS, RESOLUTIONS, Settings},
     sound::Wave,
     texture::Texture,
 };
-use font::MenuFont;
+use font::{FONT_SIZES, MenuFont};
 pub use intro::Intro;
 
 pub struct Frontend {
@@ -27,17 +27,22 @@ pub struct Frontend {
 #[derive(Default)]
 struct MenuArt {
     desktop: Option<[Texture; 12]>,
+    skins: [SkinArt; GUI_SKINS.len()],
+    checkbox: [Option<Texture>; 2],
+    click: Option<Arc<Wave>>,
+    fonts: [Option<MenuFont>; FONT_SIZES.len()],
+}
+
+#[derive(Default)]
+struct SkinArt {
     bar: Option<Texture>,
     bar_ends: [Option<Texture>; 2],
     bar_item: [[Option<Texture>; 3]; 2],
     window: Option<Texture>,
     button: Option<Texture>,
-    checkbox: [Option<Texture>; 2],
     panel: Option<Texture>,
     pulldown: [Option<Texture>; 9],
     highlight: Option<Texture>,
-    click: Option<Arc<Wave>>,
-    font: Option<MenuFont>,
 }
 
 impl Frontend {
@@ -106,25 +111,35 @@ impl MenuArt {
             .map(|index| texture(&format!("Bg{}{}", index % 4 + 1, index / 4 + 1)))
             .collect::<Option<Vec<_>>>()
             .and_then(|tiles| tiles.try_into().ok());
+        let skins = GUI_SKINS.map(|(_, prefix)| {
+            let themed = |name: &str| texture(&format!("{prefix}{name}"));
+            let gold = prefix == "Gold";
+            let bar = |name: &str| if gold { texture(name) } else { themed(name) };
+            let menu = |part: &str| {
+                let prefix = if gold { "B" } else { prefix };
+                texture(&format!("{prefix}Menu{part}"))
+            };
+            SkinArt {
+                bar: bar("BarTile"),
+                bar_ends: [bar("BarL"), bar("BarWin")],
+                bar_item: ["In", "Out"]
+                    .map(|state| ["L", "M", "R"].map(|part| bar(&format!("Bar{state}{part}")))),
+                window: themed("ActiveFrame"),
+                button: themed("Button"),
+                panel: if gold {
+                    menu("Area")
+                } else {
+                    themed("ClientArea")
+                },
+                pulldown: ["TL", "T", "TR", "L", "Area", "R", "BL", "B", "BR"].map(menu),
+                highlight: menu("HM"),
+            }
+        });
         Self {
             desktop,
-            bar: texture("BlueBarTile"),
-            bar_ends: [texture("BlueBarL"), texture("BlueBarWin")],
-            bar_item: ["In", "Out"]
-                .map(|state| ["L", "M", "R"].map(|part| texture(&format!("BlueBar{state}{part}")))),
-            window: texture("BlueActiveFrame"),
-            button: texture("BlueButton"),
+            skins,
             checkbox: [texture("ChkUnchecked"), texture("ChkChecked")],
-            panel: texture("BlueClientArea"),
-            pulldown: ["TL", "T", "TR", "L", "Area", "R", "BL", "B", "BR"].map(|part| {
-                if part == "Area" {
-                    texture("BlueMenuArea")
-                } else {
-                    texture(&format!("BlueMenu{part}"))
-                }
-            }),
-            highlight: texture("BlueMenuHM"),
-            font: MenuFont::load(font_path).ok(),
+            fonts: MenuFont::load_sizes(font_path),
             click: export("LittleSelect", "Sound")
                 .and_then(|item| Wave::from_export(&package, item).ok())
                 .map(Arc::new),
@@ -149,17 +164,81 @@ pub struct Menu {
     hover: Option<usize>,
     waiting: Option<usize>,
     options_open: bool,
+    choice: Option<(Choice, usize)>,
+    panel_offset: [i32; 2],
+    drag_offset: Option<[i32; 2]>,
+    pub dpi: u32,
     pub status: String,
 }
 
-const TABS: [&str; 5] = ["Video", "Audio", "Controls", "Input", "HUD"];
-const VIDEO: [&str; 6] = [
+#[derive(Clone, Copy)]
+enum Choice {
+    Resolution,
+    Skin,
+}
+
+impl Choice {
+    fn for_row(tab: usize, row: usize) -> Option<Self> {
+        match (tab, row) {
+            (0, 1) => Some(Self::Resolution),
+            (0, 7) => Some(Self::Skin),
+            _ => None,
+        }
+    }
+
+    fn slot(self, settings: &mut Settings) -> &mut usize {
+        match self {
+            Self::Resolution => &mut settings.resolution,
+            Self::Skin => &mut settings.gui_skin,
+        }
+    }
+
+    fn len(self) -> usize {
+        match self {
+            Self::Resolution => RESOLUTIONS.len(),
+            Self::Skin => GUI_SKINS.len(),
+        }
+    }
+
+    fn label(self, index: usize) -> String {
+        match self {
+            Self::Resolution => {
+                let (w, h) = RESOLUTIONS[index];
+                format!("{w}x{h}")
+            }
+            Self::Skin => GUI_SKINS[index].0.into(),
+        }
+    }
+
+    fn at(self, x: i32, y: i32, row: usize) -> Option<usize> {
+        let y = y - 16 - row_y(row) - 22;
+        ((CHOICE_LEFT..CHOICE_LEFT + CHOICE_WIDTH).contains(&x)
+            && (0..self.len() as i32 * CHOICE_HEIGHT).contains(&y))
+        .then(|| (y / CHOICE_HEIGHT) as usize)
+    }
+}
+
+const ROW_START: i32 = 42;
+const ROW_HEIGHT: i32 = 26;
+const CHOICE_LEFT: i32 = 279;
+const CHOICE_WIDTH: i32 = 130;
+const CHOICE_HEIGHT: i32 = 16;
+
+fn row_y(index: usize) -> i32 {
+    ROW_START + index as i32 * ROW_HEIGHT
+}
+
+const TAB_WIDTH: i32 = 68;
+const TABS: [&str; 6] = ["Video", "Audio", "Controls", "Input", "HUD", "Game"];
+const VIDEO: [&str; 8] = [
     "Display Mode",
     "Resolution",
     "Vertical Sync",
     "Field of View",
     "Show FPS",
     "Play Intro",
+    "Show Decals",
+    "GUI Skin",
 ];
 const AUDIO: [&str; 2] = ["Music Volume", "Sound Volume"];
 const CONTROLS: [&str; 8] = [
@@ -174,12 +253,44 @@ const CONTROLS: [&str; 8] = [
 ];
 const INPUT: [&str; 2] = ["Mouse Sensitivity", "Invert Mouse"];
 const HUD: [&str; 1] = ["HUD Scale"];
+const GAME: [&str; 1] = ["Dodging"];
 const TOP_ITEMS: [i32; 4] = [0, 56, 112, 148];
 const OPTIONS_RECT: [i32; 4] = [56, 16, 120, 24];
 
 impl Menu {
     pub fn pointer(&mut self, size: [i32; 2], x: i32, y: i32) {
-        self.hover = Self::top_item(Layout::new(size).local(x, y));
+        let layout = Layout::new(size, self.dpi);
+        let [x, y] = layout.local(x, y);
+        if let Some([left, top]) = self.drag_offset {
+            let [center_x, center_y] = layout.panel;
+            self.panel_offset = [x - left - center_x, y - top - center_y];
+        }
+        let [left, top] = layout.panel_position(size, self.panel_offset);
+        if let Some((choice, highlight)) = &mut self.choice
+            && let Some(index) = choice.at(x - left, y - top, self.selected)
+        {
+            *highlight = index;
+        }
+        self.hover = Self::top_item([x, y]);
+    }
+
+    pub fn start_drag(&mut self, size: [i32; 2], x: i32, y: i32) -> bool {
+        if !self.preferences || self.choice.is_some() || self.waiting.is_some() {
+            return false;
+        }
+        let layout = Layout::new(size, self.dpi);
+        let [x, y] = layout.local(x, y);
+        let [left, top] = layout.panel_position(size, self.panel_offset);
+        let offset = [x - left, y - top];
+        if (0..400).contains(&offset[0]) && (0..16).contains(&offset[1]) {
+            self.drag_offset = Some(offset);
+            return true;
+        }
+        false
+    }
+
+    pub fn end_drag(&mut self) -> bool {
+        self.drag_offset.take().is_some()
     }
 
     fn top_item([x, y]: [i32; 2]) -> Option<usize> {
@@ -198,7 +309,8 @@ impl Menu {
             1 => &AUDIO,
             2 => &CONTROLS,
             3 => &INPUT,
-            _ => &HUD,
+            4 => &HUD,
+            _ => &GAME,
         }
     }
 
@@ -216,6 +328,20 @@ impl Menu {
     }
 
     pub fn key(&mut self, key: u16, settings: &mut Settings) -> Action {
+        if let Some((choice, selected)) = &mut self.choice {
+            match key {
+                VK_UP => *selected = (*selected + choice.len() - 1) % choice.len(),
+                VK_DOWN => *selected = (*selected + 1) % choice.len(),
+                VK_ESCAPE => self.choice = None,
+                VK_RETURN | VK_SPACE => {
+                    *choice.slot(settings) = *selected;
+                    self.choice = None;
+                    return Action::Changed;
+                }
+                _ => {}
+            }
+            return Action::None;
+        }
         if let Some(index) = self.waiting.take() {
             self.status.clear();
             if key == VK_ESCAPE {
@@ -242,6 +368,11 @@ impl Menu {
                 }
                 VK_DOWN => self.selected = (self.selected + 1) % self.rows().len(),
                 VK_LEFT => return self.adjust(-1, settings),
+                VK_RETURN | VK_SPACE
+                    if let Some(choice) = Choice::for_row(self.tab, self.selected) =>
+                {
+                    self.choice = Some((choice, *choice.slot(settings)));
+                }
                 VK_RIGHT | VK_RETURN | VK_SPACE => return self.adjust(1, settings),
                 _ => {}
             }
@@ -275,7 +406,7 @@ impl Menu {
         if button != VK_LBUTTON {
             return Action::None;
         }
-        let ui = Layout::new(size);
+        let ui = Layout::new(size, self.dpi);
         let [x, y] = ui.local(x, y);
         if !self.preferences {
             let was_open = std::mem::take(&mut self.options_open);
@@ -292,7 +423,15 @@ impl Menu {
                 return self.main(self.selected);
             }
         } else {
-            let [x, y] = [x - ui.panel[0], y - ui.panel[1]];
+            let [left, top] = ui.panel_position(size, self.panel_offset);
+            let [x, y] = [x - left, y - top];
+            if let Some((choice, _)) = self.choice.take() {
+                if let Some(index) = choice.at(x, y, self.selected) {
+                    *choice.slot(settings) = index;
+                    return Action::Changed;
+                }
+                return Action::None;
+            }
             if ((0..16).contains(&y) && (400..420).contains(&x))
                 || ((316..332).contains(&y) && (368..416).contains(&x))
             {
@@ -301,13 +440,19 @@ impl Menu {
                 return Action::None;
             }
             let y = y - 16;
-            if (2..19).contains(&y) && (3..3 + 70 * TABS.len() as i32).contains(&x) {
-                self.tab = ((x - 3) / 70) as usize;
+            if (2..19).contains(&y) && (3..3 + TAB_WIDTH * TABS.len() as i32).contains(&x) {
+                self.tab = ((x - 3) / TAB_WIDTH) as usize;
                 self.selected = 0;
-            } else if (0..420).contains(&x) && y >= 42 {
-                let row = ((y - 42) / 26) as usize;
+            } else if (0..420).contains(&x) && y >= ROW_START {
+                let row = ((y - ROW_START) / ROW_HEIGHT) as usize;
                 if row < self.rows().len() {
                     self.selected = row;
+                    if let Some(choice) = Choice::for_row(self.tab, row) {
+                        if (CHOICE_LEFT..CHOICE_LEFT + CHOICE_WIDTH).contains(&x) {
+                            self.choice = Some((choice, *choice.slot(settings)));
+                        }
+                        return Action::None;
+                    }
                     if (279..409).contains(&x) {
                         let amount = ((x - 279) as u32 * 100 / 129).min(100);
                         let slider = match (self.tab, row) {
@@ -344,6 +489,11 @@ impl Menu {
             (0, 3) => adjust(&mut settings.field_of_view, 5, 75, 120),
             (0, 4) => settings.show_fps = !settings.show_fps,
             (0, 5) => settings.intro = !settings.intro,
+            (0, 6) => settings.show_decals = !settings.show_decals,
+            (0, 7) => {
+                settings.gui_skin =
+                    (settings.gui_skin as i32 + step).rem_euclid(GUI_SKINS.len() as i32) as usize;
+            }
             (1, 0) => adjust(&mut settings.music_volume, 10, 0, 100),
             (1, 1) => adjust(&mut settings.effects_volume, 10, 0, 100),
             (2, row) => {
@@ -354,15 +504,30 @@ impl Menu {
             (3, 0) => adjust(&mut settings.sensitivity, 10, 10, 250),
             (3, 1) => settings.invert_mouse = !settings.invert_mouse,
             (4, 0) => adjust(&mut settings.hud_scale, 10, 50, 150),
+            (5, 0) => settings.dodging = !settings.dodging,
             _ => return Action::None,
         }
         Action::Changed
     }
 
     pub fn draw(&self, frontend: &Frontend, frame: &mut Frame, font: &Hud, settings: &Settings) {
-        let ui = Layout::new([frame.width as i32, frame.height as i32]);
-        let art = &frontend.art;
-        if let Some(tiles) = &art.desktop {
+        let size = [frame.width as i32, frame.height as i32];
+        let ui = Layout::new(size, self.dpi);
+        let resources = &frontend.art;
+        let font_index = ((ui.scale * 4.0).round() as usize)
+            .saturating_sub(4)
+            .min(FONT_SIZES.len() - 1);
+        let menu_font = resources.fonts[font_index]
+            .as_ref()
+            .map(|font| (font, 1.0 + font_index as f32 * 0.25))
+            .or_else(|| resources.fonts[1].as_ref().map(|font| (font, 1.25)));
+        let art = &resources.skins[settings.gui_skin];
+        let art = if art.bar.is_some() {
+            art
+        } else {
+            &resources.skins[0]
+        };
+        if let Some(tiles) = &resources.desktop {
             let size = (frame.width as f32 / 4.0).min(frame.height as f32 / 3.0);
             let left = (frame.width as f32 - 4.0 * size) * 0.5;
             let top = (frame.height as f32 - 3.0 * size) * 0.5;
@@ -383,9 +548,8 @@ impl Menu {
                 );
             }
         }
-        let label = |frame: &mut Frame, x, y, text: &str| {
-            ui.label(frame, font, art.font.as_ref(), x, y, text)
-        };
+        let label =
+            |frame: &mut Frame, x, y, text: &str| ui.label(frame, font, menu_font, x, y, text);
         let width = (frame.width as f32 / ui.scale).ceil() as i32;
         ui.tile(
             frame,
@@ -429,7 +593,7 @@ impl Menu {
                     );
                 }
             }
-            ui.label(frame, font, art.font.as_ref(), x + 6, 1, label);
+            ui.label(frame, font, menu_font, x + 6, 1, label);
         }
         if frontend.logo.is_none() && !frontend.has_desktop() {
             label(frame, (width - 160) / 2, 65, "UNREAL TOURNAMENT");
@@ -476,7 +640,7 @@ impl Menu {
             }
             return;
         }
-        let [x, y] = ui.panel;
+        let [x, y] = ui.panel_position(size, self.panel_offset);
         ui.tile(frame, None, [x, y, 420, 338], [0.62, 0.64, 0.75]);
         ui.tile(
             frame,
@@ -505,7 +669,7 @@ impl Menu {
         label(frame, x + 5, y + 1, "Preferences");
         let y = y + 16;
         for (index, label) in TABS.into_iter().enumerate() {
-            let tx = x + 3 + index as i32 * 70;
+            let tx = x + 3 + index as i32 * TAB_WIDTH;
             let selected = index == self.tab;
             let (left, right, height) = if selected {
                 (4.0, 55.0, 17)
@@ -516,11 +680,11 @@ impl Menu {
                 for (rect, source) in [
                     ([tx, y + 2, 3, height], [left, 80.0, 3.0, height as f32]),
                     (
-                        [tx + 3, y + 2, 65, height],
+                        [tx + 3, y + 2, TAB_WIDTH - 5, height],
                         [left + 3.0, 80.0, 1.0, height as f32],
                     ),
                     (
-                        [tx + 68, y + 2, 2, height],
+                        [tx + TAB_WIDTH - 2, y + 2, 2, height],
                         [right, 80.0, 2.0, height as f32],
                     ),
                 ] {
@@ -530,11 +694,11 @@ impl Menu {
                 ui.tile(
                     frame,
                     art.bar.as_ref(),
-                    [tx, y + 2, 70, height],
+                    [tx, y + 2, TAB_WIDTH, height],
                     [0.25, 0.33, 0.42],
                 );
             }
-            ui.label(frame, font, art.font.as_ref(), tx + 12, y + 4, label);
+            ui.label(frame, font, menu_font, tx + 12, y + 4, label);
         }
         let enabled = |enabled| {
             if enabled {
@@ -558,6 +722,8 @@ impl Menu {
                     settings.field_of_view.to_string(),
                     enabled(settings.show_fps),
                     enabled(settings.intro),
+                    enabled(settings.show_decals),
+                    GUI_SKINS[settings.gui_skin].0.into(),
                 ]
             }
             1 => vec![
@@ -569,10 +735,11 @@ impl Menu {
                 format!("{}%", settings.sensitivity),
                 enabled(settings.invert_mouse),
             ],
-            _ => vec![format!("{}%", settings.hud_scale)],
+            4 => vec![format!("{}%", settings.hud_scale)],
+            _ => vec![enabled(settings.dodging)],
         };
-        for (index, (label, value)) in self.rows().iter().zip(values).enumerate() {
-            let row_y = y + 42 + index as i32 * 26;
+        for (index, (caption, value)) in self.rows().iter().zip(values).enumerate() {
+            let row_y = y + row_y(index);
             if self.selected == index {
                 ui.tile(
                     frame,
@@ -581,18 +748,20 @@ impl Menu {
                     [0.21, 0.33, 0.50],
                 );
             }
-            ui.label(frame, font, art.font.as_ref(), x + 15, row_y + 4, label);
+            label(frame, x + 15, row_y + 4, caption);
             let checkbox = match (self.tab, index) {
                 (0, 2) => Some(settings.vsync),
                 (0, 4) => Some(settings.show_fps),
                 (0, 5) => Some(settings.intro),
+                (0, 6) => Some(settings.show_decals),
                 (3, 1) => Some(settings.invert_mouse),
+                (5, 0) => Some(settings.dodging),
                 _ => None,
             };
             if let Some(checked) = checkbox {
                 ui.tile(
                     frame,
-                    art.checkbox[usize::from(checked)].as_ref(),
+                    resources.checkbox[usize::from(checked)].as_ref(),
                     [x + 395, row_y + 4, 12, 12],
                     if checked {
                         [0.12, 0.25, 0.5]
@@ -623,6 +792,27 @@ impl Menu {
                 );
                 continue;
             }
+            if Choice::for_row(self.tab, index).is_some() {
+                let left = x + CHOICE_LEFT;
+                ui.tile(
+                    frame,
+                    None,
+                    [left, row_y + 2, CHOICE_WIDTH, 18],
+                    [0.76, 0.79, 0.89],
+                );
+                if let Some(atlas) = &art.window {
+                    ui.segment(
+                        frame,
+                        atlas,
+                        [left + CHOICE_WIDTH - 16, row_y + 5, 12, 12],
+                        [20.0, 60.0, 12.0, 12.0],
+                    );
+                } else {
+                    label(frame, left + CHOICE_WIDTH - 14, row_y + 4, "v");
+                }
+                label(frame, left + 5, row_y + 4, &value);
+                continue;
+            }
             ui.tile(
                 frame,
                 None,
@@ -630,10 +820,10 @@ impl Menu {
                 [0.76, 0.79, 0.89],
             );
             if self.tab == 0 || self.tab == 4 {
-                ui.label(frame, font, art.font.as_ref(), x + 291, row_y + 4, "<");
-                ui.label(frame, font, art.font.as_ref(), x + 401, row_y + 4, ">");
+                ui.label(frame, font, menu_font, x + 291, row_y + 4, "<");
+                ui.label(frame, font, menu_font, x + 401, row_y + 4, ">");
             }
-            ui.label(frame, font, art.font.as_ref(), x + 314, row_y + 4, &value);
+            ui.label(frame, font, menu_font, x + 314, row_y + 4, &value);
         }
         if let Some(button) = &art.button {
             ui.segment(
@@ -649,6 +839,28 @@ impl Menu {
         if !self.status.is_empty() {
             label(frame, x + 12, y + 301, &self.status);
         }
+        if let Some((choice, selected)) = self.choice {
+            let left = x + CHOICE_LEFT;
+            let top = y + row_y(self.selected) + 22;
+            ui.tile(
+                frame,
+                art.pulldown[4].as_ref(),
+                [left, top, CHOICE_WIDTH, choice.len() as i32 * CHOICE_HEIGHT],
+                [0.65, 0.68, 0.79],
+            );
+            for index in 0..choice.len() {
+                let top = top + index as i32 * CHOICE_HEIGHT;
+                if index == selected {
+                    ui.tile(
+                        frame,
+                        art.highlight.as_ref(),
+                        [left, top, CHOICE_WIDTH, CHOICE_HEIGHT],
+                        [0.25, 0.38, 0.55],
+                    );
+                }
+                label(frame, left + 5, top + 1, &choice.label(index));
+            }
+        }
     }
 }
 
@@ -658,10 +870,10 @@ struct Layout {
 }
 
 impl Layout {
-    fn new([width, height]: [i32; 2]) -> Self {
-        let scale = (width as f32 / 900.0)
-            .min(height as f32 / 460.0)
-            .clamp(0.4, 2.5);
+    fn new([width, height]: [i32; 2], dpi: u32) -> Self {
+        let desktop_scale = (dpi / 24).clamp(4, 12) as f32 * 0.25;
+        let fit = (width as f32 / 440.0).min(height as f32 / 370.0);
+        let scale = desktop_scale.min(fit).max(0.4);
         Self {
             scale,
             panel: [
@@ -675,6 +887,14 @@ impl Layout {
         [
             (x as f32 / self.scale) as i32,
             (y as f32 / self.scale) as i32,
+        ]
+    }
+
+    fn panel_position(&self, [width, height]: [i32; 2], [x, y]: [i32; 2]) -> [i32; 2] {
+        let [width, height] = self.local(width, height);
+        [
+            (self.panel[0] + x).clamp(0, (width - 420).max(0)),
+            (self.panel[1] + y).clamp(16, (height - 338).max(16)),
         ]
     }
 
@@ -701,17 +921,17 @@ impl Layout {
         &self,
         frame: &mut Frame,
         font: &Hud,
-        menu_font: Option<&MenuFont>,
+        menu_font: Option<(&MenuFont, f32)>,
         x: i32,
         y: i32,
         label: &str,
     ) {
-        if let Some(font) = menu_font {
+        if let Some((font, native_scale)) = menu_font {
             font.draw(
                 frame,
                 x as f32 * self.scale,
                 y as f32 * self.scale,
-                self.scale,
+                self.scale / native_scale,
                 label,
             );
             return;
@@ -768,12 +988,39 @@ mod tests {
         assert!(menu.options_open);
         menu.click(size, 104, 25, VK_LBUTTON, &mut settings);
         assert!(menu.preferences);
-        let [x, y] = Layout::new(size).panel;
+        let [x, y] = Layout::new(size, menu.dpi).panel;
         menu.click(size, x + 90, y + 22, VK_LBUTTON, &mut settings);
         assert!(menu.click(size, x + 408, y + 60, VK_LBUTTON, &mut settings) == Action::Changed);
         assert_eq!(settings.music_volume, 100);
         menu.click(size, x + 380, y + 321, VK_LBUTTON, &mut settings);
         assert!(!menu.preferences);
+        menu.tab = 0;
+        menu.click(size, 104, 8, VK_LBUTTON, &mut settings);
+        menu.click(size, 104, 25, VK_LBUTTON, &mut settings);
+        let combo_x = x + CHOICE_LEFT + 10;
+        let resolution_y = y + 16 + row_y(1);
+        let settings_before = settings.resolution;
+        menu.click(size, combo_x, resolution_y + 8, VK_LBUTTON, &mut settings);
+        menu.key(VK_DOWN, &mut settings);
+        menu.key(VK_ESCAPE, &mut settings);
+        assert_eq!(settings.resolution, settings_before);
+        menu.click(size, combo_x, resolution_y + 8, VK_LBUTTON, &mut settings);
+        assert!(
+            menu.click(
+                size,
+                combo_x,
+                resolution_y + 22 + 5 * CHOICE_HEIGHT,
+                VK_LBUTTON,
+                &mut settings
+            ) == Action::Changed
+        );
+        assert_eq!(settings.resolution, 5);
+        let skin_y = y + 16 + row_y(7);
+        menu.click(size, combo_x, skin_y + 8, VK_LBUTTON, &mut settings);
+        menu.key(VK_DOWN, &mut settings);
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::Changed);
+        assert_eq!(settings.gui_skin, 1);
+        menu.key(VK_ESCAPE, &mut settings);
         assert!(menu.click([900, 600], 40, 13, VK_LBUTTON, &mut settings) == Action::Play);
     }
 
@@ -809,8 +1056,14 @@ mod tests {
                 "{class}"
             );
         }
-        assert!(front.art.bar.is_some() && front.art.panel.is_some());
-        assert!(front.has_desktop() && front.art.font.is_some());
+        assert!(
+            front
+                .art
+                .skins
+                .iter()
+                .all(|skin| skin.bar.is_some() && skin.panel.is_some())
+        );
+        assert!(front.has_desktop() && front.art.fonts[0].is_some());
         assert!(front.art.click.is_some());
         let mut heard = 0;
         let mut moved = false;
@@ -853,7 +1106,14 @@ mod tests {
                 .is_some_and(|clip| clip.started.is_some())
         }));
         let mut frame = Frame::new();
-        frame.draw_cinematic(logo, camera, 1.0, 90.0, 0.0, 1.0);
+        frame.draw_cinematic(
+            logo,
+            camera,
+            1.0,
+            90.0,
+            0.0,
+            (1.0, crate::map::Vec3::default()),
+        );
         assert!(
             frame
                 .pixels

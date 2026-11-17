@@ -10,24 +10,33 @@ pub struct MenuFont {
     pages: Vec<Page>,
 }
 
+pub const FONT_SIZES: [u32; 9] = [10, 12, 15, 17, 20, 22, 25, 27, 30];
+
 struct Page {
     texture: Texture,
     glyphs: Vec<[u32; 4]>,
 }
 
 impl MenuFont {
-    pub fn load(path: &Path) -> io::Result<Self> {
-        let bytes = fs::read(path)?;
-        let package = Package::read(&bytes)?;
+    pub fn load_sizes(path: &Path) -> [Option<Self>; FONT_SIZES.len()] {
+        let Ok(bytes) = fs::read(path) else {
+            return Default::default();
+        };
+        let Ok(package) = Package::read(&bytes) else {
+            return Default::default();
+        };
+        FONT_SIZES.map(|size| Self::load(&package, &format!("Tahoma{size}")).ok())
+    }
+
+    fn load(package: &Package<'_>, name: &str) -> io::Result<Self> {
         let font = package
             .exports
             .iter()
             .find(|font| {
-                package.names[font.name] == "Tahoma12"
-                    && package.object_name(font.class) == Some("Font")
+                package.names[font.name] == name && package.object_name(font.class) == Some("Font")
             })
-            .ok_or_else(|| invalid("Tahoma12 font is missing"))?;
-        let mut data = crate::map::native_data(&package, font)?;
+            .ok_or_else(|| invalid("Tahoma font is missing"))?;
+        let mut data = crate::map::native_data(package, font)?;
         let mut pages = Vec::new();
         for _ in 0..data.count(2)? {
             let texture = data
@@ -35,7 +44,7 @@ impl MenuFont {
                 .checked_sub(1)
                 .and_then(|index| package.exports.get(index))
                 .ok_or_else(|| invalid("Font texture is missing"))?;
-            let texture = Texture::read(&package, texture)?;
+            let texture = Texture::read(package, texture)?;
             let mut glyphs = Vec::new();
             for _ in 0..data.count(16)? {
                 glyphs.push([data.u32()?, data.u32()?, data.u32()?, data.u32()?]);

@@ -15,6 +15,7 @@ struct Point {
     speed: f32,
     fov: f32,
     flash: f32,
+    fog: Vec3,
     skip_next: bool,
     end: bool,
 }
@@ -24,6 +25,7 @@ pub struct Shot {
     pub fov: f32,
     pub roll: f32,
     pub flash: f32,
+    pub fog: Vec3,
 }
 
 struct Trigger {
@@ -71,6 +73,7 @@ impl Intro {
                 speed: 1.0,
                 fov: 1.0,
                 flash: 1.0,
+                fog: Vec3::default(),
                 skip_next: false,
                 end: false,
             };
@@ -90,6 +93,7 @@ impl Intro {
                     "GameSpeedModifier" => point.speed = value.f32()?,
                     "FovModifier" => point.fov = value.f32()?,
                     "ScreenFlashScale" => point.flash = value.f32()?,
+                    "ScreenFlashFog" => point.fog = Vec3::read(&mut value)?,
                     "bSkipNextPath" => point.skip_next = property.boolean.unwrap_or(false),
                     "bEndOfPath" => point.end = property.boolean.unwrap_or(false),
                     "CollisionRadius" => radius = value.f32()?,
@@ -158,15 +162,25 @@ impl Intro {
     }
 
     pub fn update(&mut self, dt: f32) -> Option<(Shot, Vec<Arc<Wave>>)> {
+        let current = self.points.get(self.index)?;
+        let next = self.points.get(self.index + 1)?;
+        // GameSpeedModifier is level time dilation. Camera, movers and
+        // script timers all advance using the resulting level delta.
+        let dt = dt * mix(current.speed, next.speed, self.alpha).max(0.0);
         self.time += dt;
         let mut left = dt;
-        let mut cut = false;
+        let mut events = Vec::new();
+        if self.previous_shot.is_none() {
+            self.collect_touches(&mut events)?;
+        }
         while left > 0.0 {
             let current = self.points.get(self.index)?;
             let next = self.points.get(self.index + 1)?;
-            let rate = mix(current.rate, next.rate, self.alpha)
-                * mix(current.speed, next.speed, self.alpha);
-            let time = (1.0 - self.alpha) / rate.max(0.001);
+            let rate = mix(current.rate, next.rate, self.alpha);
+            if rate <= 0.0 {
+                break;
+            }
+            let time = (1.0 - self.alpha) / rate;
             if left < time {
                 self.alpha += left * rate;
                 break;
@@ -174,32 +188,27 @@ impl Intro {
             if current.end {
                 return None;
             }
+            self.alpha = 1.0;
+            self.collect_touches(&mut events)?;
             left -= time;
             self.index += 1;
+            let before_skip = self.index;
             while self
                 .points
                 .get(self.index)
                 .is_some_and(|point| point.skip_next)
             {
                 self.index += 1;
-                cut = true;
             }
             self.alpha = 0.0;
-        }
-        let shot = self.shot()?;
-        let position = shot.camera.position;
-        let previous = self
-            .previous_shot
-            .replace(position)
-            .filter(|_| !cut)
-            .unwrap_or(position);
-        let mut events = Vec::new();
-        for trigger in self.triggers.iter_mut().filter(|trigger| !trigger.fired) {
-            if trigger.touches_path(previous, position) {
-                trigger.fired = true;
-                events.push(trigger.event);
+            if self.index != before_skip {
+                // A camera cut has no swept volume between its two ends.
+                self.previous_shot = None;
+                self.collect_touches(&mut events)?;
             }
         }
+        let shot = self.shot()?;
+        self.collect_touches(&mut events)?;
         self.scheduled.retain(|&(time, event)| {
             if time > self.time {
                 true
@@ -266,7 +275,20 @@ impl Intro {
             fov: 90.0 * mix(a.fov, b.fov, t),
             roll: rotation.2,
             flash: mix(a.flash, b.flash, t),
+            fog: a.fog + (b.fog - a.fog) * t,
         })
+    }
+
+    fn collect_touches(&mut self, events: &mut Vec<usize>) -> Option<()> {
+        let position = self.shot()?.camera.position;
+        let previous = self.previous_shot.replace(position).unwrap_or(position);
+        for trigger in self.triggers.iter_mut().filter(|trigger| !trigger.fired) {
+            if trigger.touches_path(previous, position) {
+                trigger.fired = true;
+                events.push(trigger.event);
+            }
+        }
+        Some(())
     }
 }
 

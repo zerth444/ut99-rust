@@ -340,6 +340,7 @@ struct Pipeline {
     depth_off: ID3D11DepthStencilState,
     screen: ID3D11BlendState,
     modulated: ID3D11BlendState,
+    flash: ID3D11BlendState,
     no_color: ID3D11BlendState,
 }
 
@@ -368,6 +369,7 @@ impl Pipeline {
         let mut raster = None;
         let mut screen = None;
         let mut modulated = None;
+        let mut flash = None;
         let mut no_color = None;
         unsafe {
             device.CreateVertexShader(
@@ -401,6 +403,11 @@ impl Pipeline {
             blend.RenderTarget[0].SrcBlend = D3D11_BLEND_DEST_COLOR;
             blend.RenderTarget[0].DestBlend = D3D11_BLEND_SRC_COLOR;
             device.CreateBlendState(&blend, Some(&mut modulated))?;
+            blend.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+            blend.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+            blend.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO;
+            blend.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+            device.CreateBlendState(&blend, Some(&mut flash))?;
             blend.RenderTarget[0].BlendEnable = false.into();
             blend.RenderTarget[0].RenderTargetWriteMask = 0;
             device.CreateBlendState(&blend, Some(&mut no_color))?;
@@ -436,6 +443,7 @@ impl Pipeline {
             depth_off: depth_state(device, false, false)?,
             screen: screen.ok_or_else(Error::empty)?,
             modulated: modulated.ok_or_else(Error::empty)?,
+            flash: flash.ok_or_else(Error::empty)?,
             no_color: no_color.ok_or_else(Error::empty)?,
         })
     }
@@ -445,7 +453,7 @@ impl Pipeline {
             Mode::World => (&self.depth_write, None, &self.world),
             Mode::SkyMask => (&self.depth_write, Some(&self.no_color), &self.world),
             Mode::Modulated => (&self.depth_read, Some(&self.modulated), &self.world),
-            Mode::ModulatedScreen => (&self.depth_off, Some(&self.modulated), &self.ui),
+            Mode::Flash => (&self.depth_off, Some(&self.flash), &self.ui),
             Mode::ScreenDepth => (&self.depth_read, Some(&self.screen), &self.world),
             Mode::Screen => (&self.depth_off, Some(&self.screen), &self.ui),
             Mode::Ui => (&self.depth_off, None, &self.ui),
