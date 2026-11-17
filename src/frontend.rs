@@ -516,7 +516,7 @@ impl Menu {
         let resources = &frontend.art;
         let font_index = ((ui.scale * 4.0).round() as usize)
             .saturating_sub(4)
-            .min(FONT_SIZES.len() - 1);
+            .clamp(1, FONT_SIZES.len() - 1);
         let menu_font = resources.fonts[font_index]
             .as_ref()
             .map(|font| (font, 1.0 + font_index as f32 * 0.25))
@@ -931,7 +931,7 @@ impl Layout {
                 frame,
                 x as f32 * self.scale,
                 y as f32 * self.scale,
-                self.scale / native_scale,
+                (self.scale / native_scale).max(self.scale.min(1.0)),
                 label,
             );
             return;
@@ -1033,6 +1033,7 @@ mod tests {
         let (logo, camera) = front.logo.as_ref().expect("UT-Logo-Map");
         assert!(intro.map.music.is_some() && logo.music.is_some());
         assert!(!intro.map.scene_lights.is_empty());
+        assert!(!intro.map.animated_lightmaps.is_empty());
         assert!(!intro.map.coronas.is_empty());
         assert!(
             intro
@@ -1069,6 +1070,7 @@ mod tests {
         let mut moved = false;
         let mut saw_smoke = false;
         let mut saw_moving_flare = false;
+        let mut saw_light_fade = false;
         let initial_flare = intro
             .map
             .smoke
@@ -1082,6 +1084,43 @@ mod tests {
             heard += voices.len();
             let delta = shot.camera.position - first;
             moved |= delta.dot(delta) > 10_000.0;
+            if !saw_light_fade
+                && intro
+                    .map
+                    .scene_lights
+                    .iter()
+                    .any(|light| matches!(light.gain(intro.time), Some(1..=254)))
+            {
+                let mut render = Frame::hardware(&intro.map);
+                render.draw_cinematic(
+                    &intro.map,
+                    &shot.camera,
+                    intro.time,
+                    shot.fov,
+                    shot.roll,
+                    (shot.flash, shot.fog),
+                );
+                let commands = render.commands.as_mut().unwrap();
+                assert!(!commands.lightmap_updates.is_empty());
+                commands.lightmap_updates.clear();
+                render.draw_cinematic(
+                    &intro.map,
+                    &shot.camera,
+                    intro.time,
+                    shot.fov,
+                    shot.roll,
+                    (shot.flash, shot.fog),
+                );
+                assert!(
+                    render
+                        .commands
+                        .as_ref()
+                        .unwrap()
+                        .lightmap_updates
+                        .is_empty()
+                );
+                saw_light_fade = true;
+            }
             let sprites =
                 intro
                     .map
@@ -1099,6 +1138,7 @@ mod tests {
         }
         assert!(intro.time > 45.0);
         assert!(saw_smoke && saw_moving_flare);
+        assert!(saw_light_fade);
         assert!(moved && heard > 0);
         assert!(intro.map.props.iter().any(|prop| {
             prop.cinematic

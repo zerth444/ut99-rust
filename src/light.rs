@@ -31,9 +31,64 @@ impl LightIndex {
 }
 
 pub struct Light {
+    pub(crate) id: i32,
     position: Vec3,
     color: [f32; 3],
     radius: f32,
+    flicker: bool,
+    trigger: Option<TriggerLight>,
+}
+
+struct TriggerLight {
+    tag: Option<usize>,
+    change_time: f32,
+    toggle: bool,
+    alpha: f32,
+    target: f32,
+}
+
+impl Light {
+    fn animated(&self) -> bool {
+        self.flicker || self.trigger.is_some()
+    }
+
+    pub(crate) fn gain(&self, time: f32) -> Option<u8> {
+        if let Some(trigger) = &self.trigger {
+            return Some((trigger.alpha.sqrt() * 255.0).round() as u8);
+        }
+        self.flicker.then(|| {
+            // Each lamp changes independently on the level clock.
+            let tick = (time * 25.0) as u32;
+            let seed = tick.wrapping_mul(0x9e3779b9).wrapping_add(self.id as u32);
+            let hash = (seed ^ (seed >> 16)).wrapping_mul(0x85ebca6b);
+            if hash >> 31 == 0 { 0 } else { 255 }
+        })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn scene_event(&mut self, event: usize) {
+        if let Some(trigger) = &mut self.trigger
+            && trigger.tag == Some(event)
+        {
+            trigger.target = if trigger.toggle {
+                1.0 - trigger.target
+            } else {
+                1.0
+            };
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn tick(&mut self, dt: f32) {
+        if let Some(trigger) = &mut self.trigger {
+            let step = if trigger.change_time > 0.0 {
+                dt / trigger.change_time
+            } else {
+                1.0
+            };
+            trigger.alpha += (trigger.target - trigger.alpha).clamp(-step, step);
+        }
+    }
 }
 
 pub struct Corona {
@@ -101,7 +156,7 @@ pub fn read_coronas(package: &Package<'_>, path: &Path) -> io::Result<Vec<Corona
         .collect())
 }
 
-pub fn actor_lighting(lights: &[Light], position: Vec3, normal: Vec3) -> [f32; 3] {
+pub fn actor_lighting(lights: &[Light], position: Vec3, normal: Vec3, time: f32) -> [f32; 3] {
     let mut color = [0.22_f32; 3];
     for light in lights {
         let offset = light.position - position;
@@ -113,8 +168,9 @@ pub fn actor_lighting(lights: &[Light], position: Vec3, normal: Vec3) -> [f32; 3
                 1.0
             };
             let strength = (1.0 - distance / light.radius).powi(2) * (0.2 + 0.8 * facing.max(0.0));
+            let gain = f32::from(light.gain(time).unwrap_or(255)) / 255.0;
             for (channel, source) in color.iter_mut().zip(light.color) {
-                *channel += source * strength;
+                *channel += source * strength * gain;
             }
         }
     }
@@ -137,23 +193,54 @@ pub fn read_lights(package: &Package<'_>, refs: &[i32]) -> io::Result<HashMap<i3
         let mut brightness = 64;
         let mut radius = 64;
         let mut active = true;
-        while let Some((name, mut value)) = props.next()? {
-            match name {
+        let mut flicker = false;
+        let mut trigger =
+            (package.object_name(actor.class) == Some("TriggerLight")).then_some(TriggerLight {
+                tag: None,
+                change_time: 0.0,
+                toggle: false,
+                alpha: 0.0,
+                target: 0.0,
+            });
+        while let Some(prop) = props.next_tag()? {
+            let mut value = prop.value;
+            match prop.name {
                 "Location" => position = Vec3::read(&mut value)?,
                 "LightHue" => hue = value.byte()?,
                 "LightSaturation" => saturation = value.byte()?,
                 "LightBrightness" => brightness = value.byte()?,
                 "LightRadius" => radius = value.byte()?,
-                "LightType" => active = value.byte()? != 0,
+                "LightType" => {
+                    let kind = value.byte()?;
+                    active = kind != 0;
+                    flicker = kind == 4; // LT_Flicker
+                }
                 _ => {}
+            }
+            if let Some(trigger) = &mut trigger {
+                match prop.name {
+                    "Tag" => trigger.tag = Some(value.index()?),
+                    "ChangeTime" => trigger.change_time = value.f32()?,
+                    "bInitiallyOn" if prop.boolean == Some(true) => {
+                        trigger.alpha = 1.0;
+                        trigger.target = 1.0;
+                    }
+                    "InitialState" => {
+                        trigger.toggle = package.name(value.index()?)? == "TriggerToggle"
+                    }
+                    _ => {}
+                }
             }
         }
         let color = hue_color(hue, saturation, brightness);
         lights.insert(
             id,
             Light {
+                id,
                 position,
                 color,
+                flicker,
+                trigger,
                 radius: if active {
                     (f32::from(radius) + 1.0) * 25.0
                 } else {
@@ -206,6 +293,7 @@ pub struct Lightmap {
     pan: [f32; 2],
     scale: [f32; 2],
     colors: Vec<[f32; 3]>,
+    animated: Vec<(i32, Vec<[f32; 3]>)>,
 }
 
 impl Lightmap {
@@ -219,6 +307,7 @@ impl Lightmap {
         refs: &[i32],
         lights: &HashMap<i32, Light>,
         ambient: [f32; 3],
+        animated_lights: bool,
     ) -> Option<Self> {
         let width = index.width;
         let height = index.height;
@@ -246,11 +335,18 @@ impl Lightmap {
             + u_cross * (index.pan[0] / determinant)
             + face.normal.cross(face.u_axis) * (index.pan[1] / determinant);
         let mut colors = vec![ambient; width.checked_mul(height)?];
+        let mut animated = Vec::new();
         for (slot, id) in actors[..end].iter().enumerate() {
             let Some(light) = lights.get(id).filter(|light| light.radius > 0.0) else {
                 continue;
             };
             let mask = &masks[slot * stride..(slot + 1) * stride];
+            let layer = if animated_lights && light.animated() {
+                animated.push((*id, vec![[0.0; 3]; colors.len()]));
+                &mut animated.last_mut()?.1
+            } else {
+                &mut colors
+            };
             for y in 0..height {
                 for x in 0..width {
                     let point = origin + step_u * x as f32 + step_v * y as f32;
@@ -274,7 +370,7 @@ impl Lightmap {
                         }
                     }
                     let amount = visibility * (1.0 / 16.0) * angle * attenuation;
-                    for (channel, light) in colors[y * width + x].iter_mut().zip(light.color) {
+                    for (channel, light) in layer[y * width + x].iter_mut().zip(light.color) {
                         *channel += light * amount;
                     }
                 }
@@ -286,20 +382,42 @@ impl Lightmap {
             pan: index.pan,
             scale: index.scale,
             colors,
+            animated,
         })
     }
 
-    pub fn sample(&self, u: f32, v: f32) -> [f32; 3] {
+    pub(crate) fn animated_ids(&self) -> impl Iterator<Item = i32> + '_ {
+        self.animated.iter().map(|(id, _)| *id)
+    }
+
+    pub(crate) fn combine(&self, gains: &[u8]) -> Vec<[f32; 3]> {
+        let mut colors = self.colors.clone();
+        for ((_, contribution), &gain) in self.animated.iter().zip(gains) {
+            if gain == 0 {
+                continue;
+            }
+            let gain = f32::from(gain) / 255.0;
+            for (color, extra) in colors.iter_mut().zip(contribution) {
+                for (channel, extra) in color.iter_mut().zip(extra) {
+                    *channel += extra * gain;
+                }
+            }
+        }
+        colors
+    }
+
+    pub fn sample(&self, u: f32, v: f32, colors: Option<&[[f32; 3]]>) -> [f32; 3] {
         let x = ((u - self.pan[0]) / self.scale[0]).clamp(0.0, (self.width - 1) as f32);
         let y = ((v - self.pan[1]) / self.scale[1]).clamp(0.0, (self.height - 1) as f32);
         let x0 = x as usize;
         let y0 = y as usize;
         let x1 = (x0 + 1).min(self.width - 1);
         let y1 = (y0 + 1).min(self.height - 1);
-        let top = self.colors[y0 * self.width + x0];
-        let right = self.colors[y0 * self.width + x1];
-        let bottom = self.colors[y1 * self.width + x0];
-        let corner = self.colors[y1 * self.width + x1];
+        let colors = colors.unwrap_or(&self.colors);
+        let top = colors[y0 * self.width + x0];
+        let right = colors[y0 * self.width + x1];
+        let bottom = colors[y1 * self.width + x0];
+        let corner = colors[y1 * self.width + x1];
         std::array::from_fn(|i| {
             let a = top[i] + (right[i] - top[i]) * x.fract();
             let b = bottom[i] + (corner[i] - bottom[i]) * x.fract();

@@ -105,6 +105,36 @@ impl Presenter {
             let texture = self.upload(&image, mips)?;
             self.textures.insert(id, Some(texture));
         }
+        if !commands.lightmap_updates.is_empty() {
+            let view = self
+                .textures
+                .get(&LIGHTMAPS)
+                .and_then(Option::as_ref)
+                .ok_or_else(Error::empty)?;
+            let atlas = unsafe { view.GetResource()? };
+            for change in commands.lightmap_updates.drain(..) {
+                let [left, top] = change.origin;
+                let image = change.image;
+                let region = D3D11_BOX {
+                    left,
+                    top,
+                    front: 0,
+                    right: left + image.width,
+                    bottom: top + image.height,
+                    back: 1,
+                };
+                unsafe {
+                    self.context.UpdateSubresource(
+                        &atlas,
+                        0,
+                        Some(&region),
+                        image.pixels.as_ptr().cast(),
+                        image.width * 4,
+                        0,
+                    );
+                }
+            }
+        }
         self.stream_vertices(commands)?;
         let targets = self.targets.as_ref().ok_or_else(Error::empty)?;
         let viewport = D3D11_VIEWPORT {
@@ -453,7 +483,7 @@ impl Pipeline {
             Mode::World => (&self.depth_write, None, &self.world),
             Mode::SkyMask => (&self.depth_write, Some(&self.no_color), &self.world),
             Mode::Modulated => (&self.depth_read, Some(&self.modulated), &self.world),
-            Mode::Flash => (&self.depth_off, Some(&self.flash), &self.ui),
+            Mode::Flash | Mode::Ink => (&self.depth_off, Some(&self.flash), &self.ui),
             Mode::ScreenDepth => (&self.depth_read, Some(&self.screen), &self.world),
             Mode::Screen => (&self.depth_off, Some(&self.screen), &self.ui),
             Mode::Ui => (&self.depth_off, None, &self.ui),

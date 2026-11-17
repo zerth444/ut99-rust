@@ -11,6 +11,7 @@ pub enum Mode {
     SkyMask,
     Modulated,
     Flash,
+    Ink,
     ScreenDepth,
     Screen,
     Ui,
@@ -36,6 +37,11 @@ pub struct Image {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u32>,
+}
+
+pub struct LightmapUpdate {
+    pub origin: [u32; 2],
+    pub image: Image,
 }
 
 struct Atlas {
@@ -110,6 +116,7 @@ impl Pass {
 pub struct DrawList {
     pub passes: [Pass; 5],
     pub uploads: Vec<(usize, Image, bool)>,
+    pub lightmap_updates: Vec<LightmapUpdate>,
     seen: HashSet<usize>,
     atlas: Atlas,
     pub(super) layer: Layer,
@@ -133,6 +140,7 @@ impl DrawList {
                 (LIGHTMAPS, image, false),
             ],
             seen: HashSet::new(),
+            lightmap_updates: Vec::new(),
             atlas,
             layer: Layer::World,
         }
@@ -191,6 +199,25 @@ impl DrawList {
             [first[0], first[1], last[0], last[1]],
         ))
     }
+
+    pub(super) fn update_lightmap(&mut self, map: &Lightmap, colors: &[[f32; 3]]) {
+        if let Some(&origin) = self.atlas.entries.get(&(map as *const Lightmap as usize)) {
+            let (width, height, ..) = map.gpu_data();
+            self.lightmap_updates.push(LightmapUpdate {
+                origin: origin.map(|coordinate| coordinate as u32),
+                image: Image {
+                    width: width as u32,
+                    height: height as u32,
+                    pixels: colors.iter().copied().map(encode_light).collect(),
+                },
+            });
+        }
+    }
+}
+
+fn encode_light(color: [f32; 3]) -> u32 {
+    let [r, g, b] = color.map(|c| (c * (255.0 / 4.0)).round().clamp(0.0, 255.0) as u32);
+    (r << 16) | (g << 8) | b
 }
 
 fn lightmaps(map: &Map) -> (Atlas, Image) {
@@ -241,8 +268,7 @@ fn lightmaps(map: &Map) -> (Atlas, Image) {
                 .iter_mut()
                 .zip(&colors[row * w..][..w])
             {
-                let [r, g, b] = color.map(|c| (c * (255.0 / 4.0)).round().clamp(0.0, 255.0) as u32);
-                *pixel = (r << 16) | (g << 8) | b;
+                *pixel = encode_light(*color);
             }
         }
     }

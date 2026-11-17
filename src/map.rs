@@ -71,6 +71,7 @@ pub struct Start {
 
 pub struct Map {
     pub scene_lights: Vec<crate::light::Light>,
+    pub(crate) animated_lightmaps: Vec<Arc<Lightmap>>,
     pub coronas: Vec<crate::light::Corona>,
     #[cfg(windows)]
     pub(crate) smoke: crate::frontend::smoke::Smoke,
@@ -185,7 +186,15 @@ impl Map {
         if starts.is_empty() {
             return Err(invalid("Level has no PlayerStart for the preview camera"));
         }
+        let mut seen = std::collections::HashSet::new();
+        let animated_lightmaps = faces
+            .iter()
+            .filter_map(|face| face.lightmap.as_ref())
+            .filter(|map| map.animated_ids().next().is_some() && seen.insert(Arc::as_ptr(map)))
+            .cloned()
+            .collect();
         Ok(Self {
+            animated_lightmaps,
             #[cfg(windows)]
             smoke: city_intro
                 .map(|path| crate::frontend::smoke::Smoke::load(package, path, &movers))
@@ -594,8 +603,16 @@ fn read_bsp(
             face.lightmap = lightmaps
                 .entry((node.surface, zone))
                 .or_insert_with(|| {
-                    Lightmap::bake(&face, index, light_masks, &light_refs, &lights, ambient)
-                        .map(Arc::new)
+                    Lightmap::bake(
+                        &face,
+                        index,
+                        light_masks,
+                        &light_refs,
+                        &lights,
+                        ambient,
+                        use_zone_ambient,
+                    )
+                    .map(Arc::new)
                 })
                 .clone();
         }

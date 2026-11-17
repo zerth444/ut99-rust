@@ -37,6 +37,10 @@ float4 pixel_main(Fragment input) : SV_Target {
     }
     float depth = rcp(max(input.inverseDepth, 0.000001));
     float4 texel = Surface.Sample(SurfaceSampler, input.uv * depth);
+    if (input.bounds.w == -3.0) {
+        float coverage = texel.r * texel.a;
+        return float4(input.color.rgb * coverage, coverage);
+    }
     clip(texel.a - input.color.a);
     float3 lighting = 1.0;
     if (input.bounds.w > 0.0) {

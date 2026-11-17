@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -108,6 +109,12 @@ pub struct Frame {
     pub commands: Option<DrawList>,
     zoom: f32,
     roll: f32,
+    animated_lightmaps: HashMap<usize, CachedLightmap>,
+}
+
+struct CachedLightmap {
+    gains: Vec<u8>,
+    colors: Vec<[f32; 3]>,
 }
 
 impl Frame {
@@ -121,6 +128,7 @@ impl Frame {
             commands: None,
             zoom: 1.0,
             roll: 0.0,
+            animated_lightmaps: HashMap::new(),
         }
     }
 
@@ -134,6 +142,7 @@ impl Frame {
             commands: Some(DrawList::new(map)),
             zoom: 1.0,
             roll: 0.0,
+            animated_lightmaps: HashMap::new(),
         }
     }
 
@@ -202,6 +211,7 @@ impl Frame {
         if let Some(commands) = &mut self.commands {
             commands.clear();
         }
+        self.update_lighting(map, time);
         if let Some(position) = map.sky_origin {
             self.layer(Layer::Sky);
             let sky_camera = Camera {
@@ -717,6 +727,40 @@ impl Frame {
         self.blit_tile(texture, rect, source, tint, true, None);
     }
 
+    #[cfg(windows)]
+    pub(crate) fn ink(&mut self, texture: &TextureImage, rect: [i32; 4], source: [f32; 4]) {
+        let [x, y, w, h] = rect;
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let [u, v, uw, vh] = source;
+        if let Some(commands) = &mut self.commands {
+            let (id, [tw, th]) = commands.texture(Some(texture));
+            quad(
+                commands,
+                [self.width, self.height],
+                rect,
+                [u / tw, v / th, uw / tw, vh / th],
+                [0.0; 4],
+                None,
+                Mode::Ink,
+                id,
+            );
+            return;
+        }
+        for py in y.max(0)..(y + h).min(self.height as i32) {
+            for px in x.max(0)..(x + w).min(self.width as i32) {
+                let u = u + ((px - x) as f32 + 0.5) / w as f32 * uw;
+                let v = v + ((py - y) as f32 + 0.5) / h as f32 * vh;
+                if let Some([coverage, ..]) = texture.sample(u, v, true) {
+                    let pixel = &mut self.pixels[py as usize * self.width + px as usize];
+                    let color = [16, 8, 0].map(|shift| ((*pixel >> shift) & 255) as f32);
+                    *pixel = pack(color, 1.0 - coverage / 255.0);
+                }
+            }
+        }
+    }
+
     pub fn solid(&mut self, rect: [i32; 4], color: [f32; 3]) {
         if let Some(commands) = &mut self.commands {
             quad(
@@ -988,7 +1032,7 @@ impl Frame {
                         crate::mover::rotate(normal, mover.scene_rotation),
                     )
                 });
-                crate::light::actor_lighting(lights, center, normal)
+                crate::light::actor_lighting(lights, center, normal, time)
             };
             let u_pan = if flags & 0x200 != 0 { time * 64.0 } else { 0.0 };
             let v_pan = if flags & 0x400 != 0 { time * 64.0 } else { 0.0 };
@@ -1051,6 +1095,11 @@ impl Frame {
         if area.abs() < 0.01 || !area.is_finite() {
             return;
         }
+        let colors = face.lightmap.as_deref().and_then(|lightmap| {
+            self.animated_lightmaps
+                .get(&(lightmap as *const _ as usize))
+                .map(|cached| cached.colors.as_slice())
+        });
         let modulated = flags & MODULATED != 0;
         let translucent = flags & 4 != 0;
         if let Some(commands) = &mut self.commands {
@@ -1157,7 +1206,7 @@ impl Frame {
                                 self.depth[index] = inverse_depth;
                                 let exposure = 0.62 + 0.38 * (inverse_depth * 680.0).min(1.0);
                                 let color = if let Some(lightmap) = &face.lightmap {
-                                    let lighting = lightmap.sample(u, v);
+                                    let lighting = lightmap.sample(u, v, colors);
                                     std::array::from_fn(|i| color[i] * lighting[i])
                                 } else {
                                     std::array::from_fn(|i| color[i] * light[i] * exposure)
@@ -1171,6 +1220,40 @@ impl Frame {
                 w1 += d_x[1];
                 w2 += d_x[2];
             }
+        }
+    }
+
+    fn update_lighting(&mut self, map: &Map, time: f32) {
+        if map.animated_lightmaps.is_empty() {
+            self.animated_lightmaps.clear();
+            return;
+        }
+        let gains: HashMap<_, _> = map
+            .scene_lights
+            .iter()
+            .filter_map(|light| Some((light.id, light.gain(time)?)))
+            .collect();
+        for lightmap in &map.animated_lightmaps {
+            let id = std::sync::Arc::as_ptr(lightmap) as usize;
+            let levels = || {
+                lightmap
+                    .animated_ids()
+                    .map(|id| gains.get(&id).copied().unwrap_or(0))
+            };
+            if self
+                .animated_lightmaps
+                .get(&id)
+                .is_some_and(|cached| levels().eq(cached.gains.iter().copied()))
+            {
+                continue;
+            }
+            let gains: Vec<_> = levels().collect();
+            let colors = lightmap.combine(&gains);
+            if let Some(commands) = &mut self.commands {
+                commands.update_lightmap(lightmap, &colors);
+            }
+            self.animated_lightmaps
+                .insert(id, CachedLightmap { gains, colors });
         }
     }
 
@@ -1270,11 +1353,16 @@ fn quad(
         return;
     }
     let z = depth.unwrap_or(0.25);
-    let bounds = if mode == Mode::Flash {
-        [0.0, 0.0, 0.0, -2.0]
-    } else {
-        [0.0, 0.0, 0.0, -1.0]
-    };
+    let bounds = [
+        0.0,
+        0.0,
+        0.0,
+        match mode {
+            Mode::Flash => -2.0,
+            Mode::Ink => -3.0,
+            _ => -1.0,
+        },
+    ];
     let vertex = |x, y, u, v| GpuVertex {
         position: ndc(Vec3(x as f32, y as f32, z), dimensions),
         uv: [u * z, v * z],

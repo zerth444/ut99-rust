@@ -60,16 +60,15 @@ impl MenuFont {
             for page in &self.pages {
                 if let Some(&[u, v, w, h]) = page.glyphs.get(index) {
                     if w != 0 && h != 0 {
-                        frame.tile(
+                        frame.ink(
                             page.texture.image(0.0),
                             [
                                 x.round() as i32,
                                 y.round() as i32,
-                                (w as f32 * scale).round() as i32,
-                                (h as f32 * scale).round() as i32,
+                                (x + w as f32 * scale).round() as i32 - x.round() as i32,
+                                (y + h as f32 * scale).round() as i32 - y.round() as i32,
                             ],
                             [u as f32, v as f32, w as f32, h as f32],
-                            [0.03; 3],
                         );
                     }
                     x += (w.max(3) as f32 + 1.0) * scale;

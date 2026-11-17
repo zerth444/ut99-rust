@@ -242,11 +242,17 @@ impl Intro {
                 mover.scene_event(event);
             }
             self.map.smoke.trigger(event, self.time);
+            for light in &mut self.map.scene_lights {
+                light.scene_event(event);
+            }
         }
         for mover in &mut self.map.movers {
             mover.tick_scene(dt);
         }
         self.map.smoke.tick(self.time, &self.map.movers);
+        for light in &mut self.map.scene_lights {
+            light.tick(dt);
+        }
         Some((shot, voices))
     }
 
