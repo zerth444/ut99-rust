@@ -374,6 +374,10 @@ impl Walker {
         self.velocity = self.velocity + impulse;
     }
 
+    pub fn speed(&self) -> f32 {
+        self.velocity.dot(self.velocity).sqrt()
+    }
+
     pub fn eye(&self, profile: Profile, right: Vec3) -> Vec3 {
         let speed = horizontal_length(self.velocity);
         let stride = if self.grounded && speed >= 10.0 {

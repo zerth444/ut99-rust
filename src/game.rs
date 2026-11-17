@@ -167,6 +167,17 @@ pub struct WeaponAssets {
     pub guided_hud: [Option<Arc<crate::texture::Texture>>; 3],
     pub rocket_lock: [Option<Arc<Wave>>; 2],
     pub lock_reticle: Option<Arc<crate::texture::Texture>>,
+    pub rocket: Option<RocketAnimations>,
+    pub loaded: Motion,
+    pub walking: Motion,
+}
+
+#[derive(Default)]
+pub struct RocketAnimations {
+    pub loads: [Motion; 6],
+    pub rotations: [Motion; 6],
+    pub fires: [Motion; 6],
+    pub rotate_sound: Option<Arc<Wave>>,
 }
 
 impl WeaponAssets {
@@ -398,6 +409,9 @@ struct Charge {
     since: f32,
     next_load: f32,
     tight: bool,
+    rotating: bool,
+    phase_since: f32,
+    bio_size: f32,
 }
 
 #[derive(Default)]
@@ -464,6 +478,8 @@ pub struct Practice {
     pub decals: decals::Marks,
     pub death: Option<Death>,
     charge: Option<Charge>,
+    rocket_fired: Option<(u8, f32)>,
+    walking_since: Option<f32>,
     hit_taken: u16,
     pub hit_flash_until: f32,
     pub shield_flash_until: f32,
@@ -528,6 +544,8 @@ impl Practice {
             decals: decals::Marks::default(),
             death: None,
             charge: None,
+            rocket_fired: None,
+            walking_since: None,
             hit_taken: 0,
             hit_flash_until: 0.0,
             shield_flash_until: 0.0,
@@ -584,6 +602,8 @@ impl Practice {
         self.ballistics = ballistics::Effects::default();
         self.death = None;
         self.charge = None;
+        self.rocket_fired = None;
+        self.walking_since = None;
         self.hit_taken = 0;
         self.hit_flash_until = self.time;
         self.shield_flash_until = self.time;
@@ -630,11 +650,42 @@ impl Practice {
                     .and_then(|age| weapon.alternate_motion.sample(age))
             })
             .or_else(|| {
-                let elapsed = self.time - self.charge.as_ref()?.since;
+                let charge = self.charge.as_ref()?;
+                if charge.weapon == Weapon::Rocket {
+                    let rocket = weapon.rocket.as_ref()?;
+                    let motion = if charge.rotating {
+                        &rocket.rotations[usize::from(charge.loaded - 1)]
+                    } else {
+                        &rocket.loads[usize::from(charge.loaded)]
+                    };
+                    return motion.sample(
+                        (self.time - charge.phase_since).min((motion.duration() - 0.001).max(0.0)),
+                    );
+                }
+                let elapsed = self.time - charge.since;
                 let duration = weapon.load.duration();
+                if elapsed >= duration && !weapon.loaded.frames.is_empty() {
+                    return weapon.loaded.sample(0.0);
+                }
                 (duration > 0.0)
                     .then(|| elapsed.min((duration - 0.001).max(0.0)))
                     .and_then(|age| weapon.load.sample(age))
+            })
+            .or_else(|| {
+                if self.weapon != Weapon::Rocket {
+                    return None;
+                }
+                let (loaded, since) = self.rocket_fired?;
+                let rocket = weapon.rocket.as_ref()?;
+                let fire = &rocket.fires[usize::from(loaded - 1)];
+                let age = self.time - since;
+                if age < fire.duration() {
+                    fire.sample(age)
+                } else if self.ammo().is_some_and(|ammo| ammo > 0) {
+                    rocket.loads[0].sample(age - fire.duration())
+                } else {
+                    None
+                }
             })
             .or_else(|| {
                 let beam = self.pulse_beam.as_ref()?;
@@ -681,6 +732,16 @@ impl Practice {
                     &weapon.primary_motion
                 };
                 motion.sample(self.time - at)
+            })
+            .or_else(|| {
+                if self.weapon != Weapon::Bio {
+                    return None;
+                }
+                let duration = weapon.walking.duration();
+                let age = self.time - self.walking_since?;
+                (duration > 0.0)
+                    .then(|| age.rem_euclid(duration))
+                    .and_then(|age| weapon.walking.sample(age))
             })
             .unwrap_or_else(rest)
     }
@@ -1040,6 +1101,15 @@ impl Practice {
         player: Option<&mut Walker>,
     ) -> Vec<Arc<Wave>> {
         self.time += dt;
+        if self.weapon == Weapon::Bio
+            && player
+                .as_deref()
+                .is_some_and(|walker| walker.speed() > 10.0)
+        {
+            self.walking_since.get_or_insert(self.time);
+        } else {
+            self.walking_since = None;
+        }
         self.effects.retain(|effect| effect.expires > self.time);
         self.decals.update(self.time);
         self.decals.follow_movers(&map.movers);
@@ -1114,6 +1184,20 @@ impl Practice {
             }
         }
         sounds.extend(self.update_weapon(&map.arsenal));
+        if self.weapon == Weapon::Rocket
+            && self.charge.is_none()
+            && matches!(self.weapon_state, WeaponState::Ready)
+            && self.ammo().is_some_and(|ammo| ammo > 0)
+            && let Some((loaded, since)) = self.rocket_fired
+            && let Some(art) = map.arsenal.get(&Weapon::Rocket)
+            && let Some(rocket) = &art.rocket
+        {
+            let reload_at = since + rocket.fires[usize::from(loaded - 1)].duration();
+            if self.time - dt < reload_at && self.time >= reload_at {
+                sounds.extend(art.load_sound.clone());
+                self.next_shot = self.next_shot.max(reload_at + rocket.loads[0].duration());
+            }
+        }
         let guiding = self.ordnance.guided_view().is_some();
         if self.health > 0
             && !guiding
@@ -1565,8 +1649,19 @@ impl Practice {
         } else {
             alternate
         };
-        let interval = if rocket { 0.9 } else { 0.5 };
-        let limit = if rocket { 6 } else { 10 };
+        let animations = map.arsenal.get(&weapon).and_then(|art| art.rocket.as_ref());
+        let rotate_duration = |index: u8| {
+            animations
+                .map_or(7.0 / 15.0, |art| {
+                    art.rotations[usize::from(index)].duration()
+                })
+                .max(0.001)
+        };
+        let load_duration = |index: u8| {
+            animations
+                .map_or(7.0 / 15.0, |art| art.loads[usize::from(index)].duration())
+                .max(0.001)
+        };
         let ammo = &mut self.ammo[weapon.ammo_pool()];
         let load_sound = || {
             map.arsenal
@@ -1591,11 +1686,21 @@ impl Practice {
                 alternate,
                 loaded: 1,
                 since: self.time,
-                next_load: self.time + interval,
+                next_load: self.time + if rocket { rotate_duration(0) } else { 0.5 },
                 tight: rocket && !alternate && input.alternate,
+                rotating: true,
+                phase_since: self.time,
+                bio_size: 0.0,
             });
-            sounds.extend(load_sound());
-            return true;
+            if rocket {
+                self.rocket_fired = None;
+                if *ammo > 0 {
+                    sounds.extend(animations.and_then(|art| art.rotate_sound.clone()));
+                }
+            } else {
+                sounds.extend(load_sound());
+                return true;
+            }
         }
         let charge = self.charge.as_mut().unwrap();
         let held = if charge.alternate {
@@ -1606,17 +1711,31 @@ impl Practice {
         if rocket && !charge.alternate && input.alternate {
             charge.tight = true;
         }
-        if held && self.time >= charge.next_load && charge.loaded < limit && *ammo > 0 {
+        if rocket {
+            while held && self.time >= charge.next_load && charge.loaded < 6 && *ammo > 0 {
+                charge.phase_since = charge.next_load;
+                if charge.rotating {
+                    charge.rotating = false;
+                    charge.next_load += load_duration(charge.loaded);
+                    sounds.extend(load_sound());
+                } else {
+                    *ammo -= 1;
+                    charge.loaded += 1;
+                    charge.rotating = true;
+                    charge.next_load += rotate_duration(charge.loaded - 1);
+                    if *ammo > 0 {
+                        sounds.extend(animations.and_then(|art| art.rotate_sound.clone()));
+                    }
+                }
+            }
+        } else if self.time > charge.next_load && charge.bio_size < 4.1 && *ammo > 0 {
             *ammo -= 1;
             charge.loaded += 1;
-            charge.next_load += interval;
-            if rocket {
-                sounds.extend(load_sound());
-            }
+            charge.bio_size = (charge.bio_size + self.time - charge.phase_since).min(4.1);
+            charge.phase_since = self.time;
+            charge.next_load = self.time + 0.5;
         }
-        if held
-            && (!rocket || (charge.loaded < limit && (*ammo > 0 || self.time < charge.next_load)))
-        {
+        if held && (!rocket || (charge.loaded < 6 && *ammo > 0)) {
             return true;
         }
         let charge = self.charge.take().unwrap();
@@ -1631,7 +1750,7 @@ impl Practice {
         let scale = if rocket {
             1.0
         } else {
-            (1.0 + 0.4 * f32::from(charge.loaded - 1)).min(4.28) * 0.5
+            (1.0 + 0.8 * charge.bio_size) * 0.5
         };
         let forward = camera.look_direction();
         let right = camera.right();
@@ -1660,9 +1779,18 @@ impl Practice {
         }
         self.shots += u32::from(count);
         self.last_fire = Some((weapon, charge.alternate, self.time));
+        if rocket {
+            self.rocket_fired = Some((charge.loaded, self.time));
+        }
         self.next_shot = self.time
             + if rocket {
-                0.6
+                animations.map_or(0.6, |art| {
+                    art.fires[usize::from(charge.loaded - 1)].duration()
+                }) + if self.ammo[weapon.ammo_pool()] > 0 {
+                    load_duration(0)
+                } else {
+                    0.0
+                }
             } else {
                 map.arsenal
                     .get(&Weapon::Bio)
@@ -2101,6 +2229,13 @@ fn shot_sound(
     alt: bool,
 ) -> Option<Arc<Wave>> {
     let assets = arsenal.get(&weapon)?;
+    if weapon == Weapon::Bio {
+        return if alt {
+            assets.fire.clone()
+        } else {
+            assets.alternate.clone()
+        };
+    }
     if alt && weapon != Weapon::Enforcer && assets.alternate.is_some() {
         return assets.alternate.clone();
     }
@@ -2119,6 +2254,329 @@ mod tests {
             slot: None,
             cycle: 0,
         }
+    }
+
+    #[test]
+    #[ignore = "requires the local GOTY game packages"]
+    fn deck16_rocket_and_bio_animation_and_sound_sequences() {
+        let path = std::path::Path::new("local/goty/Maps/DM-Deck16][.unr");
+        let bytes = std::fs::read(path).unwrap();
+        let mut map = Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap();
+        let camera = Camera::from_start(map.starts[11]);
+        let rocket = map.arsenal[&Weapon::Rocket].rocket.as_ref().unwrap();
+        assert_eq!(
+            rocket.loads.each_ref().map(|clip| clip.frames.len()),
+            [7, 7, 7, 7, 7, 6]
+        );
+        assert_eq!(
+            rocket.rotations.each_ref().map(|clip| clip.frames.len()),
+            [7; 6]
+        );
+        // The class defaults deliberately reuse Fire2/Fire3 for five/six rounds.
+        assert_eq!(
+            rocket.fires.each_ref().map(|clip| clip.frames.len()),
+            [8, 11, 10, 11, 11, 10]
+        );
+        assert!(
+            rocket
+                .loads
+                .iter()
+                .chain(&rocket.rotations)
+                .all(|clip| (clip.rate - 15.0).abs() < 0.001)
+        );
+        assert!(
+            rocket
+                .fires
+                .iter()
+                .all(|clip| (clip.rate - 18.0).abs() < 0.001)
+        );
+        assert!(rocket.rotate_sound.is_some());
+        for alternate in [false, true] {
+            for count in 1..=6 {
+                let mut game = Practice::new(&map);
+                game.weapon = Weapon::Rocket;
+                game.weapon_state = WeaponState::Ready;
+                game.ammo[Weapon::Rocket.ammo_pool()] = 20;
+                let mut sounds = Vec::new();
+                let mut blasts = Vec::new();
+                let held = fire_input(!alternate, alternate);
+                game.update_charge(&map, &camera, &held, true, &mut sounds, &mut blasts);
+                assert!(Arc::ptr_eq(
+                    sounds.last().unwrap(),
+                    rocket.rotate_sound.as_ref().unwrap()
+                ));
+                while game
+                    .charge
+                    .as_ref()
+                    .is_some_and(|charge| charge.loaded < count)
+                {
+                    let charge = game.charge.as_ref().unwrap();
+                    let rotating = charge.rotating;
+                    game.time = charge.next_load + 0.0001;
+                    sounds.clear();
+                    game.update_charge(&map, &camera, &held, true, &mut sounds, &mut blasts);
+                    if rotating {
+                        let charge = game.charge.as_ref().unwrap();
+                        assert!(!charge.rotating);
+                        assert!(std::ptr::eq(
+                            game.pose(&map.arsenal[&Weapon::Rocket]).current,
+                            rocket.loads[usize::from(charge.loaded)].frames[0].as_slice()
+                        ));
+                        assert!(Arc::ptr_eq(
+                            sounds.last().unwrap(),
+                            map.arsenal[&Weapon::Rocket].load_sound.as_ref().unwrap()
+                        ));
+                    }
+                }
+                if count < 6 {
+                    sounds.clear();
+                    game.update_charge(
+                        &map,
+                        &camera,
+                        &fire_input(false, false),
+                        true,
+                        &mut sounds,
+                        &mut blasts,
+                    );
+                }
+                assert!(game.charge.is_none());
+                assert_eq!(game.shots, u32::from(count));
+                assert_eq!(game.ammo(), Some(20 - u16::from(count)));
+                assert_eq!(game.ordnance.active_count(), usize::from(count));
+                assert!(sounds.iter().any(|sound| {
+                    Arc::ptr_eq(
+                        sound,
+                        shot_sound(&map.arsenal, Weapon::Rocket, alternate)
+                            .as_ref()
+                            .unwrap(),
+                    )
+                }));
+                let fire = &rocket.fires[usize::from(count - 1)];
+                assert!(std::ptr::eq(
+                    game.pose(&map.arsenal[&Weapon::Rocket]).current,
+                    fire.frames[0].as_slice()
+                ));
+                assert!(
+                    (game.next_shot - game.time - fire.duration() - rocket.loads[0].duration())
+                        .abs()
+                        < 0.001
+                );
+                game.time += fire.duration() + 0.001;
+                assert!(std::ptr::eq(
+                    game.pose(&map.arsenal[&Weapon::Rocket]).current,
+                    rocket.loads[0].frames[0].as_slice()
+                ));
+            }
+        }
+        let bio = &map.arsenal[&Weapon::Bio];
+        assert_eq!(bio.load.frames.len(), 30);
+        assert!((bio.load.duration() - 30.0 / 7.2).abs() < 0.001);
+        assert_eq!(bio.loaded.frames.len(), 1);
+        assert_eq!(bio.walking.frames.len(), 18);
+        assert!((bio.primary_motion.duration() - 9.0 / 31.5).abs() < 0.001);
+        assert!((bio.alternate_motion.duration() - 0.75).abs() < 0.001);
+        assert!(Arc::ptr_eq(
+            bio.fire.as_ref().unwrap(),
+            bio.alternate.as_ref().unwrap()
+        ));
+        let mut game = Practice::new(&map);
+        game.weapon = Weapon::Bio;
+        game.weapon_state = WeaponState::Ready;
+        game.ammo[Weapon::Bio.ammo_pool()] = 20;
+        let mut sounds = Vec::new();
+        let mut blasts = Vec::new();
+        game.update_charge(
+            &map,
+            &camera,
+            &fire_input(false, true),
+            true,
+            &mut sounds,
+            &mut blasts,
+        );
+        assert_eq!(sounds.len(), 1);
+        assert!(Arc::ptr_eq(&sounds[0], bio.load_sound.as_ref().unwrap()));
+        for _ in 0..10 {
+            game.time += 0.51;
+            sounds.clear();
+            game.update_charge(
+                &map,
+                &camera,
+                &fire_input(false, true),
+                true,
+                &mut sounds,
+                &mut blasts,
+            );
+            assert!(
+                sounds.is_empty(),
+                "BioAltRep plays once rather than restarting per ammo"
+            );
+        }
+        let charge = game.charge.as_ref().unwrap();
+        assert!((charge.bio_size - 4.1).abs() < 0.001);
+        assert_eq!(charge.loaded, 10);
+        assert_eq!(game.ammo(), Some(10));
+        assert!(std::ptr::eq(
+            game.pose(bio).current,
+            bio.loaded.frames[0].as_slice()
+        ));
+        game.update_charge(
+            &map,
+            &camera,
+            &fire_input(false, false),
+            true,
+            &mut sounds,
+            &mut blasts,
+        );
+        assert_eq!(game.ordnance.active_count(), 1);
+        assert_eq!(sounds.len(), 1);
+        assert!(Arc::ptr_eq(&sounds[0], bio.fire.as_ref().unwrap()));
+        assert!((game.next_shot - game.time - 0.75).abs() < 0.001);
+
+        // The last rocket fires immediately; there is no empty reload animation or sound.
+        let mut game = Practice::new(&map);
+        game.weapon = Weapon::Rocket;
+        game.weapon_state = WeaponState::Ready;
+        game.ammo[Weapon::Rocket.ammo_pool()] = 1;
+        let sounds = game.update(
+            &mut map,
+            &camera,
+            0.01,
+            fire_input(true, false),
+            false,
+            None,
+        );
+        assert_eq!(game.shots, 1);
+        assert!(game.charge.is_none());
+        assert_eq!(sounds.len(), 1);
+        assert!(
+            (game.next_shot
+                - game.time
+                - map.arsenal[&Weapon::Rocket].rocket.as_ref().unwrap().fires[0].duration())
+            .abs()
+                < 0.001
+        );
+
+        let mut game = Practice::new(&map);
+        game.weapon = Weapon::Rocket;
+        game.weapon_state = WeaponState::Ready;
+        game.ammo[Weapon::Rocket.ammo_pool()] = 8;
+        game.update(
+            &mut map,
+            &camera,
+            0.01,
+            fire_input(true, false),
+            false,
+            None,
+        );
+        // Releasing during Load2 must fire one rocket, not grant a second round early.
+        let rotate = map.arsenal[&Weapon::Rocket]
+            .rocket
+            .as_ref()
+            .unwrap()
+            .rotations[0]
+            .duration();
+        let sounds = game.update(
+            &mut map,
+            &camera,
+            rotate + 0.01,
+            fire_input(true, false),
+            false,
+            None,
+        );
+        assert!(!game.charge.as_ref().unwrap().rotating);
+        assert!(sounds.iter().any(|sound| Arc::ptr_eq(
+            sound,
+            map.arsenal[&Weapon::Rocket].load_sound.as_ref().unwrap()
+        )));
+        game.update(
+            &mut map,
+            &camera,
+            0.01,
+            fire_input(false, false),
+            false,
+            None,
+        );
+        assert_eq!(game.shots, 1);
+        assert_eq!(game.ammo(), Some(7));
+        let fire = map.arsenal[&Weapon::Rocket].rocket.as_ref().unwrap().fires[0].duration();
+        let sounds = game.update(
+            &mut map,
+            &camera,
+            fire + 0.001,
+            fire_input(true, false),
+            false,
+            None,
+        );
+        assert!(
+            game.charge.is_none(),
+            "the firing/reload sequence blocks another shot"
+        );
+        assert!(sounds.iter().any(|sound| Arc::ptr_eq(
+            sound,
+            map.arsenal[&Weapon::Rocket].load_sound.as_ref().unwrap()
+        )));
+        let load = map.arsenal[&Weapon::Rocket].rocket.as_ref().unwrap().loads[0].duration();
+        game.update(
+            &mut map,
+            &camera,
+            load,
+            fire_input(true, false),
+            false,
+            None,
+        );
+        assert!(game.charge.is_some());
+        assert_eq!(game.ammo(), Some(6));
+
+        let mut game = Practice::new(&map);
+        game.weapon = Weapon::Bio;
+        game.weapon_state = WeaponState::Ready;
+        game.ammo[Weapon::Bio.ammo_pool()] = 20;
+        let sounds = game.update(
+            &mut map,
+            &camera,
+            0.01,
+            fire_input(true, false),
+            false,
+            None,
+        );
+        assert_eq!(game.shots, 1);
+        assert!(sounds.iter().any(|sound| Arc::ptr_eq(
+            sound,
+            map.arsenal[&Weapon::Bio].alternate.as_ref().unwrap()
+        )));
+        let cooldown = map.arsenal[&Weapon::Bio].primary_motion.duration();
+        game.update(
+            &mut map,
+            &camera,
+            cooldown * 0.5,
+            fire_input(true, false),
+            false,
+            None,
+        );
+        assert_eq!(game.shots, 1);
+        game.update(
+            &mut map,
+            &camera,
+            cooldown * 0.5 + 0.001,
+            fire_input(true, false),
+            false,
+            None,
+        );
+        assert_eq!(game.shots, 2);
+        let mut walker = Walker::spawn(&map.collision, map.starts[11].position);
+        walker.add_velocity(Vec3(40.0, 0.0, 0.0));
+        game.update(
+            &mut map,
+            &camera,
+            cooldown + 0.01,
+            fire_input(false, false),
+            false,
+            Some(&mut walker),
+        );
+        assert!(std::ptr::eq(
+            game.pose(&map.arsenal[&Weapon::Bio]).current,
+            map.arsenal[&Weapon::Bio].walking.frames[0].as_slice()
+        ));
     }
 
     #[test]

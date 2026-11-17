@@ -7,7 +7,7 @@ use std::{
 
 use crate::game::ordnance::{self, Kind};
 use crate::game::shock;
-use crate::game::{Flash, Item, Motion, Weapon, WeaponAssets};
+use crate::game::{Flash, Item, Motion, RocketAnimations, Weapon, WeaponAssets};
 use crate::map::{Face, Vec3, material_color, native_data};
 use crate::mover::{product, read_rotation, rotate, unit};
 use crate::package::{Export, Package, Properties, Reader, invalid};
@@ -666,6 +666,19 @@ pub fn load(
             );
         }
         if weapon == Weapon::Rocket {
+            weapon_assets.fire = cached_wave(
+                &assets,
+                &mut waves,
+                find_export(&assets, "unrealshare", "Ignite", "Sound"),
+            );
+            weapon_assets.rocket = Some(RocketAnimations {
+                rotate_sound: cached_wave(
+                    &assets,
+                    &mut waves,
+                    find_export(&assets, "unrealshare", "BarrelMove", "Sound"),
+                ),
+                ..Default::default()
+            });
             weapon_assets.rocket_lock = ["SeekLock", "SeekLost"].map(|name| {
                 cached_wave(
                     &assets,
@@ -744,6 +757,38 @@ pub fn load(
                 if let Some(Vec3(x, y, z)) = visual.player_offset {
                     let offset = Vec3(x, if weapon == Weapon::Redeemer { y } else { -y }, z);
                     let scale = visual.player_scale.unwrap_or(1.0);
+                    let rocket_names = if weapon == Weapon::Rocket {
+                        let (package, export) = assets.object(class);
+                        let mut names = [
+                            ["Load1", "Load2", "Load3", "Load4", "Load5", "Load6"],
+                            [
+                                "Rotate1", "Rotate2", "Rotate3", "Rotate4", "Rotate5", "Rotate3",
+                            ],
+                            ["Fire1", "Fire2", "Fire3", "Fire4", "Fire2", "Fire3"],
+                        ]
+                        .map(|group| group.map(str::to_owned));
+                        if let Ok(mut props) = class_properties(package, export) {
+                            while let Ok(Some(prop)) = props.next_tag() {
+                                let group = match prop.name {
+                                    "LoadAnim" => 0,
+                                    "RotateAnim" => 1,
+                                    "FireAnim" => 2,
+                                    _ => continue,
+                                };
+                                if prop.array_index < 6 {
+                                    let mut value = prop.value;
+                                    if let Ok(name) =
+                                        value.index().and_then(|index| package.name(index))
+                                    {
+                                        names[group][prop.array_index] = name.to_owned();
+                                    }
+                                }
+                            }
+                        }
+                        Some(names)
+                    } else {
+                        None
+                    };
                     let mut pose = |index| {
                         let vertices: Vec<_> = mesh
                             .frame(index)
@@ -761,6 +806,14 @@ pub fn load(
                                 rate: seq.rate * factor,
                             })
                     };
+                    if let Some(names) = &rocket_names {
+                        if let Some(rocket) = &mut weapon_assets.rocket {
+                            rocket.loads = std::array::from_fn(|i| motion(&[&names[0][i]], 1.0));
+                            rocket.rotations =
+                                std::array::from_fn(|i| motion(&[&names[1][i]], 1.0));
+                            rocket.fires = std::array::from_fn(|i| motion(&[&names[2][i]], 0.6));
+                        }
+                    }
                     weapon_assets.primary_motion = motion(
                         &["Shoot", "Fire1", "Fire", "Shoot1", "ShootLoop", "Firing"],
                         match weapon {
@@ -793,6 +846,8 @@ pub fn load(
                     }
                     if weapon == Weapon::Bio {
                         weapon_assets.alternate_motion = motion(&["Fire"], 0.4);
+                        weapon_assets.loaded = motion(&["Loaded"], 1.0);
+                        weapon_assets.walking = motion(&["Walking"], 0.3);
                     }
                     if weapon == Weapon::Minigun {
                         weapon_assets.alternate_motion = motion(&["Shoot1"], 1.3);
