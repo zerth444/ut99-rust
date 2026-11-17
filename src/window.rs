@@ -31,6 +31,7 @@ pub fn show(
     start: usize,
     title: &str,
     obs: bool,
+    no_sound: bool,
     path: &Path,
     startup: bool,
 ) -> io::Result<()> {
@@ -79,6 +80,7 @@ pub fn show(
             map,
             start,
             obs,
+            no_sound,
             frontend.as_mut(),
             &mut settings,
             &settings_path,
@@ -124,6 +126,7 @@ unsafe fn message_loop(
     map: &mut Map,
     mut start: usize,
     obs: bool,
+    no_sound: bool,
     mut frontend: Option<&mut Frontend>,
     settings: &mut Settings,
     settings_path: &Path,
@@ -141,11 +144,15 @@ unsafe fn message_loop(
     let mut walker = Walker::spawn(&map.collision, map.starts[start].position);
     let mut fly = false;
     let mut muted = false;
-    let mut audio = Audio::open(if frontend.is_some() {
+    let mut audio = if no_sound {
         None
     } else {
-        map.music.as_ref()
-    });
+        Audio::open(if frontend.is_some() {
+            None
+        } else {
+            map.music.as_ref()
+        })
+    };
     let mut jump = false;
     let mut occupied_portal = None;
     let mut last_direction = None;

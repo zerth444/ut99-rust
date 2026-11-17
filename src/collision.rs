@@ -149,8 +149,29 @@ impl Collision {
             .map(|hit| (start + delta * hit.fraction, hit.normal))
     }
 
+    pub fn projectile_surface(
+        &self,
+        start: Vec3,
+        delta: Vec3,
+        radius: f32,
+        height: f32,
+    ) -> Option<(Vec3, Vec3)> {
+        self.sweep(start, delta, Vec3(radius, radius, height))
+            .map(|hit| (start + delta * hit.fraction, hit.normal))
+    }
+
     fn trace(&self, start: Vec3, delta: Vec3) -> Option<Hit> {
         self.sweep(start, delta, PLAYER)
+    }
+
+    fn water_jump_clear(&self, position: Vec3, forward: Vec3) -> bool {
+        let higher = position + UP * (1.1 * self.profile.step_height);
+        self.trace(position, forward * PLAYER_RADIUS)
+            .is_some_and(|hit| hit.normal.2.abs() < FLOOR_NORMAL)
+            && self.ray(higher, forward * (2.0 * PLAYER_RADIUS)).is_none()
+            && self
+                .trace(position, UP * self.profile.step_height)
+                .is_none()
     }
 
     fn slide(&self, mut position: Vec3, mut delta: Vec3) -> Vec3 {
@@ -411,17 +432,27 @@ impl Walker {
                 );
                 let flow = zone.flow * 25.0;
                 let origin = self.position;
-                self.position = world.slide(origin, (self.velocity + flow) * step);
-                self.velocity = (self.position - origin) * step.recip() - flow;
-                if !world.regions.at(self.position).water && intent.2 > 0.0 {
-                    let ahead = crate::mover::unit(Vec3(intent.0, intent.1, 0.0));
-                    let reach = ahead * (PLAYER_RADIUS + 8.0);
-                    if world.trace(self.position, reach).is_some()
-                        && world.trace(self.position, UP * PLAYER.2).is_none()
-                        && world.trace(self.position + UP * PLAYER.2, reach).is_none()
+                let delta = (self.velocity + flow) * step;
+                self.position = world.slide(origin, delta);
+                let swim_z = self.position.2;
+                let forward = crate::mover::unit(Vec3(intent.0, intent.1, 0.0));
+                let blocked = (self.position - origin).dot(forward) < 0.95 * delta.dot(forward);
+                if blocked && delta.dot(forward) > 0.0 {
+                    let raised = self.position + UP * profile.step_height;
+                    if !world.regions.at(raised).water
+                        && world.trace(self.position, raised - self.position).is_none()
                     {
-                        self.velocity.2 = 330.0 + 2.0 * PLAYER_RADIUS;
+                        self.position = world.slide(raised, forward * delta.dot(forward));
                     }
+                }
+                self.velocity = (self.position - origin) * step.recip() - flow;
+                // The step changes position, not the swimmer's vertical momentum.
+                self.velocity.2 = (swim_z - origin.2) / step - flow.2;
+                if !world.regions.at(self.position).water
+                    && intent.2 > 0.0
+                    && world.water_jump_clear(self.position, forward)
+                {
+                    self.velocity.2 = 330.0 + 2.0 * PLAYER_RADIUS;
                 }
                 continue;
             }
@@ -463,6 +494,15 @@ impl Walker {
             let flow = zone.flow * (step * 25.0);
             let delta = (horizontal + Vec3(flow.0, flow.1, 0.0)) * step;
             let origin = self.position;
+            let foot_in_water = world.regions.at(origin - UP * PLAYER_HEIGHT).water;
+            if foot_in_water
+                && swim.2 > 0.0
+                && self.velocity.2 <= 160.0
+                && world.water_jump_clear(origin, heading)
+            {
+                self.velocity.2 = 330.0 + 2.0 * PLAYER_RADIUS;
+                self.grounded = false;
+            }
             self.position = world.slide(origin, delta);
             let moved = self.position - origin;
             let blocked = moved.dot(delta) < delta.dot(delta) * 0.95;

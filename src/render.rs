@@ -178,7 +178,11 @@ impl Frame {
         self.roll = 0.0;
         self.zoom = 1.0;
         self.begin_ui(false);
-        let gain = flash.clamp(0.0, 1.0);
+        self.screen_flash(flash, fog);
+    }
+
+    fn screen_flash(&mut self, gain: f32, fog: Vec3) {
+        let gain = gain.clamp(0.0, 1.0);
         if gain < 0.999 || fog.dot(fog) > 0.0 {
             if let Some(commands) = &mut self.commands {
                 quad(
@@ -378,14 +382,25 @@ impl Frame {
             }
         });
         let guided_camera = game.ordnance.guided_view();
+        let (shake_roll, shake_height) = game.ordnance.nuclear_shake(camera.position, game.time);
+        let shaken = Camera {
+            position: camera.position + Vec3(0.0, 0.0, shake_height),
+            yaw: camera.yaw,
+            pitch: camera.pitch,
+        };
         let camera = death_camera
             .as_ref()
             .or(guided_camera.as_ref())
-            .unwrap_or(camera);
+            .unwrap_or(&shaken);
+        self.roll = if guided_camera.is_some() {
+            game.ordnance.guided_roll
+        } else {
+            shake_roll
+        };
         self.zoom = (0.5 * game.field_of_view().to_radians()).tan().recip();
         self.draw(map, camera, time);
         self.layer(Layer::Effects);
-        let view = View::camera(camera);
+        let view = self.camera_view(camera);
         if game.show_decals {
             for mark in game.decals.visible() {
                 self.draw_faces_in_view(mark, &view, time, false, None, None);
@@ -506,6 +521,7 @@ impl Frame {
             }
         }
         self.zoom = 1.0;
+        self.roll = 0.0;
         if guided_camera.is_none()
             && game.death.is_none()
             && !game.scoped()
@@ -589,6 +605,7 @@ impl Frame {
         if let Some(weapon) = map.arsenal.get(&crate::game::Weapon::Redeemer) {
             let [reticle, readout, noise] = &weapon.guided_hud;
             if guided_camera.is_some() && game.death.is_none() {
+                self.screen_flash(0.8, Vec3(200.0 / 1000.0, 0.0, 0.0));
                 if let Some(reticle) = reticle {
                     let (w, h) = reticle.size();
                     let scale = (self.width as f32 / 640.0).floor().max(0.5);
@@ -624,9 +641,10 @@ impl Frame {
                 && let Some(noise) = noise
             {
                 let (w, h) = noise.size();
+                let scale = self.width.max(self.height) as f32 / 256.0;
                 self.tile(
-                    noise.image(time),
-                    [0, 0, self.width as i32, self.height as i32],
+                    noise.image_once(1.0 - (game.guidance_lost_until - game.time) / 0.3),
+                    [0, 0, (w * scale) as i32, (h * scale) as i32],
                     [0.0, 0.0, w, h],
                     [1.0; 3],
                 );
@@ -1256,7 +1274,11 @@ impl Frame {
                                     blend_light(pack(color, glow), self.pixels[index]);
                             } else {
                                 self.depth[index] = inverse_depth;
-                                let exposure = 0.62 + 0.38 * (inverse_depth * 680.0).min(1.0);
+                                let exposure = if flags & 0x0040_0000 != 0 {
+                                    1.0
+                                } else {
+                                    0.62 + 0.38 * (inverse_depth * 680.0).min(1.0)
+                                };
                                 let color = if let Some(lightmap) = &face.lightmap {
                                     let lighting = lightmap.sample(u, v, colors);
                                     std::array::from_fn(|i| color[i] * lighting[i])

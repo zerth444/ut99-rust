@@ -82,6 +82,11 @@ pub struct Art {
     pub scale: Option<f32>,
     pub wavefront: Vec<Face>,
     pub second_explosion: Option<Arc<Texture>>,
+    pub smoke: [Option<Arc<Texture>>; 4],
+    pub smoke_offsets: Vec<Vec3>,
+    pub scorch: Option<(Arc<Texture>, f32, f32)>,
+    pub collision_radius: f32,
+    pub collision_height: f32,
 }
 
 pub type Arsenal = [Art; Kind::ALL.len()];
@@ -95,6 +100,8 @@ pub enum Visual<'a> {
 pub struct Shots {
     projectiles: Vec<Projectile>,
     effects: Vec<Effect>,
+    marks: Vec<(Kind, Vec3, Vec3)>,
+    pub guided_roll: f32,
 }
 
 struct Projectile {
@@ -122,6 +129,36 @@ struct Effect {
 }
 
 impl Shots {
+    pub(super) fn project_marks(&mut self, map: &Map, marks: &mut super::decals::Marks, time: f32) {
+        for (kind, point, normal) in self.marks.drain(..) {
+            if let Some((texture, scale, duration)) = &map.ordnance[kind as usize].scorch {
+                marks.project(&map.faces, point, normal, texture, *scale, time + duration);
+            }
+        }
+    }
+
+    pub fn nuclear_shake(&self, eye: Vec3, time: f32) -> (f32, f32) {
+        self.effects
+            .iter()
+            .filter(|effect| effect.kind.warhead() && !effect.trail)
+            .filter_map(|effect| {
+                let age = time - effect.born;
+                let offset = eye - effect.position;
+                let distance = offset.dot(offset).sqrt();
+                (age < 0.5 && distance < 3000.0).then_some((distance, age))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map_or((0.0, 0.0), |(distance, age)| {
+                let fade = 1.0 - 2.0 * age;
+                let roll =
+                    (600_000.0 / distance.max(1.0)).min(4096.0) * std::f32::consts::TAU / 65_536.0;
+                (
+                    roll * fade * (46.0 * age).sin(),
+                    10.0 * fade * (32.0 * age).sin(),
+                )
+            })
+    }
+
     pub(super) fn nuclear_wave(
         &mut self,
         map: &Map,
@@ -178,7 +215,7 @@ impl Shots {
             .find(|shot| shot.kind == Kind::GuidedWarhead)?;
         let direction = missile.direction;
         Some(Camera {
-            position: missile.position + direction * 18.0,
+            position: missile.position,
             yaw: direction.1.atan2(direction.0),
             pitch: direction.2.atan2(direction.0.hypot(direction.1)),
         })
@@ -209,8 +246,16 @@ impl Shots {
                 time,
             );
         }
-        shot.direction = unit(shot.velocity + aim * (1500.0 * dt));
-        shot.velocity = shot.direction * 550.0;
+        let velocity = unit(shot.velocity + aim * (1500.0 * dt)) * 550.0;
+        shot.direction = unit(velocity);
+        if dt > 0.0 {
+            let (right, _) = super::shock::axes(shot.direction);
+            let roll = (10.0 * right.dot(velocity - shot.velocity) / dt).clamp(-12000.0, 12000.0)
+                * std::f32::consts::TAU
+                / 65_536.0;
+            self.guided_roll += (roll - self.guided_roll) * (5.0 * dt).min(1.0);
+        }
+        shot.velocity = velocity;
         None
     }
 
@@ -243,6 +288,9 @@ impl Shots {
         sounds: &mut Vec<Arc<Wave>>,
     ) -> Option<Blast> {
         let art = &map.ordnance[kind as usize];
+        if kind == Kind::GuidedWarhead {
+            self.guided_roll = 0.0;
+        }
         let forward = camera.look_direction();
         let right = camera.right();
         let up = forward.cross(right);
@@ -254,7 +302,7 @@ impl Shots {
             Kind::Rocket | Kind::Grenade => forward * 20.0 + right * (8.0 + side) - up * 9.0,
             Kind::FlakShell | Kind::Chunk => forward * 20.0 + right * (11.0 + side) - up * 15.0,
             Kind::Razor | Kind::RazorAlt => forward * 20.0 + right * 15.0 - up * 13.0,
-            Kind::Warhead | Kind::GuidedWarhead => forward * 26.0 - up * 10.0,
+            Kind::Warhead | Kind::GuidedWarhead => forward * 19.8 + right - up * 11.89,
             _ => forward * 18.0 + right * 11.0 - up * 6.0,
         };
         let speed = art.speed.unwrap_or(match kind {
@@ -292,18 +340,21 @@ impl Shots {
                 },
             scale,
             stuck: None,
-            next_trail: time,
+            next_trail: time + if kind.warhead() { 0.3 } else { 0.0 },
             wall_hits: 0,
             seeking: None,
         };
         if let Some((point, normal)) = map.collision.ray_surface(camera.position, offset) {
             shot.position = point + normal * 0.5;
+            if art.scorch.is_some() {
+                self.marks.push((kind, point, normal));
+            }
             if !matches!(
                 kind,
                 Kind::Grenade | Kind::Chunk | Kind::Razor | Kind::FlakShell
             ) && !kind.bio()
             {
-                return explode(&shot, art, &mut self.effects, sounds, time);
+                return explode_at(&shot, art, &mut self.effects, sounds, time, normal * 15.5);
             }
         }
         self.projectiles.push(shot);
@@ -335,6 +386,14 @@ impl Shots {
     ) {
         self.effects
             .retain(|effect| time - effect.born < effect.duration);
+        for effect in self.effects.iter().filter(|effect| {
+            effect.kind.warhead()
+                && !effect.trail
+                && time >= effect.born + 0.5
+                && time - dt < effect.born + 0.5
+        }) {
+            sounds.extend(map.ordnance[effect.kind as usize].sound.iter().cloned());
+        }
         let mut fragments = Vec::new();
         self.projectiles.retain_mut(|shot| {
             let kind = shot.kind;
@@ -380,16 +439,64 @@ impl Shots {
                     shot.velocity = shot.direction * speed;
                 }
                 if time >= shot.next_trail {
-                    shot.next_trail = time + 0.035;
-                    self.effects.push(Effect {
-                        kind,
-                        position: shot.position - shot.direction * 10.0,
-                        born: time,
-                        duration: 0.22,
-                        scale: 0.5,
-                        trail: true,
-                        struck: [false; 2],
-                    });
+                    if kind.warhead() {
+                        shot.next_trail = time
+                            + if kind == Kind::Warhead {
+                                152.0 / art.speed.unwrap_or(600.0).max(1.0)
+                            } else {
+                                0.02
+                            };
+                        if !map.collision.regions.at(shot.position).water {
+                            let count = if kind == Kind::Warhead {
+                                art.smoke_offsets.len()
+                            } else {
+                                1
+                            };
+                            let (right, up) = super::shock::axes(shot.direction);
+                            for i in 0..count {
+                                let offset = art.smoke_offsets.get(i).copied().unwrap_or_default();
+                                let position = if kind == Kind::Warhead {
+                                    shot.position
+                                        + shot.direction * offset.0
+                                        + right * offset.1
+                                        + up * offset.2
+                                } else {
+                                    shot.position
+                                };
+                                if map
+                                    .collision
+                                    .ray(shot.position, position - shot.position)
+                                    .is_some()
+                                {
+                                    break;
+                                }
+                                self.effects.push(Effect {
+                                    kind,
+                                    position,
+                                    born: time,
+                                    duration: if kind == Kind::Warhead {
+                                        1.4 + i as f32 * 0.025
+                                    } else {
+                                        1.5
+                                    },
+                                    scale: 2.0,
+                                    trail: true,
+                                    struck: [false; 2],
+                                });
+                            }
+                        }
+                    } else {
+                        shot.next_trail = time + 0.035;
+                        self.effects.push(Effect {
+                            kind,
+                            position: shot.position - shot.direction * 10.0,
+                            born: time,
+                            duration: 0.22,
+                            scale: 0.5,
+                            trail: true,
+                            struck: [false; 2],
+                        });
+                    }
                 }
             } else if matches!(kind, Kind::Grenade | Kind::FlakShell)
                 || (kind == Kind::Chunk && shot.wall_hits > 0)
@@ -399,13 +506,19 @@ impl Shots {
                     shot.velocity + map.collision.regions.at(shot.position).gravity * dt;
             }
             let delta = shot.velocity * dt;
-            let wall = map.collision.ray_surface(shot.position, delta);
+            let wall = map.collision.projectile_surface(
+                shot.position,
+                delta,
+                art.collision_radius,
+                art.collision_height,
+            );
             let visible_delta = wall.map_or(delta, |(point, _)| point - shot.position);
             if let Some(target) = target.as_deref_mut()
                 && let Some(fraction) = target.ray(shot.position, visible_delta)
             {
                 shot.position = shot.position + visible_delta * fraction;
-                let blast = explode(shot, art, &mut self.effects, sounds, time);
+                let offset = unit(shot.position - target.position) * 16.0;
+                let blast = explode_at(shot, art, &mut self.effects, sounds, time, offset);
                 if blast.is_none() {
                     let damage = match kind {
                         Kind::Pulse => 20,
@@ -515,7 +628,18 @@ impl Shots {
                         });
                     }
                 }
-                blasts.extend(explode(shot, art, &mut self.effects, sounds, time));
+                if art.scorch.is_some() {
+                    let contact = map.collision.ray(point, normal * -32.0).unwrap_or(point);
+                    self.marks.push((kind, contact, normal));
+                }
+                blasts.extend(explode_at(
+                    shot,
+                    art,
+                    &mut self.effects,
+                    sounds,
+                    time,
+                    normal * 15.5,
+                ));
                 false
             }
         });
@@ -560,6 +684,28 @@ impl Shots {
         for effect in &self.effects {
             let art = &assets[effect.kind as usize];
             let age = (time - effect.born) / effect.duration;
+            if effect.kind.warhead() && effect.trail {
+                let seed =
+                    (effect.position.0.to_bits() ^ effect.position.1.to_bits()).rotate_left(9);
+                let index = ((effect.born * 1000.0) as usize ^ seed as usize) % art.smoke.len();
+                if let Some(texture) = &art.smoke[index] {
+                    draw(Visual::Sprite(
+                        effect.position + Vec3(0.0, 0.0, 50.0 * (time - effect.born)),
+                        texture.image_once(if effect.kind == Kind::Warhead {
+                            (seed % 1000) as f32 / 1000.0
+                        } else {
+                            age
+                        }),
+                        effect.scale,
+                        if effect.kind == Kind::Warhead {
+                            0.8
+                        } else {
+                            0.4
+                        },
+                    ));
+                }
+                continue;
+            }
             if effect.kind.warhead() && !effect.trail {
                 let elapsed = time - effect.born;
                 if !art.wavefront.is_empty() {
@@ -627,8 +773,25 @@ fn explode(
     sounds: &mut Vec<Arc<Wave>>,
     time: f32,
 ) -> Option<Blast> {
+    explode_at(shot, art, effects, sounds, time, Vec3(0.0, 0.0, 16.0))
+}
+
+fn explode_at(
+    shot: &Projectile,
+    art: &Art,
+    effects: &mut Vec<Effect>,
+    sounds: &mut Vec<Arc<Wave>>,
+    time: f32,
+    wave_offset: Vec3,
+) -> Option<Blast> {
     sounds.extend(art.sound.iter().cloned());
     let kind = shot.kind;
+    let position = if kind.warhead() {
+        sounds.extend(art.contact.iter().cloned());
+        shot.position + wave_offset
+    } else {
+        shot.position
+    };
     let (duration, scale) = match kind {
         Kind::Pulse => (0.5, 0.65),
         Kind::Rocket | Kind::Grenade => (0.7, 1.4),
@@ -639,7 +802,7 @@ fn explode(
     };
     effects.push(Effect {
         kind,
-        position: shot.position,
+        position,
         born: time,
         duration,
         scale,
@@ -674,6 +837,103 @@ fn shock_size(age: f32) -> f32 {
 mod tests {
     use super::*;
     use crate::{collision::Collision, package::Package};
+
+    #[test]
+    #[ignore = "requires the local GOTY game packages"]
+    fn redeemer_uses_stock_missile_smoke_and_full_nuclear_wave() {
+        let path = std::path::Path::new("local/goty/Maps/DM-Deck16][.unr");
+        let bytes = std::fs::read(path).unwrap();
+        let mut map = Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap();
+        let launcher = &map.arsenal[&super::super::Weapon::Redeemer];
+        assert!(launcher.guided_hud.iter().all(Option::is_some));
+        assert!(launcher.primary_motion.duration() > 0.7);
+        for kind in [Kind::Warhead, Kind::GuidedWarhead] {
+            let art = &map.ordnance[kind as usize];
+            assert_eq!(art.flight.frames.len(), 100);
+            assert!(art.flight.frames.iter().all(|frame| {
+                !frame.is_empty() && frame.iter().all(|face| face.texture.is_some())
+            }));
+            assert!(art.smoke.iter().all(Option::is_some));
+            assert!(art.scorch.is_some());
+            assert!(art.contact.is_some() && art.sound.is_some());
+            assert!(art.explosion.is_some() && art.second_explosion.is_some());
+            let mut min = Vec3(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+            let mut max = min * -1.0;
+            for face in &art.wavefront {
+                assert!(face.texture.is_some());
+                for &p in &face.vertices {
+                    min = Vec3(min.0.min(p.0), min.1.min(p.1), min.2.min(p.2));
+                    max = Vec3(max.0.max(p.0), max.1.max(p.1), max.2.max(p.2));
+                }
+            }
+            let size = max - min;
+            assert!(size.0.max(size.1).max(size.2) * shock_size(1.4) > 2000.0);
+        }
+        let mut collision = Collision::read(&[], std::iter::empty(), &[]).unwrap();
+        collision.add_box(Vec3(800.0, -1000.0, -1000.0), Vec3(850.0, 1000.0, 1000.0));
+        map.collision = collision;
+        let camera = Camera {
+            position: Vec3(0.0, 0.0, 65.0),
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        let mut shots = Shots::default();
+        let mut sounds = Vec::new();
+        let mut blasts = Vec::new();
+        shots.fire(
+            &map,
+            &camera,
+            Kind::Warhead,
+            camera.forward(),
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            &mut sounds,
+        );
+        for frame in 1..=160 {
+            shots.update(
+                &map,
+                None,
+                frame as f32 * 0.01,
+                0.01,
+                &mut sounds,
+                &mut blasts,
+            );
+        }
+        assert!(shots.projectiles.is_empty());
+        let effect = shots.effects.iter().find(|effect| !effect.trail).unwrap();
+        assert!((effect.position.0 - 769.0).abs() < 0.01);
+        assert!(shots.effects.iter().any(|effect| effect.trail));
+        assert_eq!(shots.marks.len(), 1);
+        assert!((shots.marks[0].1.0 - 800.0).abs() < 0.01);
+        assert!(
+            map.ordnance[Kind::Warhead as usize]
+                .scorch
+                .as_ref()
+                .unwrap()
+                .2
+                > 0.0
+        );
+        assert_eq!(blasts.len(), 1);
+        let origin = effect.position;
+        let born = effect.born;
+        let exposed = origin - Vec3(500.0, 0.0, 0.0);
+        assert!(shots.nuclear_wave(&map, born + 1.0, exposed, 0).is_some());
+        assert!(shots.nuclear_wave(&map, born + 1.1, exposed, 0).is_none());
+        assert!(
+            shots
+                .nuclear_wave(&map, born + 0.8, origin + Vec3(200.0, 0.0, 0.0), 1)
+                .is_none()
+        );
+        let mut sprites = Vec::new();
+        shots.visuals(&map.ordnance, born + 0.75, |visual| {
+            if let Visual::Sprite(_, _, scale, _) = visual {
+                sprites.push(scale);
+            }
+        });
+        assert!(sprites.contains(&2.8) && sprites.contains(&3.2));
+    }
 
     #[test]
     #[ignore = "requires the local GOTY game packages"]

@@ -32,7 +32,15 @@ use package::Package;
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args_os().skip(1).peekable();
     #[cfg(windows)]
-    let obs = args.next_if(|arg| arg == "--obs").is_some();
+    let (obs, no_sound) = {
+        let mut obs = false;
+        let mut no_sound = false;
+        while let Some(flag) = args.next_if(|arg| arg == "--obs" || arg == "--nosound") {
+            obs |= flag == "--obs";
+            no_sound |= flag == "--nosound";
+        }
+        (obs, no_sound)
+    };
     if args.peek().is_none() {
         #[cfg(windows)]
         {
@@ -48,6 +56,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     start,
                     &window_title(&demo),
                     obs,
+                    no_sound,
                     &demo,
                     true,
                 )?);
@@ -193,6 +202,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 start,
                 &window_title(path),
                 obs,
+                no_sound,
                 path,
                 command == "play",
             )?;
@@ -214,8 +224,8 @@ fn window_title(path: &Path) -> String {
 fn print_usage() {
     println!("ut99-rust inspect <package>");
     println!("ut99-rust map-info <map.unr>");
-    println!("ut99-rust [--obs] view <map.unr> [player-start]");
-    println!("ut99-rust [--obs] play <map.unr> [player-start]");
+    println!("ut99-rust [--obs] [--nosound] view <map.unr> [player-start]");
+    println!("ut99-rust [--obs] [--nosound] play <map.unr> [player-start]");
     println!("ut99-rust capture <map.unr> <output.bmp> [player-start]");
     println!("ut99-rust capture-practice <map.unr> <output.bmp> [player-start]");
 }

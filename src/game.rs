@@ -1194,6 +1194,8 @@ impl Practice {
             &mut sounds,
             &mut blasts,
         );
+        self.ordnance
+            .project_marks(map, &mut self.decals, self.time);
         if self.was_guiding && self.ordnance.guided_view().is_none() {
             self.guidance_lost_until = self.time + 0.3;
             self.next_shot = self.time + 1.3;

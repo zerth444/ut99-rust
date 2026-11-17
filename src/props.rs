@@ -66,6 +66,7 @@ impl<'a> Assets<'a> {
 #[derive(Clone, Copy, Default)]
 struct Appearance {
     hidden: bool,
+    unlit: bool,
     draw_type: u8,
     mesh: Option<Object>,
     player_mesh: Option<Object>,
@@ -104,6 +105,7 @@ struct Appearance {
 
 struct VisualProperties {
     hidden: Option<bool>,
+    unlit: Option<bool>,
     draw_type: Option<u8>,
     mesh: Option<i32>,
     player_mesh: Option<i32>,
@@ -146,6 +148,7 @@ impl VisualProperties {
     fn read(mut props: Properties<'_, '_>) -> io::Result<Self> {
         let mut props_out = Self {
             hidden: None,
+            unlit: None,
             draw_type: None,
             mesh: None,
             player_mesh: None,
@@ -187,6 +190,7 @@ impl VisualProperties {
             let mut value = prop.value;
             match prop.name {
                 "bHidden" => props_out.hidden = prop.boolean,
+                "bUnlit" => props_out.unlit = prop.boolean,
                 "DrawType" => props_out.draw_type = Some(value.byte()?),
                 "Mesh" => props_out.mesh = Some(value.compact()?),
                 "PlayerViewMesh" => props_out.player_mesh = Some(value.compact()?),
@@ -236,6 +240,9 @@ impl VisualProperties {
     fn apply(&self, assets: &mut Assets<'_>, package: usize, mut parent: Appearance) -> Appearance {
         if let Some(value) = self.hidden {
             parent.hidden = value;
+        }
+        if let Some(value) = self.unlit {
+            parent.unlit = value;
         }
         if let Some(value) = self.draw_type {
             parent.draw_type = value;
@@ -412,39 +419,45 @@ pub fn load(
     let Some(folder) = path.parent() else {
         return Ok(Scene::default());
     };
-    let mut packages: Vec<_> = [
-        ("../System", "u"),
-        ("../Textures", "utx"),
-        ("../Sounds", "uax"),
-    ]
-    .into_iter()
-    .flat_map(|(directory, extension)| {
-        fs::read_dir(folder.join(directory))
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .map(move |entry| (entry.path(), extension))
-    })
-    .filter_map(|(path, extension)| {
-        path.extension()?
-            .to_str()?
-            .eq_ignore_ascii_case(extension)
-            .then_some(())?;
-        let name = path.file_stem()?.to_str()?.to_ascii_lowercase();
-        // Only packages directly referenced by this map and the engine's base classes.
-        if !matches!(
-            name.as_str(),
-            "engine" | "core" | "botpack" | "dmatch" | "unrealshare" | "unreali" | "soldierskins"
-        ) && !map
-            .imports
-            .iter()
-            .any(|import| import.outer == 0 && map.names[import.name].eq_ignore_ascii_case(&name))
-        {
-            return None;
-        }
-        Some((name, fs::read(path).ok()?))
-    })
-    .collect();
+    let mut packages: Vec<_> =
+        [
+            ("../System", "u"),
+            ("../Textures", "utx"),
+            ("../Sounds", "uax"),
+        ]
+        .into_iter()
+        .flat_map(|(directory, extension)| {
+            fs::read_dir(folder.join(directory))
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .map(move |entry| (entry.path(), extension))
+        })
+        .filter_map(|(path, extension)| {
+            path.extension()?
+                .to_str()?
+                .eq_ignore_ascii_case(extension)
+                .then_some(())?;
+            let name = path.file_stem()?.to_str()?.to_ascii_lowercase();
+            // Map imports and stock gameplay assets used independently of the level.
+            if !matches!(
+                name.as_str(),
+                "engine"
+                    | "core"
+                    | "botpack"
+                    | "dmatch"
+                    | "unrealshare"
+                    | "unreali"
+                    | "soldierskins"
+                    | "ladrstatic"
+            ) && !map.imports.iter().any(|import| {
+                import.outer == 0 && map.names[import.name].eq_ignore_ascii_case(&name)
+            }) {
+                return None;
+            }
+            Some((name, fs::read(path).ok()?))
+        })
+        .collect();
     packages.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut assets = Assets {
         packages: vec![Package::read(map.data)?],
@@ -630,8 +643,13 @@ pub fn load(
             );
         }
         if weapon == Weapon::Redeemer {
-            weapon_assets.guided_hud = ["GuidedX", "Readout", "Static_a00"].map(|name| {
-                find_export(&assets, "botpack", name, "Texture")
+            weapon_assets.guided_hud = [
+                ("botpack", "GuidedX"),
+                ("botpack", "Readout"),
+                ("ladrstatic", "Static_a00"),
+            ]
+            .map(|(package, name)| {
+                find_export(&assets, package, name, "Texture")
                     .and_then(|id| cached_texture(&assets, &mut textures, id))
             });
             weapon_assets.charge_loop = cached_wave(
@@ -717,7 +735,7 @@ pub fn load(
                 let transform =
                     |point| rotate(product(point - mesh.origin, mesh.scale), mesh.rotation);
                 if let Some(Vec3(x, y, z)) = visual.player_offset {
-                    let offset = Vec3(x, -y, z);
+                    let offset = Vec3(x, if weapon == Weapon::Redeemer { y } else { -y }, z);
                     let scale = visual.player_scale.unwrap_or(1.0);
                     let mut pose = |index| {
                         let vertices: Vec<_> = mesh
@@ -743,6 +761,7 @@ pub fn load(
                             Weapon::Shock => shock::firing_rate(false),
                             Weapon::Hammer => 0.65,
                             Weapon::Minigun => 1.6,
+                            Weapon::Redeemer => 0.3,
                             _ => 1.0,
                         },
                     );
@@ -1030,7 +1049,8 @@ fn projectile_art(
             Some(("botpack", "GelHit")),
         ),
     };
-    art.explosion = find_export(assets, "botpack", texture, "Texture")
+    art.explosion = find_export(assets, package, texture, "Texture")
+        .or_else(|| find_export(assets, "botpack", texture, "Texture"))
         .and_then(|id| cached_texture(assets, textures, id));
     art.sound = cached_wave(assets, waves, find_export(assets, package, sound, "Sound"));
     art.contact = contact.and_then(|(package, sound)| {
@@ -1050,16 +1070,51 @@ fn projectile_art(
                 object,
                 visual,
                 &mesh,
-                &["Flying", "Spin", "Wing", "WingIn", "Still", "All"],
+                &[
+                    "missile", "Flying", "Spin", "Wing", "WingIn", "Still", "All",
+                ],
             );
             art.stuck = effect_motion(assets, textures, object, visual, &mesh, &["Hit", "Still"]);
         }
     }
-    if matches!(kind, Kind::Rocket | Kind::Warhead | Kind::GuidedWarhead) {
+    if kind == Kind::Rocket {
         art.trail = find_export(assets, "botpack", "JRFlare", "Texture")
             .and_then(|id| cached_texture(assets, textures, id));
     }
     if matches!(kind, Kind::Warhead | Kind::GuidedWarhead) {
+        art.collision_radius = visual.collision_radius.unwrap_or(15.0);
+        art.collision_height = visual.collision_height.unwrap_or(8.0);
+        let smoke_class = find_export(assets, "botpack", "UTSmokeTrail", "Class");
+        let smoke = appearance(assets, classes, smoke_class);
+        if let Some(object) = smoke.mesh {
+            let (package, export) = assets.object(object);
+            if let Ok(mesh) = Mesh::read(package, export)
+                && let Some(frame) = mesh.frame(0)
+            {
+                art.smoke_offsets = effect_vertices(&mesh, frame, smoke.scale);
+            }
+        }
+        art.smoke = ["us1_a00", "us2_a00", "us3_a00", "us8_a00"].map(|name| {
+            find_export(assets, "botpack", name, "Texture")
+                .and_then(|id| cached_texture(assets, textures, id))
+        });
+        art.contact = cached_wave(
+            assets,
+            waves,
+            find_export(assets, "unrealshare", "Expl03", "Sound"),
+        );
+        let mark_class = find_export(assets, "botpack", "NuclearMark", "Class");
+        let mark = appearance(assets, classes, mark_class);
+        art.scorch = mark
+            .texture
+            .and_then(|id| cached_texture(assets, textures, id))
+            .map(|texture| {
+                (
+                    texture,
+                    mark.scale,
+                    mark.lifetime.filter(|&time| time > 0.0).unwrap_or(23.0),
+                )
+            });
         art.second_explosion = find_export(assets, "botpack", "ne_a00", "Texture")
             .and_then(|id| cached_texture(assets, textures, id));
         let class = find_export(assets, "botpack", "ShockWave", "Class");
@@ -1453,7 +1508,7 @@ fn mesh_faces(
             mesh_triangle: Some(index),
             normal,
             color,
-            flags: tri.flags,
+            flags: tri.flags | if visual.unlit { 0x0040_0000 } else { 0 },
             texture,
             lightmap: None,
             sky: false,

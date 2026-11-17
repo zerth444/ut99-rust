@@ -709,6 +709,39 @@ mod tests {
         assert!(world.regions.at(walker.position).water);
         assert!(walker.position.2 < upper - 20.0);
 
+        let mut swimmer = Walker::spawn(world, Vec3(-1160.0, -1230.0, upper - 20.0));
+        assert!(world.regions.at(swimmer.position).water);
+        let reach_ramp = Vec3(1.0, 0.0, 0.0);
+        for _ in 0..220 {
+            swimmer.advance_with_swim(
+                world,
+                reach_ramp * world.profile.ground_speed,
+                reach_ramp + up * 0.65,
+                None,
+                dt,
+            );
+            if swimmer.grounded && swimmer.position.0 > -1100.0 {
+                break;
+            }
+        }
+        assert!(
+            swimmer.grounded && swimmer.position.0 > -1100.0,
+            "{:?}",
+            swimmer.position
+        );
+        let up_ramp = Vec3(0.0, -1.0, 0.0);
+        for _ in 0..500 {
+            swimmer.advance(world, up_ramp * world.profile.ground_speed, None, dt);
+            if swimmer.grounded && swimmer.position.2 > upper + 130.0 {
+                break;
+            }
+        }
+        assert!(
+            swimmer.grounded && swimmer.position.2 > upper + 130.0,
+            "{:?}",
+            swimmer.position
+        );
+
         let mut game = crate::game::Practice::new(&map);
         let mut camera = crate::render::Camera::from_start(map.starts[0]);
         let mut cross = |position: Vec3| {

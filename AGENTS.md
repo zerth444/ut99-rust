@@ -6,3 +6,4 @@ The product is a complete Rust port of Unreal Tournament (1999) using the origin
 - Use the original game and original packages as the reference. Prefer serialized values and assets and verified original behavior over invented gameplay constants or replacement visuals. Record approximations and unsupported paths as open work.
 - A milestone is complete when its stated behavior has been checked against the original. An executable prototype or parser test alone does not establish parity.
 - Stage 3 is solo practice. Stage 4 is a complete Deathmatch with bots. Neither narrows the final scope.
+- Run interactive game checks silently as requested by the user. Use `--nosound` for the Rust client and `-nosound` for the original client.
