@@ -30,6 +30,9 @@ pub struct Settings {
     pub show_fps: bool,
     pub show_decals: bool,
     pub dodging: bool,
+    pub context_help: bool,
+    pub game_speed: u32,
+    pub view_bob: u32,
     pub gui_skin: usize,
     pub field_of_view: u32,
     pub hud_scale: u32,
@@ -50,6 +53,9 @@ impl Default for Settings {
             show_fps: false,
             show_decals: true,
             dodging: true,
+            context_help: true,
+            game_speed: 100,
+            view_bob: 4,
             gui_skin: 0,
             field_of_view: 90,
             hud_scale: 100,
@@ -86,6 +92,9 @@ impl Settings {
                 "show_fps" => settings.show_fps = value != 0,
                 "show_decals" => settings.show_decals = value != 0,
                 "dodging" => settings.dodging = value != 0,
+                "context_help" => settings.context_help = value != 0,
+                "game_speed" => settings.game_speed = value.clamp(50, 200),
+                "view_bob" => settings.view_bob = value.min(8),
                 "gui_skin" => settings.gui_skin = (value as usize).min(GUI_SKINS.len() - 1),
                 "fov" => settings.field_of_view = value.clamp(75, 120),
                 "hud_scale" => settings.hud_scale = value.clamp(50, 150),
@@ -127,7 +136,7 @@ impl Settings {
 
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let mut text = format!(
-            "fullscreen={}\nresolution={}\nvsync={}\nintro={}\nshow_fps={}\nshow_decals={}\ndodging={}\ngui_skin={}\nfov={}\nhud_scale={}\nmusic={}\neffects={}\nsensitivity={}\ninvert_mouse={}\n",
+            "fullscreen={}\nresolution={}\nvsync={}\nintro={}\nshow_fps={}\nshow_decals={}\ndodging={}\ncontext_help={}\ngame_speed={}\nview_bob={}\ngui_skin={}\nfov={}\nhud_scale={}\nmusic={}\neffects={}\nsensitivity={}\ninvert_mouse={}\n",
             u8::from(self.fullscreen),
             self.resolution,
             u8::from(self.vsync),
@@ -135,6 +144,9 @@ impl Settings {
             u8::from(self.show_fps),
             u8::from(self.show_decals),
             u8::from(self.dodging),
+            u8::from(self.context_help),
+            self.game_speed,
+            self.view_bob,
             self.gui_skin,
             self.field_of_view,
             self.hud_scale,
@@ -187,6 +199,9 @@ mod tests {
         settings.gui_skin = 2;
         settings.show_decals = false;
         settings.dodging = false;
+        settings.context_help = false;
+        settings.game_speed = 145;
+        settings.view_bob = 7;
         settings.bind(0, b'I' as u16);
         settings.bind(6, 2);
         settings.save(&path).unwrap();

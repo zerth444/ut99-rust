@@ -29,7 +29,7 @@ struct MenuArt {
     desktop: Option<[Texture; 12]>,
     skins: [SkinArt; GUI_SKINS.len()],
     checkbox: [Option<Texture>; 2],
-    click: Option<Arc<Wave>>,
+    sounds: [Option<Arc<Wave>>; 3],
     fonts: [Option<MenuFont>; FONT_SIZES.len()],
 }
 
@@ -43,6 +43,7 @@ struct SkinArt {
     panel: Option<Texture>,
     pulldown: [Option<Texture>; 9],
     highlight: Option<Texture>,
+    separator: Option<Texture>,
 }
 
 impl Frontend {
@@ -82,8 +83,8 @@ impl Frontend {
         }
     }
 
-    pub fn play_menu_sound(&self, audio: &mut crate::sound::device::Audio) {
-        if let Some(sound) = &self.art.click {
+    pub fn play_menu_sound(&self, audio: &mut crate::sound::device::Audio, sound: MenuSound) {
+        if let Some(sound) = &self.art.sounds[sound as usize] {
             audio.play(Arc::clone(sound));
         }
     }
@@ -133,6 +134,11 @@ impl MenuArt {
                 },
                 pulldown: ["TL", "T", "TR", "L", "Area", "R", "BL", "B", "BR"].map(menu),
                 highlight: menu("HM"),
+                separator: if gold {
+                    texture("MenuLine")
+                } else {
+                    menu("Line")
+                },
             }
         });
         Self {
@@ -140,9 +146,11 @@ impl MenuArt {
             skins,
             checkbox: [texture("ChkUnchecked"), texture("ChkChecked")],
             fonts: MenuFont::load_sizes(font_path),
-            click: export("LittleSelect", "Sound")
-                .and_then(|item| Wave::from_export(&package, item).ok())
-                .map(Arc::new),
+            sounds: ["LittleSelect", "WindowOpen", "WindowClose"].map(|name| {
+                export(name, "Sound")
+                    .and_then(|item| Wave::from_export(&package, item).ok())
+                    .map(Arc::new)
+            }),
         }
     }
 }
@@ -155,15 +163,45 @@ pub enum Action {
     Changed,
 }
 
+pub enum MenuSound {
+    Select,
+    Open,
+    Close,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MenuState {
+    window: bool,
+    pulldown: Option<Pulldown>,
+}
+
+impl MenuState {
+    pub fn sound_to(self, next: Self, action: Action) -> Option<MenuSound> {
+        if self.window != next.window {
+            Some(if next.window {
+                MenuSound::Open
+            } else {
+                MenuSound::Close
+            })
+        } else if self.pulldown != next.pulldown || action == Action::Changed {
+            Some(MenuSound::Select)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Menu {
     pub resume: bool,
     preferences: bool,
     tab: usize,
     selected: usize,
-    hover: Option<usize>,
+    bar_focus: usize,
+    bar_hover: Option<usize>,
     waiting: Option<usize>,
-    options_open: bool,
+    pulldown: Option<(Pulldown, usize)>,
+    quit: Option<bool>,
     choice: Option<(Choice, usize)>,
     panel_offset: [i32; 2],
     drag_offset: Option<[i32; 2]>,
@@ -253,11 +291,98 @@ const CONTROLS: [&str; 8] = [
 ];
 const INPUT: [&str; 2] = ["Mouse Sensitivity", "Invert Mouse"];
 const HUD: [&str; 1] = ["HUD Scale"];
-const GAME: [&str; 1] = ["Dodging"];
-const TOP_ITEMS: [i32; 4] = [0, 56, 112, 148];
-const OPTIONS_RECT: [i32; 4] = [56, 16, 120, 24];
+const GAME: [&str; 3] = ["Dodging", "Game Speed", "View Bob"];
+const TOP_ITEMS: [i32; 5] = [0, 56, 103, 159, 201];
+const MENU_ROW: i32 = 18;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pulldown {
+    Game,
+    Options,
+    Help,
+}
+
+impl Pulldown {
+    fn from_index(index: usize) -> Option<Self> {
+        [
+            None,
+            Some(Self::Game),
+            Some(Self::Options),
+            Some(Self::Help),
+        ][index]
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Game => 1,
+            Self::Options => 2,
+            Self::Help => 3,
+        }
+    }
+
+    fn entries(self, resume: bool) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Game if resume => &[
+                ("Return to Current Game", "Return to the current game."),
+                ("Quit", "Exit Unreal Tournament."),
+            ],
+            Self::Game => &[
+                (
+                    "Start Practice Session",
+                    "Start a practice session on Deck16][.",
+                ),
+                ("Quit", "Exit Unreal Tournament."),
+            ],
+            Self::Options => &[("Preferences", "Configure settings.")],
+            Self::Help => &[("Context Help", "Show help for the selected menu item.")],
+        }
+    }
+
+    fn rect(self, resume: bool) -> [i32; 4] {
+        let width = match self {
+            Self::Game => 190,
+            Self::Options => 120,
+            Self::Help => 132,
+        };
+        let count = self.entries(resume).len();
+        [
+            TOP_ITEMS[self.index()],
+            16,
+            width,
+            8 + self.row_offset(count - 1) + MENU_ROW,
+        ]
+    }
+
+    fn row_offset(self, index: usize) -> i32 {
+        MENU_ROW * index as i32
+            + if self == Self::Game && index > 0 {
+                6
+            } else {
+                0
+            }
+    }
+
+    fn item_at(self, [x, y]: [i32; 2], resume: bool) -> Option<usize> {
+        let [left, top, width, height] = self.rect(resume);
+        if !(left + 4..left + width - 4).contains(&x) || !(top + 4..top + height - 4).contains(&y) {
+            return None;
+        }
+        let y = y - top - 4;
+        (0..self.entries(resume).len()).find(|&index| {
+            let offset = self.row_offset(index);
+            (offset..offset + MENU_ROW).contains(&y)
+        })
+    }
+}
 
 impl Menu {
+    pub fn state(&self) -> MenuState {
+        MenuState {
+            window: self.preferences || self.quit.is_some(),
+            pulldown: self.pulldown.map(|(section, _)| section),
+        }
+    }
+
     pub fn pointer(&mut self, size: [i32; 2], x: i32, y: i32) {
         let layout = Layout::new(size, self.dpi);
         let [x, y] = layout.local(x, y);
@@ -271,7 +396,18 @@ impl Menu {
         {
             *highlight = index;
         }
-        self.hover = Self::top_item([x, y]);
+        self.bar_hover = Self::top_item([x, y]);
+        if let Some((open, item)) = &mut self.pulldown {
+            if let Some(section) = self.bar_hover.and_then(Pulldown::from_index)
+                && section != *open
+            {
+                self.bar_focus = section.index();
+                *open = section;
+                *item = 0;
+            } else if let Some(index) = open.item_at([x, y], self.resume) {
+                *item = index;
+            }
+        }
     }
 
     pub fn start_drag(&mut self, size: [i32; 2], x: i32, y: i32) -> bool {
@@ -314,20 +450,41 @@ impl Menu {
         }
     }
 
-    fn main(&mut self, index: usize) -> Action {
-        self.options_open = false;
-        match index {
-            0 => Action::Play,
-            1 => {
+    fn activate(&mut self, section: Pulldown, item: usize, settings: &mut Settings) -> Action {
+        self.pulldown = None;
+        match section {
+            Pulldown::Game if item == 0 => Action::Play,
+            Pulldown::Game => {
+                self.quit = Some(true);
+                Action::None
+            }
+            Pulldown::Options => {
                 self.preferences = true;
                 self.selected = 0;
                 Action::None
             }
-            _ => Action::Quit,
+            Pulldown::Help => {
+                settings.context_help = !settings.context_help;
+                Action::Changed
+            }
         }
     }
 
     pub fn key(&mut self, key: u16, settings: &mut Settings) -> Action {
+        if let Some(yes) = &mut self.quit {
+            match key {
+                VK_LEFT | VK_RIGHT | VK_TAB => *yes = !*yes,
+                VK_ESCAPE | 0x4e => self.quit = None,
+                VK_RETURN | VK_SPACE | 0x59 => {
+                    if key == 0x59 || *yes {
+                        return Action::Quit;
+                    }
+                    self.quit = None;
+                }
+                _ => {}
+            }
+            return Action::None;
+        }
         if let Some((choice, selected)) = &mut self.choice {
             match key {
                 VK_UP => *selected = (*selected + choice.len() - 1) % choice.len(),
@@ -357,7 +514,6 @@ impl Menu {
             match key {
                 VK_ESCAPE => {
                     self.preferences = false;
-                    self.selected = 1;
                 }
                 VK_TAB => {
                     self.tab = (self.tab + 1) % TABS.len();
@@ -378,14 +534,31 @@ impl Menu {
             }
             return Action::None;
         }
-        if self.options_open && key == VK_ESCAPE {
-            self.options_open = false;
+        if let Some((section, item)) = self.pulldown {
+            let len = section.entries(self.resume).len();
+            match key {
+                VK_ESCAPE => self.pulldown = None,
+                VK_UP => self.pulldown = Some((section, (item + len - 1) % len)),
+                VK_DOWN => self.pulldown = Some((section, (item + 1) % len)),
+                VK_RETURN | VK_SPACE => return self.activate(section, item, settings),
+                VK_LEFT | VK_RIGHT => {
+                    self.bar_focus = (self.bar_focus + if key == VK_LEFT { 3 } else { 1 }) % 4;
+                    self.pulldown = Pulldown::from_index(self.bar_focus).map(|next| (next, 0));
+                }
+                _ => {}
+            }
             return Action::None;
         }
         match key {
-            VK_LEFT | VK_UP => self.selected = (self.selected + 2) % 3,
-            VK_RIGHT | VK_DOWN | VK_TAB => self.selected = (self.selected + 1) % 3,
-            VK_RETURN | VK_SPACE => return self.main(self.selected),
+            VK_LEFT => self.bar_focus = (self.bar_focus + 3) % 4,
+            VK_RIGHT | VK_TAB => self.bar_focus = (self.bar_focus + 1) % 4,
+            VK_RETURN | VK_SPACE | VK_DOWN => {
+                if let Some(section) = Pulldown::from_index(self.bar_focus) {
+                    self.pulldown = Some((section, 0));
+                } else if key != VK_DOWN {
+                    return Action::Play;
+                }
+            }
             VK_ESCAPE if self.resume => return Action::Play,
             _ => {}
         }
@@ -408,19 +581,35 @@ impl Menu {
         }
         let ui = Layout::new(size, self.dpi);
         let [x, y] = ui.local(x, y);
+        if self.quit.is_some() {
+            let [left, top, ..] = ui.quit_rect(size);
+            if (top + 57..top + 75).contains(&y) {
+                if (left + 75..left + 125).contains(&x) {
+                    return Action::Quit;
+                }
+                if (left + 145..left + 195).contains(&x) {
+                    self.quit = None;
+                }
+            }
+            if (left + 249..left + 270).contains(&x) && (top..top + 16).contains(&y) {
+                self.quit = None;
+            }
+            return Action::None;
+        }
         if !self.preferences {
-            let was_open = std::mem::take(&mut self.options_open);
-            let [left, top, width, height] = OPTIONS_RECT;
-            if was_open && (left..left + width).contains(&x) && (top..top + height).contains(&y) {
-                return self.main(1);
+            let open = self.pulldown.take().map(|(section, _)| section);
+            if let Some(section) = open
+                && let Some(item) = section.item_at([x, y], self.resume)
+            {
+                return self.activate(section, item, settings);
             }
             if let Some(index) = Self::top_item([x, y]) {
-                self.selected = index;
-                if index == 1 {
-                    self.options_open = !was_open;
-                    return Action::None;
+                self.bar_focus = index;
+                if let Some(section) = Pulldown::from_index(index) {
+                    self.pulldown = (open != Some(section)).then_some((section, 0));
+                } else {
+                    return Action::Play;
                 }
-                return self.main(self.selected);
             }
         } else {
             let [left, top] = ui.panel_position(size, self.panel_offset);
@@ -436,7 +625,6 @@ impl Menu {
                 || ((316..332).contains(&y) && (368..416).contains(&x))
             {
                 self.preferences = false;
-                self.selected = 1;
                 return Action::None;
             }
             let y = y - 16;
@@ -459,6 +647,10 @@ impl Menu {
                             (1, 0) => Some((&mut settings.music_volume, amount)),
                             (1, 1) => Some((&mut settings.effects_volume, amount)),
                             (3, 0) => Some((&mut settings.sensitivity, 10 + amount * 240 / 100)),
+                            (5, 1) => {
+                                Some((&mut settings.game_speed, 50 + (amount * 30 + 50) / 100 * 5))
+                            }
+                            (5, 2) => Some((&mut settings.view_bob, (amount * 8 + 50) / 100)),
                             _ => None,
                         };
                         if let Some((value, amount)) = slider {
@@ -505,6 +697,8 @@ impl Menu {
             (3, 1) => settings.invert_mouse = !settings.invert_mouse,
             (4, 0) => adjust(&mut settings.hud_scale, 10, 50, 150),
             (5, 0) => settings.dodging = !settings.dodging,
+            (5, 1) => adjust(&mut settings.game_speed, 5, 50, 200),
+            (5, 2) => adjust(&mut settings.view_bob, 1, 0, 8),
             _ => return Action::None,
         }
         Action::Changed
@@ -569,16 +763,22 @@ impl Menu {
         }
         for (index, label) in [
             if self.resume { "Resume" } else { "Play" },
+            "Game",
             "Options",
-            "Exit",
+            "Help",
         ]
         .into_iter()
         .enumerate()
         {
             let x = TOP_ITEMS[index];
             let item_width = TOP_ITEMS[index + 1] - x;
-            if (self.selected == index || self.hover == Some(index)) && !self.preferences {
-                let pressed = index == 1 && self.options_open;
+            if (self.bar_focus == index || self.bar_hover == Some(index))
+                && !self.preferences
+                && self.quit.is_none()
+            {
+                let pressed = self
+                    .pulldown
+                    .is_some_and(|(section, _)| section.index() == index);
                 let parts = &art.bar_item[usize::from(!pressed)];
                 for (texture, (left, width)) in
                     parts
@@ -599,8 +799,8 @@ impl Menu {
             label(frame, (width - 160) / 2, 65, "UNREAL TOURNAMENT");
         }
         if !self.preferences {
-            if self.options_open {
-                let [x, y, w, h] = OPTIONS_RECT;
+            if let Some((section, selected)) = self.pulldown {
+                let [x, y, w, h] = section.rect(self.resume);
                 let columns = [(x, 4), (x + 4, w - 8), (x + w - 4, 4)];
                 let rows = [(y, 4), (y + 4, h - 8), (y + h - 4, 4)];
                 for (row, (top, height)) in rows.into_iter().enumerate() {
@@ -613,9 +813,36 @@ impl Menu {
                         );
                     }
                 }
-                label(frame, x + 10, y + 5, "Preferences");
+                if section == Pulldown::Game {
+                    ui.tile(
+                        frame,
+                        art.separator.as_ref(),
+                        [x + 4, y + 4 + MENU_ROW + 2, w - 8, 2],
+                        [0.31, 0.40, 0.56],
+                    );
+                }
+                for (index, &(caption, _)) in section.entries(self.resume).iter().enumerate() {
+                    let row = y + 4 + section.row_offset(index);
+                    if index == selected {
+                        ui.tile(
+                            frame,
+                            art.highlight.as_ref(),
+                            [x + 4, row, w - 8, MENU_ROW],
+                            [0.31, 0.46, 0.63],
+                        );
+                    }
+                    if section == Pulldown::Help {
+                        ui.tile(
+                            frame,
+                            resources.checkbox[usize::from(settings.context_help)].as_ref(),
+                            [x + 7, row + 3, 12, 12],
+                            [0.84; 3],
+                        );
+                    }
+                    label(frame, x + 23, row + 1, caption);
+                }
             }
-            if let Some(index) = self.hover {
+            if settings.context_help {
                 let bottom = (frame.height as f32 / ui.scale) as i32 - 16;
                 ui.tile(
                     frame,
@@ -623,49 +850,42 @@ impl Menu {
                     [0, bottom, width, 16],
                     [0.24, 0.27, 0.31],
                 );
-                label(
-                    frame,
-                    7,
-                    bottom + 1,
+                let help = if let Some((open, selected)) = self.pulldown {
+                    open.entries(self.resume)[selected].1
+                } else {
                     [
                         if self.resume {
-                            "Return to the match."
+                            "Return to the current game."
                         } else {
                             "Start a practice session on Deck16][."
                         },
-                        "Change video, audio and controls.",
-                        "Exit Unreal Tournament.",
-                    ][index],
-                );
+                        "Start a game or quit.",
+                        "Configure settings.",
+                        "Enable or disable help.",
+                    ][self.bar_hover.unwrap_or(self.bar_focus)]
+                };
+                label(frame, 7, bottom + 1, help);
+            }
+            if let Some(yes) = self.quit {
+                let rect = ui.quit_rect(size);
+                let [x, y, ..] = rect;
+                ui.window(frame, art, rect);
+                label(frame, x + 5, y + 1, "Confirm Quit");
+                label(frame, x + 38, y + 31, "Are you sure you want to Quit?");
+                for (index, caption) in ["Yes", "No"].into_iter().enumerate() {
+                    let left = x + 75 + index as i32 * 70;
+                    ui.button(frame, art, [left, y + 57, 50, 18]);
+                    let selected = yes == (index == 0);
+                    if selected {
+                        ui.solid_outline(frame, [left + 3, y + 59, 44, 14]);
+                    }
+                    label(frame, left + 15, y + 58, caption);
+                }
             }
             return;
         }
         let [x, y] = ui.panel_position(size, self.panel_offset);
-        ui.tile(frame, None, [x, y, 420, 338], [0.62, 0.64, 0.75]);
-        ui.tile(
-            frame,
-            art.panel.as_ref(),
-            [x + 2, y + 16, 416, 319],
-            [0.18, 0.20, 0.22],
-        );
-        if let Some(texture) = &art.window {
-            for (rect, source) in [
-                ([x, y, 2, 16], [0.0, 0.0, 2.0, 16.0]),
-                ([x + 2, y, 416, 16], [32.0, 0.0, 1.0, 16.0]),
-                ([x + 418, y, 2, 16], [126.0, 0.0, 2.0, 16.0]),
-                ([x + 406, y + 3, 11, 11], [4.0, 32.0, 11.0, 11.0]),
-                ([x, y + 16, 2, 319], [0.0, 32.0, 2.0, 1.0]),
-                ([x + 418, y + 16, 2, 319], [126.0, 32.0, 2.0, 1.0]),
-                ([x, y + 335, 420, 3], [32.0, 125.0, 1.0, 3.0]),
-            ] {
-                frame.tile(
-                    texture.image(0.0),
-                    rect.map(|value| (value as f32 * ui.scale).round() as i32),
-                    source,
-                    [1.0; 3],
-                );
-            }
-        }
+        ui.window(frame, art, [x, y, 420, 338]);
         label(frame, x + 5, y + 1, "Preferences");
         let y = y + 16;
         for (index, label) in TABS.into_iter().enumerate() {
@@ -736,7 +956,11 @@ impl Menu {
                 enabled(settings.invert_mouse),
             ],
             4 => vec![format!("{}%", settings.hud_scale)],
-            _ => vec![enabled(settings.dodging)],
+            _ => vec![
+                enabled(settings.dodging),
+                format!("{}%", settings.game_speed),
+                settings.view_bob.to_string(),
+            ],
         };
         for (index, (caption, value)) in self.rows().iter().zip(values).enumerate() {
             let row_y = y + row_y(index);
@@ -775,9 +999,14 @@ impl Menu {
                 (1, 0) => Some(settings.music_volume as f32 / 100.0),
                 (1, 1) => Some(settings.effects_volume as f32 / 100.0),
                 (3, 0) => Some((settings.sensitivity - 10) as f32 / 240.0),
+                (5, 1) => Some((settings.game_speed - 50) as f32 / 150.0),
+                (5, 2) => Some(settings.view_bob as f32 / 8.0),
                 _ => None,
             };
             if let Some(fraction) = slider {
+                if self.tab == 5 {
+                    label(frame, x + 201, row_y + 4, &value);
+                }
                 ui.tile(
                     frame,
                     None,
@@ -825,16 +1054,7 @@ impl Menu {
             }
             ui.label(frame, font, menu_font, x + 314, row_y + 4, &value);
         }
-        if let Some(button) = &art.button {
-            ui.segment(
-                frame,
-                button,
-                [x + 368, y + 300, 48, 16],
-                [0.0, 0.0, 48.0, 16.0],
-            );
-        } else {
-            ui.tile(frame, None, [x + 368, y + 300, 48, 16], [0.71, 0.75, 0.86]);
-        }
+        ui.button(frame, art, [x + 368, y + 300, 48, 16]);
         label(frame, x + 376, y + 301, "Close");
         if !self.status.is_empty() {
             label(frame, x + 12, y + 301, &self.status);
@@ -896,6 +1116,53 @@ impl Layout {
             (self.panel[0] + x).clamp(0, (width - 420).max(0)),
             (self.panel[1] + y).clamp(16, (height - 338).max(16)),
         ]
+    }
+
+    fn quit_rect(&self, [width, height]: [i32; 2]) -> [i32; 4] {
+        let [width, height] = self.local(width, height);
+        [width / 2 - 135, height / 2 - 42, 270, 84]
+    }
+
+    fn window(&self, frame: &mut Frame, art: &SkinArt, [x, y, w, h]: [i32; 4]) {
+        self.tile(frame, None, [x, y, w, h], [0.62, 0.64, 0.75]);
+        self.tile(
+            frame,
+            art.panel.as_ref(),
+            [x + 2, y + 16, w - 4, h - 19],
+            [0.62, 0.64, 0.75],
+        );
+        if let Some(texture) = &art.window {
+            for (rect, source) in [
+                ([x, y, 2, 16], [0.0, 0.0, 2.0, 16.0]),
+                ([x + 2, y, w - 4, 16], [32.0, 0.0, 1.0, 16.0]),
+                ([x + w - 2, y, 2, 16], [126.0, 0.0, 2.0, 16.0]),
+                ([x + w - 14, y + 3, 11, 11], [4.0, 32.0, 11.0, 11.0]),
+                ([x, y + 16, 2, h - 19], [0.0, 32.0, 2.0, 1.0]),
+                ([x + w - 2, y + 16, 2, h - 19], [126.0, 32.0, 2.0, 1.0]),
+                ([x, y + h - 3, w, 3], [32.0, 125.0, 1.0, 3.0]),
+            ] {
+                self.segment(frame, texture, rect, source);
+            }
+        }
+    }
+
+    fn button(&self, frame: &mut Frame, art: &SkinArt, rect: [i32; 4]) {
+        if let Some(button) = &art.button {
+            self.segment(frame, button, rect, [0.0, 0.0, 48.0, 16.0]);
+        } else {
+            self.tile(frame, None, rect, [0.71, 0.75, 0.86]);
+        }
+    }
+
+    fn solid_outline(&self, frame: &mut Frame, [x, y, w, h]: [i32; 4]) {
+        for rect in [
+            [x, y, w, 1],
+            [x, y + h - 1, w, 1],
+            [x, y + 1, 1, h - 2],
+            [x + w - 1, y + 1, 1, h - 2],
+        ] {
+            self.tile(frame, None, rect, [0.16, 0.21, 0.30]);
+        }
     }
 
     fn tile(&self, frame: &mut Frame, texture: Option<&Texture>, rect: [i32; 4], color: [f32; 3]) {
@@ -972,6 +1239,8 @@ mod tests {
         let mut menu = Menu::default();
         assert!(menu.key(VK_RETURN, &mut settings) == Action::Play);
         menu.key(VK_RIGHT, &mut settings);
+        menu.key(VK_RIGHT, &mut settings);
+        menu.key(VK_RETURN, &mut settings);
         menu.key(VK_RETURN, &mut settings);
         assert!(menu.preferences);
         menu.key(VK_TAB, &mut settings);
@@ -984,9 +1253,9 @@ mod tests {
         menu.key(VK_ESCAPE, &mut settings);
         assert!(!menu.preferences);
         let size = [900, 600];
-        menu.click(size, 104, 8, VK_LBUTTON, &mut settings);
-        assert!(menu.options_open);
-        menu.click(size, 104, 25, VK_LBUTTON, &mut settings);
+        menu.click(size, 125, 8, VK_LBUTTON, &mut settings);
+        assert!(matches!(menu.pulldown, Some((Pulldown::Options, 0))));
+        menu.click(size, 125, 25, VK_LBUTTON, &mut settings);
         assert!(menu.preferences);
         let [x, y] = Layout::new(size, menu.dpi).panel;
         menu.click(size, x + 90, y + 22, VK_LBUTTON, &mut settings);
@@ -995,8 +1264,8 @@ mod tests {
         menu.click(size, x + 380, y + 321, VK_LBUTTON, &mut settings);
         assert!(!menu.preferences);
         menu.tab = 0;
-        menu.click(size, 104, 8, VK_LBUTTON, &mut settings);
-        menu.click(size, 104, 25, VK_LBUTTON, &mut settings);
+        menu.click(size, 125, 8, VK_LBUTTON, &mut settings);
+        menu.click(size, 125, 25, VK_LBUTTON, &mut settings);
         let combo_x = x + CHOICE_LEFT + 10;
         let resolution_y = y + 16 + row_y(1);
         let settings_before = settings.resolution;
@@ -1020,8 +1289,51 @@ mod tests {
         menu.key(VK_DOWN, &mut settings);
         assert!(menu.key(VK_RETURN, &mut settings) == Action::Changed);
         assert_eq!(settings.gui_skin, 1);
+        menu.click(size, x + 350, y + 22, VK_LBUTTON, &mut settings);
+        assert!(
+            menu.click(
+                size,
+                x + 408,
+                y + 16 + row_y(1) + 8,
+                VK_LBUTTON,
+                &mut settings
+            ) == Action::Changed
+        );
+        assert_eq!(settings.game_speed, 200);
+        assert!(menu.key(VK_LEFT, &mut settings) == Action::Changed);
+        assert_eq!(settings.game_speed, 195);
+        assert!(
+            menu.click(
+                size,
+                x + 279,
+                y + 16 + row_y(2) + 8,
+                VK_LBUTTON,
+                &mut settings
+            ) == Action::Changed
+        );
+        assert_eq!(settings.view_bob, 0);
         menu.key(VK_ESCAPE, &mut settings);
         assert!(menu.click([900, 600], 40, 13, VK_LBUTTON, &mut settings) == Action::Play);
+
+        menu.click(size, 70, 8, VK_LBUTTON, &mut settings);
+        assert!(menu.click(size, 72, 25, VK_LBUTTON, &mut settings) == Action::Play);
+        menu.click(size, 70, 8, VK_LBUTTON, &mut settings);
+        menu.key(VK_DOWN, &mut settings);
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::None);
+        assert_eq!(menu.quit, Some(true));
+        menu.key(VK_ESCAPE, &mut settings);
+        assert!(menu.quit.is_none());
+        menu.click(size, 70, 8, VK_LBUTTON, &mut settings);
+        menu.click(size, 72, 48, VK_LBUTTON, &mut settings);
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::Quit);
+
+        menu.quit = None;
+        menu.click(size, 180, 8, VK_LBUTTON, &mut settings);
+        assert!(menu.click(size, 180, 25, VK_LBUTTON, &mut settings) == Action::Changed);
+        assert!(!settings.context_help);
+        menu.resume = true;
+        menu.click(size, 70, 8, VK_LBUTTON, &mut settings);
+        assert!(menu.click(size, 72, 25, VK_LBUTTON, &mut settings) == Action::Play);
     }
 
     #[test]
@@ -1065,7 +1377,7 @@ mod tests {
                 .all(|skin| skin.bar.is_some() && skin.panel.is_some())
         );
         assert!(front.has_desktop() && front.art.fonts[0].is_some());
-        assert!(front.art.click.is_some());
+        assert!(front.art.sounds.iter().all(Option::is_some));
         let mut heard = 0;
         let mut moved = false;
         let mut saw_smoke = false;

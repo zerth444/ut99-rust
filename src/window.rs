@@ -342,7 +342,8 @@ unsafe fn message_loop(
             }
 
             let now = Instant::now();
-            let dt = (now - tick).as_secs_f32().min(0.06);
+            let input_dt = (now - tick).as_secs_f32().min(0.06);
+            let dt = input_dt * settings.game_speed as f32 / 100.0;
             tick = now;
             game.base_fov = settings.field_of_view as f32;
             game.hud_scale = settings.hud_scale as f32 / 100.0;
@@ -375,7 +376,7 @@ unsafe fn message_loop(
                     camera.pitch +=
                         y as f32 * sensitivity * if settings.invert_mouse { 1.0 } else { -1.0 };
                 }
-                update_view(&mut camera, dt);
+                update_view(&mut camera, input_dt);
                 let movement =
                     camera.forward() * axis(forward, back) + camera.right() * axis(right, left);
                 if guiding {
@@ -439,7 +440,9 @@ unsafe fn message_loop(
             jump = false;
             dodge = None;
             if !fly {
-                camera.position = walker.eye(map.collision.profile, camera.right());
+                let mut profile = map.collision.profile;
+                profile.bob = 0.004 * settings.view_bob as f32;
+                camera.position = walker.eye(profile, camera.right());
             }
             if let Some(speed) = movement_audio.landing {
                 game.fall_damage(speed, game.jump_speed(map.collision.profile.jump_speed));
@@ -556,7 +559,7 @@ unsafe fn message_loop(
                 };
                 frame.width = size.0 as usize;
                 frame.height = size.1 as usize;
-                frame.draw_practice(map, &camera, (now - started).as_secs_f32(), &game);
+                frame.draw_practice(map, &camera, game.time, &game);
                 let track = map
                     .music
                     .as_ref()
@@ -659,6 +662,7 @@ fn run_frontend(
                     return Ok(false);
                 }
                 if message.hwnd == window {
+                    let previous_menu = menu.state();
                     if intro.is_none() {
                         match message.message {
                             WM_LBUTTONDOWN => {
@@ -710,6 +714,11 @@ fn run_frontend(
                     } else {
                         Action::None
                     };
+                    if let Some(sound) = previous_menu.sound_to(menu.state(), action)
+                        && let Some(audio) = audio
+                    {
+                        frontend.play_menu_sound(audio, sound);
+                    }
                     match action {
                         Action::Play => return Ok(true),
                         Action::Quit => {
@@ -730,9 +739,6 @@ fn run_frontend(
                             if let Err(error) = settings.save(settings_path) {
                                 eprintln!("{}: {error}", settings_path.display());
                                 menu.status = "COULD NOT SAVE SETTINGS".into();
-                            }
-                            if let Some(audio) = audio {
-                                frontend.play_menu_sound(audio);
                             }
                         }
                         Action::None => {}
