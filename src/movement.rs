@@ -152,6 +152,51 @@ pub struct Regions {
 }
 
 impl Regions {
+    pub fn water_crossings(&self, start: Vec3, delta: Vec3) -> Vec<(f32, bool)> {
+        let mut crossings = Vec::new();
+        let mut water = self.at(start).water;
+        let mut stack = vec![(0_i32, -1_i32, 0.0_f32, 1.0_f32)];
+        let mut visited = 0;
+        while let Some((child, zone, from, to)) = stack.pop() {
+            visited += 1;
+            if visited > self.nodes.len().saturating_mul(2) + 1 {
+                break;
+            }
+            let Some(node) = usize::try_from(child)
+                .ok()
+                .and_then(|index| self.nodes.get(index))
+            else {
+                let wet = usize::try_from(zone)
+                    .ok()
+                    .and_then(|index| self.zones.get(index))
+                    .unwrap_or(&self.level)
+                    .water;
+                if wet != water {
+                    crossings.push((from, wet));
+                    water = wet;
+                }
+                continue;
+            };
+            let origin = start.dot(node.plane.normal) - node.plane.distance;
+            let along = delta.dot(node.plane.normal);
+            let split = -origin / along;
+            if split > from && split < to {
+                let near = usize::from(along < 0.0);
+                let far = 1 - near;
+                stack.push((node.children[far], node.zones[far], split, to));
+                stack.push((node.children[near], node.zones[near], from, split));
+            } else {
+                let side = usize::from(origin + along * ((from + to) * 0.5) >= 0.0);
+                stack.push((node.children[side], node.zones[side], from, to));
+            }
+        }
+        let end_water = self.at(start + delta).water;
+        if end_water != water {
+            crossings.push((1.0, end_water));
+        }
+        crossings
+    }
+
     pub fn at(&self, position: Vec3) -> Zone {
         let mut index = 0;
         for _ in 0..self.nodes.len() {
@@ -170,5 +215,65 @@ impl Regions {
             }
         }
         self.level
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn water_crossings_find_a_thin_zone_even_with_both_ends_in_air() {
+        let regions = Regions {
+            nodes: vec![
+                RegionNode {
+                    plane: Plane {
+                        normal: Vec3(1.0, 0.0, 0.0),
+                        distance: 5.0,
+                    },
+                    children: [-1, 1],
+                    zones: [0, -1],
+                },
+                RegionNode {
+                    plane: Plane {
+                        normal: Vec3(1.0, 0.0, 0.0),
+                        distance: 6.0,
+                    },
+                    children: [-1, -1],
+                    zones: [1, 0],
+                },
+            ],
+            zones: vec![
+                Zone::default(),
+                Zone {
+                    water: true,
+                    ..Zone::default()
+                },
+            ],
+            level: Zone::default(),
+        };
+        let hits = regions.water_crossings(Vec3::default(), Vec3(20.0, 0.0, 0.0));
+        assert_eq!(hits.len(), 2);
+        assert!((hits[0].0 - 0.25).abs() < 0.00001 && hits[0].1);
+        assert!((hits[1].0 - 0.30).abs() < 0.00001 && !hits[1].1);
+        let hits = regions.water_crossings(Vec3(20.0, 0.0, 0.0), Vec3(-20.0, 0.0, 0.0));
+        assert_eq!(hits.len(), 2);
+        assert!((hits[0].0 - 0.70).abs() < 0.00001 && hits[0].1);
+        assert!((hits[1].0 - 0.75).abs() < 0.00001 && !hits[1].1);
+        assert!(
+            regions
+                .water_crossings(Vec3(5.5, 0.0, 0.0), Vec3::default())
+                .is_empty()
+        );
+        let boundary = regions.water_crossings(Vec3(5.0, 0.0, 0.0), Vec3(-1.0, 0.0, 0.0));
+        assert_eq!(boundary, vec![(0.0, false)]);
+        assert_eq!(
+            regions.water_crossings(Vec3::default(), Vec3(5.0, 0.0, 0.0)),
+            vec![(1.0, true)]
+        );
+        assert_eq!(
+            regions.water_crossings(Vec3(5.5, 0.0, 0.0), Vec3(0.5, 0.0, 0.0)),
+            vec![(1.0, false)]
+        );
     }
 }

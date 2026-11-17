@@ -89,6 +89,8 @@ pub struct Art {
     pub scorch: Option<(Arc<Texture>, f32, f32)>,
     pub collision_radius: f32,
     pub collision_height: f32,
+    pub water: Motion,
+    pub water_lifetime: f32,
 }
 
 pub type Arsenal = [Art; Kind::ALL.len()];
@@ -102,6 +104,8 @@ pub enum Visual<'a> {
 pub struct Shots {
     projectiles: Vec<Projectile>,
     effects: Vec<Effect>,
+    ripples: Vec<Ripple>,
+    self_hits: Vec<(u16, Vec3)>,
     marks: Vec<(Kind, Vec3, Vec3, Option<usize>)>,
     pub guided_roll: f32,
 }
@@ -120,6 +124,15 @@ struct Projectile {
     next_trail: f32,
     wall_hits: u8,
     seeking: Option<(Vec3, f32)>,
+    hit_water: bool,
+    spray: Option<(u8, Vec3)>,
+}
+
+struct Ripple {
+    kind: Kind,
+    position: Vec3,
+    born: f32,
+    scale: f32,
 }
 
 struct Effect {
@@ -134,6 +147,10 @@ struct Effect {
 }
 
 impl Shots {
+    pub(super) fn take_self_hits(&mut self) -> Vec<(u16, Vec3)> {
+        std::mem::take(&mut self.self_hits)
+    }
+
     pub(super) fn follow_movers(&mut self, movers: &[crate::mover::Mover]) {
         for shot in &mut self.projectiles {
             if let Some((index, local)) = shot.base
@@ -517,14 +534,21 @@ impl Shots {
         let lift = match kind {
             Kind::Grenade => 210.0,
             Kind::FlakShell => 200.0,
-            Kind::Gel | Kind::Glob => 120.0,
+            Kind::Gel | Kind::Glob | Kind::Splash => 120.0,
             _ => 0.0,
         };
         let mut shot = Projectile {
             kind,
             direction,
             position: camera.position + offset,
-            velocity: direction * speed + Vec3(0.0, 0.0, lift),
+            velocity: direction
+                * (speed
+                    + if kind == Kind::Grenade {
+                        variation * 100.0
+                    } else {
+                        0.0
+                    })
+                + Vec3(0.0, 0.0, lift),
             born: time,
             expires: time
                 + match kind {
@@ -541,7 +565,22 @@ impl Shots {
             next_trail: time + if kind.warhead() { 0.3 } else { 0.0 },
             wall_hits: 0,
             seeking: None,
+            hit_water: false,
+            spray: None,
         };
+        if map.collision.regions.at(shot.position).water {
+            let factor = match kind {
+                Kind::Rocket | Kind::Grenade => 0.6,
+                Kind::Chunk => 0.65,
+                Kind::Gel | Kind::Glob | Kind::Splash => 0.7,
+                _ => 1.0,
+            };
+            shot.velocity = shot.velocity * factor;
+            shot.hit_water = matches!(
+                kind,
+                Kind::Rocket | Kind::Grenade | Kind::Razor | Kind::RazorAlt
+            );
+        }
         if let Some((point, normal)) = map.collision.ray_surface(camera.position, offset) {
             shot.position = point + normal * 0.5;
             if art.scorch.is_some() {
@@ -584,6 +623,9 @@ impl Shots {
     ) {
         self.effects
             .retain(|effect| time - effect.born < effect.duration);
+        self.ripples.retain(|ripple| {
+            time - ripple.born < map.ordnance[ripple.kind as usize].water_lifetime
+        });
         self.follow_movers(&map.movers);
         for effect in self.effects.iter().filter(|effect| {
             effect.nuclear && time >= effect.born + 0.5 && time - dt < effect.born + 0.5
@@ -600,19 +642,34 @@ impl Shots {
                     || shot.stuck.is_some()
                     || kind.bio()
                 {
-                    blasts.extend(explode(shot, art, &mut self.effects, sounds, time));
+                    let mut source = *shot;
+                    if kind == Kind::Grenade {
+                        source.position = source.position + Vec3(0.0, 0.0, 16.0);
+                    }
+                    blasts.extend(explode(&source, art, &mut self.effects, sounds, time));
                 }
                 return false;
             }
             if shot.stuck.is_some() {
-                if kind.bio()
-                    && player.is_some_and(|center| {
-                        let d = center - shot.position;
-                        d.0.hypot(d.1) < crate::collision::PLAYER_RADIUS + 7.0 * shot.scale
-                            && d.2.abs() < 43.0
-                            && map.collision.ray(shot.position, d).is_none()
-                    })
-                {
+                spawn_splashes(shot, map, time, &mut fragments);
+                let touched = player.is_some_and(|center| {
+                    super::shock::cylinder_hit(
+                        shot.position - center,
+                        Vec3::default(),
+                        crate::collision::PLAYER_RADIUS + art.collision_radius,
+                        crate::collision::PLAYER_HEIGHT + art.collision_height,
+                    )
+                    .is_some()
+                        && map
+                            .collision
+                            .ray(shot.position, center - shot.position)
+                            .is_none()
+                });
+                if touched && kind == Kind::Grenade {
+                    blasts.extend(explode(shot, art, &mut self.effects, sounds, time));
+                    return false;
+                }
+                if kind.bio() && touched {
                     let delay = 0.1 + 0.2 * ((shot.born * 997.0).sin() * 0.5 + 0.5);
                     shot.expires = shot.expires.min(time + delay);
                     return true;
@@ -685,7 +742,7 @@ impl Shots {
                                 });
                             }
                         }
-                    } else {
+                    } else if !map.collision.regions.at(shot.position).water {
                         shot.next_trail = time + 0.035;
                         self.effects.push(Effect {
                             kind,
@@ -714,31 +771,58 @@ impl Shots {
                 art.collision_height,
             );
             let visible_delta = wall.map_or(delta, |(point, _, _)| point - shot.position);
+            let owner_armed = match kind {
+                Kind::Grenade | Kind::Chunk => shot.wall_hits > 0,
+                Kind::Razor => shot.wall_hits > 0 || time - shot.born >= 0.2,
+                Kind::Gel | Kind::Glob | Kind::Splash => shot.hit_water,
+                _ => false,
+            };
+            let owner = player.filter(|_| owner_armed).and_then(|center| {
+                super::shock::cylinder_hit(
+                    shot.position - center,
+                    visible_delta,
+                    crate::collision::PLAYER_RADIUS + art.collision_radius,
+                    crate::collision::PLAYER_HEIGHT + art.collision_height,
+                )
+                .map(|fraction| (center, fraction))
+            });
+            if let Some((center, fraction)) = owner
+                && target
+                    .as_deref()
+                    .and_then(|target| target.ray(shot.position, visible_delta))
+                    .is_none_or(|target| fraction < target)
+            {
+                water_crossing(shot, map, visible_delta * fraction, time, &mut self.ripples);
+                shot.position = shot.position + visible_delta * fraction;
+                let blast = explode(shot, art, &mut self.effects, sounds, time);
+                if blast.is_none() {
+                    self.self_hits.push(projectile_damage(shot, art, center));
+                }
+                blasts.extend(blast);
+                return false;
+            }
             if let Some(target) = target.as_deref_mut()
                 && let Some(fraction) = target.ray(shot.position, visible_delta)
             {
+                water_crossing(shot, map, visible_delta * fraction, time, &mut self.ripples);
                 shot.position = shot.position + visible_delta * fraction;
                 let offset = unit(shot.position - target.position) * 16.0;
                 let blast = explode_at(shot, art, &mut self.effects, sounds, time, offset);
                 if blast.is_none() {
-                    let damage = match kind {
-                        Kind::Pulse => 20,
-                        Kind::Razor => 30,
-                        Kind::Chunk => 16,
-                        _ => 0,
-                    };
-                    target.damage(art.damage.map_or(damage, |damage| damage as u16));
+                    target.damage(projectile_damage(shot, art, target.position).0);
                 }
                 blasts.extend(blast);
                 return false;
             }
             let Some((point, normal, hull)) = wall else {
+                water_crossing(shot, map, delta, time, &mut self.ripples);
                 shot.position = shot.position + delta;
                 if shot.velocity.dot(shot.velocity) > 1.0 {
                     shot.direction = unit(shot.velocity);
                 }
                 return true;
             };
+            water_crossing(shot, map, point - shot.position, time, &mut self.ripples);
             shot.position = point + normal * 0.5;
             shot.wall_hits += 1;
             if kind == Kind::Grenade {
@@ -751,7 +835,7 @@ impl Shots {
                 } else {
                     velocity
                 };
-                if normal.2 > 0.7 && shot.velocity.dot(shot.velocity) < 900.0 {
+                if shot.velocity.dot(shot.velocity) < 400.0 {
                     shot.velocity = Vec3::default();
                     shot.stuck = Some(time);
                 }
@@ -774,33 +858,12 @@ impl Shots {
             } else if kind.bio() {
                 if kind == Kind::Glob {
                     let draw_scale = shot.scale * 2.0;
-                    let (right, up) = super::shock::axes(normal);
                     let count = if draw_scale > 1.0 {
-                        (draw_scale * 2.0) as usize - 1
+                        (draw_scale * 2.0) as u8 - 1
                     } else {
                         0
                     };
-                    for index in 0..count {
-                        let angle = index as f32 * 2.399963;
-                        let direction =
-                            unit(normal + (right * angle.cos() + up * angle.sin()) * 0.75);
-                        fragments.push(Projectile {
-                            kind: Kind::Splash,
-                            position: shot.position + direction * 5.0,
-                            direction,
-                            velocity: direction
-                                * map.ordnance[Kind::Splash as usize].speed.unwrap_or(300.0)
-                                + Vec3(0.0, 0.0, 120.0),
-                            born: time,
-                            expires: time + 12.0,
-                            scale: 0.55,
-                            stuck: None,
-                            base: None,
-                            next_trail: time,
-                            wall_hits: 0,
-                            seeking: None,
-                        });
-                    }
+                    shot.spray = Some((count, shot.position + normal * 5.0));
                     shot.scale = shot.scale.min(1.5);
                 }
                 shot.direction = normal;
@@ -812,6 +875,7 @@ impl Shots {
                     .find(|(_, mover)| mover.collision_hull() == Some(hull))
                     .map(|(index, mover)| (index, shot.position - mover.offset));
                 shot.expires = time + 3.8;
+                spawn_splashes(shot, map, time, &mut fragments);
                 if art.scorch.is_some() {
                     let contact = map.collision.ray(point, normal * -8.0).unwrap_or(point);
                     self.marks
@@ -839,6 +903,8 @@ impl Shots {
                             next_trail: time,
                             wall_hits: 0,
                             seeking: None,
+                            hit_water: false,
+                            spray: None,
                         });
                     }
                 }
@@ -865,6 +931,25 @@ impl Shots {
     }
 
     pub fn visuals<'a>(&self, assets: &'a Arsenal, time: f32, mut draw: impl FnMut(Visual<'a>)) {
+        for ripple in &self.ripples {
+            let art = &assets[ripple.kind as usize];
+            let age = time - ripple.born;
+            let elapsed = age.min((art.water.duration() - 0.001).max(0.0));
+            if let Some(pose) = art.water.sample(elapsed) {
+                let direction = if matches!(ripple.kind, Kind::Razor | Kind::RazorAlt) {
+                    Vec3(1.0, 0.0, 0.0)
+                } else {
+                    Vec3(0.0, 0.0, 1.0)
+                };
+                draw(Visual::Mesh(
+                    ripple.position,
+                    direction,
+                    pose,
+                    ripple.scale,
+                    Some((1.0 - age / art.water_lifetime).clamp(0.0, 1.0)),
+                ));
+            }
+        }
         for shot in &self.projectiles {
             let art = &assets[shot.kind as usize];
             if shot.kind == Kind::Pulse {
@@ -1000,6 +1085,119 @@ impl Shots {
     }
 }
 
+fn projectile_damage(shot: &Projectile, art: &Art, center: Vec3) -> (u16, Vec3) {
+    if shot.kind == Kind::Chunk && shot.velocity.dot(shot.velocity) <= 200.0 * 200.0 {
+        return (0, Vec3::default());
+    }
+    let damage = art.damage.unwrap_or(match shot.kind {
+        Kind::Pulse => 20.0,
+        Kind::Razor => 30.0,
+        Kind::Chunk => 16.0,
+        _ => 0.0,
+    });
+    let damage = if shot.kind == Kind::Razor
+        && shot.position.2 - center.2 > 0.62 * crate::collision::PLAYER_HEIGHT
+    {
+        damage * 3.5
+    } else {
+        damage
+    };
+    (
+        damage as u16,
+        unit(shot.velocity) * art.momentum.unwrap_or(10_000.0),
+    )
+}
+
+fn water_crossing(
+    shot: &mut Projectile,
+    map: &Map,
+    delta: Vec3,
+    time: f32,
+    ripples: &mut Vec<Ripple>,
+) {
+    for (fraction, wet) in map.collision.regions.water_crossings(shot.position, delta) {
+        let mut scale = None;
+        if shot.kind.warhead() {
+            scale = Some(0.2);
+        } else if wet {
+            let factor = match shot.kind {
+                Kind::Rocket | Kind::Grenade | Kind::Razor | Kind::RazorAlt if !shot.hit_water => {
+                    scale = Some(if matches!(shot.kind, Kind::Razor | Kind::RazorAlt) {
+                        0.5
+                    } else {
+                        0.2
+                    });
+                    0.6
+                }
+                Kind::Chunk => 0.65,
+                Kind::Gel | Kind::Glob | Kind::Splash => {
+                    if !shot.hit_water {
+                        scale = Some(0.1);
+                    }
+                    0.1
+                }
+                _ => 1.0,
+            };
+            shot.velocity = shot.velocity * factor;
+        }
+        if wet {
+            shot.hit_water = true;
+        }
+        if let Some(scale) = scale {
+            ripples.push(Ripple {
+                kind: shot.kind,
+                position: shot.position + delta * fraction,
+                born: time,
+                scale,
+            });
+        }
+    }
+}
+
+fn spawn_splashes(shot: &mut Projectile, map: &Map, time: f32, fragments: &mut Vec<Projectile>) {
+    let Some((left, origin)) = &mut shot.spray else {
+        return;
+    };
+    for _ in 0..(*left).min(2) {
+        *left -= 1;
+        let seed = shot
+            .born
+            .to_bits()
+            .wrapping_add(u32::from(*left))
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223);
+        let z = 2.0 * (seed >> 8) as f32 / 16_777_216.0 - 1.0;
+        let angle = seed.wrapping_mul(22_695_477) as f32 / u32::MAX as f32 * std::f32::consts::TAU;
+        let radius = (1.0 - z * z).max(0.0).sqrt();
+        let position = *origin + Vec3(radius * angle.cos(), radius * angle.sin(), z) * 4.0;
+        let direction = unit(position - shot.position);
+        let mut velocity = direction * map.ordnance[Kind::Splash as usize].speed.unwrap_or(300.0)
+            + Vec3(0.0, 0.0, 120.0);
+        if map.collision.regions.at(position).water {
+            velocity = velocity * 0.7;
+        }
+        fragments.push(Projectile {
+            kind: Kind::Splash,
+            position,
+            direction,
+            velocity,
+            born: time,
+            expires: time + 3.1 + 0.2 * (seed >> 8) as f32 / 16_777_216.0,
+            scale: 1.0,
+            stuck: None,
+            base: None,
+            next_trail: time,
+            wall_hits: 0,
+            seeking: None,
+            hit_water: false,
+            spray: None,
+        });
+    }
+    if *left == 0 {
+        shot.spray = None;
+    }
+}
+
 fn shoot_down(
     shot: &Projectile,
     art: &Art,
@@ -1113,6 +1311,304 @@ fn wave_hit(map: &Map, origin: Vec3, center: Vec3, age: f32) -> Option<(u16, Vec
 mod tests {
     use super::*;
     use crate::{collision::Collision, package::Package};
+
+    #[test]
+    #[ignore = "requires the local GOTY game packages"]
+    fn stock_projectiles_slow_in_water_and_use_original_ripples() {
+        use crate::{
+            collision::Plane,
+            movement::{RegionNode, Zone},
+        };
+        let path = std::path::Path::new("local/goty/Maps/DM-Deck16][.unr");
+        let bytes = std::fs::read(path).unwrap();
+        let mut map = Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap();
+        map.collision = Collision::read(&[], std::iter::empty(), &[]).unwrap();
+        map.collision.regions.nodes = vec![RegionNode {
+            plane: Plane {
+                normal: Vec3(1.0, 0.0, 0.0),
+                distance: 50.0,
+            },
+            children: [-1, -1],
+            zones: [0, 1],
+        }];
+        map.collision.regions.zones = vec![
+            Zone::default(),
+            Zone {
+                water: true,
+                ..Zone::default()
+            },
+        ];
+        let camera = Camera {
+            position: Vec3(0.0, 0.0, 65.0),
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        for (kind, factor) in [
+            (Kind::Rocket, 0.6),
+            (Kind::Grenade, 0.6),
+            (Kind::Razor, 0.6),
+            (Kind::RazorAlt, 0.6),
+            (Kind::Chunk, 0.65),
+            (Kind::Gel, 0.1),
+            (Kind::Glob, 0.1),
+            (Kind::Splash, 0.1),
+            (Kind::Warhead, 1.0),
+        ] {
+            let mut shots = Shots::default();
+            let mut sounds = Vec::new();
+            let mut blasts = Vec::new();
+            shots.fire(
+                &map,
+                &camera,
+                kind,
+                camera.forward(),
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                &mut sounds,
+            );
+            let before = shots.projectiles[0].velocity;
+            shots.update(&map, None, 0.2, 0.2, &mut sounds, &mut blasts);
+            let shot = &shots.projectiles[0];
+            assert!(shot.position.0 > 50.0 && shot.hit_water, "{}", kind.class());
+            let expected = if matches!(kind, Kind::Rocket | Kind::Warhead) {
+                (before.dot(before).sqrt() + 10.0) * factor
+            } else if matches!(kind, Kind::Grenade) || kind.bio() {
+                let velocity = before + Vec3(0.0, 0.0, -190.0);
+                velocity.dot(velocity).sqrt() * factor
+            } else {
+                before.dot(before).sqrt() * factor
+            };
+            assert!(
+                (shot.velocity.dot(shot.velocity).sqrt() - expected).abs() < 0.01,
+                "{}",
+                kind.class()
+            );
+            if kind != Kind::Chunk {
+                let art = &map.ordnance[kind as usize];
+                assert!(!art.water.frames.is_empty(), "{}", kind.class());
+                assert!(
+                    art.water
+                        .frames
+                        .iter()
+                        .all(|frame| frame.iter().all(|face| face.texture.is_some()))
+                );
+                assert!(art.water_lifetime > 0.0);
+                assert_eq!(shots.ripples.len(), 1);
+                assert!((shots.ripples[0].position.0 - 50.0).abs() < 0.001);
+            }
+            let underwater = Camera {
+                position: Vec3(150.0, 0.0, 65.0),
+                ..camera
+            };
+            let mut wet = Shots::default();
+            wet.fire(
+                &map,
+                &underwater,
+                kind,
+                camera.forward(),
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                &mut sounds,
+            );
+            let initial_factor = match kind {
+                Kind::Rocket | Kind::Grenade => 0.6,
+                Kind::Chunk => 0.65,
+                Kind::Gel | Kind::Glob | Kind::Splash => 0.7,
+                _ => 1.0,
+            };
+            let error = wet.projectiles[0].velocity - before * initial_factor;
+            assert!(error.dot(error) < 0.001);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the local GOTY game packages"]
+    fn charged_bio_emits_two_full_size_splashes_per_tick() {
+        let path = std::path::Path::new("local/goty/Maps/DM-Deck16][.unr");
+        let bytes = std::fs::read(path).unwrap();
+        let mut map = Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap();
+        map.collision = Collision::read(&[], std::iter::empty(), &[]).unwrap();
+        map.collision
+            .add_box(Vec3(190.0, -500.0, -500.0), Vec3(220.0, 500.0, 500.0));
+        let camera = Camera {
+            position: Vec3(0.0, 0.0, 65.0),
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        let mut shots = Shots::default();
+        let mut sounds = Vec::new();
+        let mut blasts = Vec::new();
+        shots.fire(
+            &map,
+            &camera,
+            Kind::Glob,
+            camera.forward(),
+            0.0,
+            2.14,
+            0.0,
+            0.0,
+            &mut sounds,
+        );
+        let mut tick = 0;
+        while shots.projectiles[0].stuck.is_none() {
+            tick += 1;
+            shots.update(
+                &map,
+                None,
+                tick as f32 / 240.0,
+                1.0 / 240.0,
+                &mut sounds,
+                &mut blasts,
+            );
+            assert!(tick < 240);
+        }
+        assert_eq!(shots.projectiles[0].scale, 1.5);
+        for expected in [2, 4, 6, 7] {
+            assert_eq!(
+                shots
+                    .projectiles
+                    .iter()
+                    .filter(|shot| shot.kind == Kind::Splash)
+                    .count(),
+                expected
+            );
+            for splash in shots
+                .projectiles
+                .iter()
+                .filter(|shot| shot.kind == Kind::Splash)
+            {
+                assert_eq!(splash.scale, 1.0);
+                assert!((3.0999..=3.3001).contains(&(splash.expires - splash.born)));
+            }
+            tick += 1;
+            shots.update(
+                &map,
+                None,
+                tick as f32 / 240.0,
+                1.0 / 240.0,
+                &mut sounds,
+                &mut blasts,
+            );
+        }
+        assert!(shots.projectiles[0].spray.is_none());
+        assert!(blasts.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires the local GOTY game packages"]
+    fn ricochets_and_armed_grenades_can_hit_the_player() {
+        use super::super::{Input, Practice};
+        let path = std::path::Path::new("local/goty/Maps/DM-Deck16][.unr");
+        let bytes = std::fs::read(path).unwrap();
+        let mut map = Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap();
+        map.collision = Collision::read(&[], std::iter::empty(), &[]).unwrap();
+        let camera = Camera {
+            position: Vec3(0.0, 0.0, 27.0),
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        let mut sounds = Vec::new();
+        for armed in [false, true] {
+            let mut shots = Shots::default();
+            let mut blasts = Vec::new();
+            shots.fire(
+                &map,
+                &camera,
+                Kind::Grenade,
+                camera.forward(),
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                &mut sounds,
+            );
+            let shot = &mut shots.projectiles[0];
+            shot.position = Vec3::default();
+            shot.velocity = Vec3::default();
+            shot.wall_hits = u8::from(armed);
+            shots.update(
+                &map,
+                Some(Vec3::default()),
+                0.1,
+                0.01,
+                &mut sounds,
+                &mut blasts,
+            );
+            assert_eq!(shots.projectiles.is_empty(), armed);
+            assert_eq!(blasts.len(), usize::from(armed));
+        }
+        let mut practice = Practice::new(&map);
+        practice.time = 0.2;
+        practice.ordnance.fire(
+            &map,
+            &camera,
+            Kind::Razor,
+            camera.forward(),
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            &mut sounds,
+        );
+        let shot = &mut practice.ordnance.projectiles[0];
+        shot.position = Vec3::default();
+        shot.velocity = Vec3(500.0, 0.0, 0.0);
+        let mut player = crate::collision::Walker::spawn(&map.collision, Vec3::default());
+        practice.update(
+            &mut map,
+            &camera,
+            0.01,
+            Input {
+                primary: false,
+                alternate: false,
+                slot: None,
+                cycle: 0,
+            },
+            false,
+            Some(&mut player),
+        );
+        assert_eq!(practice.health, 70);
+        assert!(practice.ordnance.projectiles.is_empty());
+        assert!(practice.ordnance.take_self_hits().is_empty());
+        for (height, expected) in [(0.0, 170), (30.0, 95)] {
+            let mut shots = Shots::default();
+            let mut blasts = Vec::new();
+            let mut target = TrainingTarget {
+                position: Vec3(100.0, 0.0, 0.0),
+                yaw: 0.0,
+                health: 200,
+                outgoing_scale: 1,
+            };
+            shots.fire(
+                &map,
+                &camera,
+                Kind::Razor,
+                camera.forward(),
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                &mut sounds,
+            );
+            shots.projectiles[0].position = Vec3(90.0, 0.0, height);
+            shots.projectiles[0].velocity = Vec3(500.0, 0.0, 0.0);
+            shots.update_with_target(
+                &map,
+                None,
+                Some(&mut target),
+                0.1,
+                0.01,
+                &mut sounds,
+                &mut blasts,
+            );
+            assert_eq!(target.health, expected);
+            assert!(shots.projectiles.is_empty());
+        }
+    }
 
     #[test]
     #[ignore = "requires the local GOTY game packages"]

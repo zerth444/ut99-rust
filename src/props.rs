@@ -1107,6 +1107,50 @@ fn projectile_art(
         art.trail = find_export(assets, "botpack", "JRFlare", "Texture")
             .and_then(|id| cached_texture(assets, textures, id));
     }
+    if matches!(
+        kind,
+        Kind::Rocket
+            | Kind::Grenade
+            | Kind::Gel
+            | Kind::Glob
+            | Kind::Splash
+            | Kind::Razor
+            | Kind::RazorAlt
+            | Kind::Warhead
+            | Kind::GuidedWarhead
+    ) {
+        let splash = matches!(kind, Kind::Razor | Kind::RazorAlt);
+        let class = find_export(
+            assets,
+            "unrealshare",
+            if splash { "Splash" } else { "WaterRing" },
+            "Class",
+        );
+        let mut visual = appearance(assets, classes, class);
+        visual.scale = 1.0;
+        if let Some(object) = visual.mesh {
+            let (package, export) = assets.object(object);
+            if let Ok(mesh) = Mesh::read(package, export) {
+                art.water = effect_motion(
+                    assets,
+                    textures,
+                    object,
+                    visual,
+                    &mesh,
+                    &[if splash { "Burst" } else { "Explosion" }],
+                );
+                art.water.rate *= if splash { 2.0 } else { 0.25 };
+                art.water_lifetime = if splash {
+                    art.water.duration()
+                } else {
+                    visual
+                        .lifetime
+                        .filter(|&time| time > 0.0)
+                        .unwrap_or(art.water.duration())
+                };
+            }
+        }
+    }
     if matches!(kind, Kind::Warhead | Kind::GuidedWarhead) {
         art.collision_radius = visual.collision_radius.unwrap_or(15.0);
         art.collision_height = visual.collision_height.unwrap_or(8.0);

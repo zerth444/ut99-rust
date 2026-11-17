@@ -1248,8 +1248,13 @@ impl Practice {
                 target.damage(damage);
             }
         }
+        let self_hits = self.ordnance.take_self_hits();
         if let Some(player) = player {
             self.update_liquid(map, player.position, camera.position, &mut sounds);
+            for (damage, momentum) in self_hits {
+                player.apply_self_damage_momentum(momentum, map.collision.profile);
+                self.splash_damage(damage.saturating_mul(damage_scale));
+            }
             if let Some((damage, momentum)) = hammer_hit {
                 player.apply_self_damage_momentum(momentum, map.collision.profile);
                 self.splash_damage(damage.saturating_mul(damage_scale));
