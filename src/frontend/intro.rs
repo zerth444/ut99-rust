@@ -232,10 +232,12 @@ impl Intro {
             for mover in &mut self.map.movers {
                 mover.scene_event(event);
             }
+            self.map.smoke.trigger(event, self.time);
         }
         for mover in &mut self.map.movers {
             mover.tick_scene(dt);
         }
+        self.map.smoke.tick(self.time, &self.map.movers);
         Some((shot, voices))
     }
 

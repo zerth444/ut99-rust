@@ -1,5 +1,6 @@
 mod font;
 mod intro;
+pub(crate) mod smoke;
 
 use std::{fs, io, path::Path, sync::Arc};
 
@@ -813,14 +814,38 @@ mod tests {
         assert!(front.art.click.is_some());
         let mut heard = 0;
         let mut moved = false;
+        let mut saw_smoke = false;
+        let mut saw_moving_flare = false;
+        let initial_flare = intro
+            .map
+            .smoke
+            .sprites(0.0, &intro.map.movers, &intro.map.ballistics.smoke)
+            .find(|sprite| sprite.3 == 1.0)
+            .expect("CityIntro car flare")
+            .0;
         let first = intro.shot().unwrap().camera.position;
         while let Some((shot, voices)) = intro.update(0.025) {
             assert!(intro.time < 240.0);
             heard += voices.len();
             let delta = shot.camera.position - first;
             moved |= delta.dot(delta) > 10_000.0;
+            let sprites =
+                intro
+                    .map
+                    .smoke
+                    .sprites(intro.time, &intro.map.movers, &intro.map.ballistics.smoke);
+            for (position, _, _, glow) in sprites {
+                if glow < 1.0 {
+                    saw_smoke = true;
+                } else {
+                    let delta = position - initial_flare;
+                    saw_moving_flare |= delta.dot(delta) > 1.0;
+                    break;
+                }
+            }
         }
         assert!(intro.time > 45.0);
+        assert!(saw_smoke && saw_moving_flare);
         assert!(moved && heard > 0);
         assert!(intro.map.props.iter().any(|prop| {
             prop.cinematic

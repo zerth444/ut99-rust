@@ -255,6 +255,12 @@ impl Frame {
         }
         self.layer(Layer::Effects);
         let view = self.camera_view(camera);
+        #[cfg(windows)]
+        for (position, image, scale, glow) in
+            map.smoke.sprites(time, &map.movers, &map.ballistics.smoke)
+        {
+            self.world_sprite(&view, position, image, scale, glow);
+        }
         for corona in &map.coronas {
             let world = map
                 .movers

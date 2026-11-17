@@ -72,6 +72,8 @@ pub struct Start {
 pub struct Map {
     pub scene_lights: Vec<crate::light::Light>,
     pub coronas: Vec<crate::light::Corona>,
+    #[cfg(windows)]
+    pub(crate) smoke: crate::frontend::smoke::Smoke,
     pub faces: Vec<Face>,
     pub starts: Vec<Start>,
     pub collision: Collision,
@@ -184,6 +186,11 @@ impl Map {
                 .is_some_and(|stem| stem.eq_ignore_ascii_case("CityIntro"))
         });
         Ok(Self {
+            #[cfg(windows)]
+            smoke: city_intro
+                .map(|path| crate::frontend::smoke::Smoke::load(package, path, &movers))
+                .transpose()?
+                .unwrap_or_default(),
             coronas: city_intro
                 .map(|path| crate::light::read_coronas(package, path))
                 .transpose()?
