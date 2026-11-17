@@ -258,6 +258,7 @@ pub struct MotionEvents {
 pub struct Walker {
     pub position: Vec3,
     pub grounded: bool,
+    pub air_control_override: Option<f32>,
     velocity: Vec3,
     bob_time: f32,
     landing_bob: f32,
@@ -276,6 +277,7 @@ impl Walker {
         Self {
             position: floor.map_or(position, |distance| raised - UP * distance),
             grounded: floor.is_some(),
+            air_control_override: None,
             velocity: Vec3::default(),
             bob_time: 0.0,
             landing_bob: 0.0,
@@ -444,7 +446,8 @@ impl Walker {
                     0.0
                 };
                 let retained = (1.0 - fluid * step).max(0.0);
-                let control = heading * (0.75 * profile.air_control * profile.acceleration * step);
+                let air_control = self.air_control_override.unwrap_or(profile.air_control);
+                let control = heading * (0.75 * air_control * profile.acceleration * step);
                 horizontal = horizontal * retained
                     + control
                     + Vec3(zone.gravity.0, zone.gravity.1, 0.0) * step;

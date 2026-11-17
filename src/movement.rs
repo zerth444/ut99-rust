@@ -47,6 +47,7 @@ pub struct PlayerAudio {
     pub jump: Option<Arc<Wave>>,
     pub land: Option<Arc<Wave>>,
     pub water_step: Option<Arc<Wave>>,
+    pub gasp: [Option<Arc<Wave>>; 2],
     pub pain: [Option<Arc<Wave>>; 4],
     pub death: [Option<Arc<Wave>>; 3],
 }
@@ -61,6 +62,7 @@ pub struct Zone {
     pub water: bool,
     pub pain: bool,
     pub damage_per_second: i32,
+    pub liquid_audio: Option<usize>,
 }
 
 impl Default for Zone {
@@ -74,12 +76,14 @@ impl Default for Zone {
             water: false,
             pain: false,
             damage_per_second: 0,
+            liquid_audio: None,
         }
     }
 }
 
 impl Zone {
-    pub fn apply(&mut self, mut props: Properties<'_, '_>) -> io::Result<()> {
+    pub fn apply(&mut self, mut props: Properties<'_, '_>) -> io::Result<[Option<i32>; 2]> {
+        let mut sounds = [None; 2];
         while let Some(prop) = props.next_tag()? {
             let mut value = prop.value;
             match prop.name {
@@ -91,18 +95,20 @@ impl Zone {
                 "bWaterZone" => self.water = prop.boolean.unwrap_or(self.water),
                 "bPainZone" => self.pain = prop.boolean.unwrap_or(self.pain),
                 "DamagePerSec" => self.damage_per_second = value.u32()? as i32,
+                "EntrySound" => sounds[0] = Some(value.compact()?),
+                "ExitSound" => sounds[1] = Some(value.compact()?),
                 _ => {}
             }
         }
-        Ok(())
+        Ok(sounds)
     }
 }
 
-pub fn load_zones(
-    package: &Package<'_>,
+pub fn load_zones<'p, 'a>(
+    package: &'p Package<'a>,
     actors: &[i32],
     level: Zone,
-    mut defaults: impl FnMut(&Export, Zone) -> Zone,
+    mut load: impl FnMut(&Export, Zone, Properties<'p, 'a>) -> io::Result<Zone>,
 ) -> io::Result<Vec<Zone>> {
     actors
         .iter()
@@ -114,9 +120,7 @@ pub fn load_zones(
             else {
                 return Ok(level);
             };
-            let mut zone = defaults(actor, level);
-            zone.apply(package.properties(actor)?)?;
-            Ok(zone)
+            load(actor, level, package.properties(actor)?)
         })
         .collect()
 }

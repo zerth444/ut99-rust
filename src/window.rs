@@ -350,6 +350,7 @@ unsafe fn message_loop(
             game.show_decals = settings.show_decals;
             let [forward, back, left, right, jump_key, walk, fire, alt_fire] = settings.bindings;
             let mut movement_audio = MotionEvents::default();
+            let mut boot_jump = false;
             let focused = GetForegroundWindow() == window;
             let guiding = game.ordnance.guided_view().is_some();
             if guiding && pilot_view.is_none() {
@@ -409,6 +410,7 @@ unsafe fn message_loop(
                     let swim = camera.look_direction() * axis(forward, back)
                         + camera.right() * (0.5 * axis(right, left))
                         + Vec3(0.0, 0.0, f32::from(key(jump_key) || key(VK_CONTROL)) * 0.5);
+                    walker.air_control_override = game.has_jump_boots().then_some(1.0);
                     movement_audio = walker.advance_with_swim(
                         &map.collision,
                         movement * (speed / movement.dot(movement).sqrt().max(1.0)),
@@ -416,6 +418,7 @@ unsafe fn message_loop(
                         jump.then(|| game.jump_speed(map.collision.profile.jump_speed)),
                         dt,
                     );
+                    boot_jump = movement_audio.jump && !key(walk) && game.used_boot_jump();
                     movement_audio.jump |= dodged;
                     if let Some((position, yaw)) = crate::teleport::touched(
                         &map.teleporters,
@@ -445,7 +448,7 @@ unsafe fn message_loop(
                 camera.position = walker.eye(profile, camera.right());
             }
             if let Some(speed) = movement_audio.landing {
-                game.fall_damage(speed, game.jump_speed(map.collision.profile.jump_speed));
+                game.landed(speed, map.collision.profile.jump_speed);
             }
             let shots = game.update(
                 map,
@@ -480,7 +483,12 @@ unsafe fn message_loop(
                     audio.play(sound);
                 }
                 if movement_audio.jump
-                    && let Some(sound) = &map.player_audio.jump
+                    && let Some(sound) = map
+                        .powerups
+                        .boots_jump
+                        .as_ref()
+                        .filter(|_| boot_jump)
+                        .or(map.player_audio.jump.as_ref())
                 {
                     audio.play(std::sync::Arc::clone(sound));
                 }

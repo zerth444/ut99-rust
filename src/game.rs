@@ -80,6 +80,23 @@ impl Weapon {
         }
     }
 
+    fn switch_priority(self) -> u8 {
+        // PlayerPawn.WeaponPriority lists these from lowest to highest.
+        match self {
+            Self::Hammer => 2,
+            Self::Enforcer => 3,
+            Self::Shock => 5,
+            Self::Bio => 6,
+            Self::Pulse => 7,
+            Self::Sniper => 8,
+            Self::Ripper => 9,
+            Self::Minigun => 10,
+            Self::Flak => 11,
+            Self::Rocket => 12,
+            Self::Redeemer => 13,
+        }
+    }
+
     fn initial(self) -> u16 {
         match self {
             Self::Hammer => 0,
@@ -237,7 +254,7 @@ pub enum Item {
     Ammo(Weapon, u16),
     Health(u16, u16),
     Armor(ArmorKind),
-    Power(&'static str),
+    Power(Powerup, u16),
 }
 
 impl Item {
@@ -264,12 +281,30 @@ impl Item {
             "armor2" => Self::Armor(ArmorKind::Chest),
             "thighpads" => Self::Armor(ArmorKind::Thigh),
             "ut_shieldbelt" => Self::Armor(ArmorKind::Belt),
-            "udamage" => Self::Power("DAMAGE AMPLIFIER"),
-            "ut_jumpboots" => Self::Power("JUMP BOOTS"),
-            "ut_invisibility" | "invisibility" => Self::Power("INVISIBILITY"),
+            "udamage" => Self::Power(Powerup::Damage, 300),
+            "ut_jumpboots" => Self::Power(Powerup::Boots, 3),
+            "ut_invisibility" => Self::Power(Powerup::Invisibility, 100),
             _ => return None,
         })
     }
+}
+
+#[derive(Clone, Copy)]
+pub enum Powerup {
+    Boots,
+    Damage,
+    Invisibility,
+}
+
+#[derive(Default)]
+pub struct PowerupArt {
+    pub boots_on: Option<Arc<Wave>>,
+    pub boots_jump: Option<Arc<Wave>>,
+    pub amp_fire: [Option<Arc<Wave>>; 2],
+    pub amp_out: Option<Arc<Wave>>,
+    pub amp_skin: Option<Arc<crate::texture::Texture>>,
+    pub invis_skin: Option<Arc<crate::texture::Texture>>,
+    pub shield_hit: Option<Arc<Wave>>,
 }
 
 #[derive(Clone, Copy)]
@@ -333,6 +368,7 @@ pub struct TrainingTarget {
     pub position: Vec3,
     pub yaw: f32,
     pub health: u16,
+    outgoing_scale: u16,
 }
 
 impl TrainingTarget {
@@ -349,7 +385,9 @@ impl TrainingTarget {
     }
 
     fn damage(&mut self, damage: u16) {
-        self.health = self.health.saturating_sub(damage);
+        self.health = self
+            .health
+            .saturating_sub(damage.saturating_mul(self.outgoing_scale));
     }
 }
 
@@ -407,10 +445,14 @@ pub struct Practice {
     pub message: String,
     pub message_until: f32,
     pub shots: u32,
-    pub jump_boost: f32,
+    pub boot_charges: u16,
+    boots_in_flight: bool,
+    amp_until: f32,
+    amp_warning: f32,
+    invis_until: f32,
     owned: [bool; 11],
     ammo: [u16; 11],
-    respawn: Vec<f32>,
+    respawn: Vec<Option<f32>>,
     pub shock: shock::Shots,
     pub pulse_beam: Option<PulseBeam>,
     pub pulse_primary_since: Option<f32>,
@@ -424,9 +466,13 @@ pub struct Practice {
     charge: Option<Charge>,
     hit_taken: u16,
     pub hit_flash_until: f32,
+    pub shield_flash_until: f32,
+    shield_hit_pending: bool,
     last_pain: f32,
     zone_pain_at: Option<f32>,
     drown_at: Option<f32>,
+    last_foot_zone: Option<crate::movement::Zone>,
+    splash_at: f32,
     hammer_since: Option<f32>,
     was_guiding: bool,
     guide_trigger_held: bool,
@@ -463,10 +509,14 @@ impl Practice {
             message: String::new(),
             message_until: 0.0,
             shots: 0,
-            jump_boost: 0.0,
+            boot_charges: 0,
+            boots_in_flight: false,
+            amp_until: 0.0,
+            amp_warning: 0.0,
+            invis_until: 0.0,
             owned: [false; 11],
             ammo: [0; 11],
-            respawn: vec![0.0; map.props.len()],
+            respawn: vec![None; map.props.len()],
             shock: shock::Shots::default(),
             pulse_beam: None,
             pulse_primary_since: None,
@@ -480,9 +530,13 @@ impl Practice {
             charge: None,
             hit_taken: 0,
             hit_flash_until: 0.0,
+            shield_flash_until: 0.0,
+            shield_hit_pending: false,
             last_pain: -1.0,
             zone_pain_at: None,
             drown_at: None,
+            last_foot_zone: None,
+            splash_at: f32::NEG_INFINITY,
             hammer_since: None,
             was_guiding: false,
             guide_trigger_held: false,
@@ -507,7 +561,9 @@ impl Practice {
         self.health = 100;
         self.armor.fill(0);
         self.weapon = Weapon::Enforcer;
-        self.jump_boost = 0.0;
+        self.clear_powerups();
+        self.last_foot_zone = None;
+        self.splash_at = f32::NEG_INFINITY;
         self.owned.fill(false);
         self.ammo.fill(0);
         self.owned[Weapon::Hammer as usize] = true;
@@ -530,6 +586,8 @@ impl Practice {
         self.charge = None;
         self.hit_taken = 0;
         self.hit_flash_until = self.time;
+        self.shield_flash_until = self.time;
+        self.shield_hit_pending = false;
         self.last_pain = self.time - 1.0;
         self.zone_pain_at = None;
         self.drown_at = None;
@@ -648,6 +706,14 @@ impl Practice {
         }
     }
 
+    fn switch_priority(&self, weapon: Weapon) -> u8 {
+        if weapon == Weapon::Hammer || self.ammo[weapon.ammo_pool()] > 0 {
+            weapon.switch_priority()
+        } else {
+            0
+        }
+    }
+
     fn update_weapon(&mut self, arsenal: &HashMap<Weapon, WeaponAssets>) -> Option<Arc<Wave>> {
         let mut sound = None;
         if let WeaponState::Lowering { target, since } = self.weapon_state {
@@ -715,6 +781,7 @@ impl Practice {
                     position: floor + Vec3(0.0, 0.0, 39.2),
                     yaw: camera.yaw + std::f32::consts::PI,
                     health: 100,
+                    outgoing_scale: self.damage_scale(),
                 });
                 self.owned.fill(true);
                 for weapon in Weapon::ALL {
@@ -788,11 +855,52 @@ impl Practice {
     }
 
     pub fn jump_speed(&self, base: f32) -> f32 {
-        if self.jump_boost > self.time {
-            510.0
+        if self.boot_charges != 0 {
+            base * 3.0
         } else {
             base
         }
+    }
+
+    pub fn damage_amp_active(&self) -> bool {
+        self.time < self.amp_until
+    }
+
+    pub fn has_jump_boots(&self) -> bool {
+        self.boot_charges > 0 || self.boots_in_flight
+    }
+
+    pub fn landed(&mut self, speed: f32, base_jump: f32) {
+        let jump_speed = if self.has_jump_boots() {
+            base_jump * 3.0
+        } else {
+            base_jump
+        };
+        self.fall_damage(speed, jump_speed);
+        self.boots_in_flight = false;
+    }
+
+    pub fn invisible(&self) -> bool {
+        self.time < self.invis_until
+    }
+
+    fn damage_scale(&self) -> u16 {
+        if self.damage_amp_active() { 3 } else { 1 }
+    }
+
+    fn clear_powerups(&mut self) {
+        self.boot_charges = 0;
+        self.boots_in_flight = false;
+        self.amp_until = 0.0;
+        self.amp_warning = 0.0;
+        self.invis_until = 0.0;
+    }
+
+    pub fn used_boot_jump(&mut self) -> bool {
+        let had_charge = self.boot_charges != 0;
+        self.boot_charges = self.boot_charges.saturating_sub(1);
+        self.boots_in_flight |= had_charge;
+        had_charge
     }
 
     pub fn fall_damage(&mut self, speed: f32, jump_speed: f32) {
@@ -803,15 +911,13 @@ impl Practice {
         } else {
             return;
         };
-        self.health = self.health.saturating_sub(damage);
-        self.hit_taken = self.hit_taken.saturating_add(damage);
-        self.hit_flash_until = self.time + 0.20;
-        self.notice(format!("FALL DAMAGE -{damage}"));
+        self.splash_damage(damage);
     }
 
     pub fn begin_death(&mut self, position: Vec3, yaw: f32, map: &Map) -> Option<Arc<Wave>> {
         let choice = ((self.jitter() + 1.0) * 1.5) as usize % 3;
         self.score = self.score.saturating_sub(1);
+        self.clear_powerups();
         self.death = Some(Death {
             position,
             yaw,
@@ -832,6 +938,11 @@ impl Practice {
 
     pub fn pain_sound(&mut self, map: &Map) -> Option<Arc<Wave>> {
         let damage = std::mem::take(&mut self.hit_taken);
+        if std::mem::take(&mut self.shield_hit_pending)
+            && let Some(sound) = &map.powerups.shield_hit
+        {
+            return Some(sound.clone());
+        }
         if damage == 0 || self.health == 0 || self.time - self.last_pain < 0.3 {
             return None;
         }
@@ -857,17 +968,13 @@ impl Practice {
             Item::Gun(weapon) => {
                 let index = weapon.ammo_pool();
                 let was_owned = self.owned[weapon as usize];
-                let add = if was_owned {
-                    initial_ammo(arsenal, weapon).div_ceil(2)
-                } else {
-                    initial_ammo(arsenal, weapon)
-                };
-                if was_owned && self.ammo[index] >= max_ammo(arsenal, weapon) {
-                    return false;
-                }
+                let was_empty = self.ammo[index] == 0;
+                let add = initial_ammo(arsenal, weapon);
                 self.owned[weapon as usize] = true;
                 self.ammo[index] = (self.ammo[index] + add).min(max_ammo(arsenal, weapon));
-                if !was_owned {
+                if (!was_owned || was_empty)
+                    && self.switch_priority(weapon) > self.switch_priority(self.pending_weapon())
+                {
                     self.request_weapon(weapon);
                 }
                 weapon.label().to_owned()
@@ -905,11 +1012,18 @@ impl Practice {
                 self.armor[kind as usize] = charge;
                 format!("ARMOR +{}", charge - current)
             }
-            Item::Power(label) => {
-                if label == "JUMP BOOTS" {
-                    self.jump_boost = self.time + 30.0;
-                }
-                label.to_owned()
+            Item::Power(Powerup::Boots, charge) => {
+                self.boot_charges = self.boot_charges.max(charge);
+                "ANTIGRAV BOOTS".into()
+            }
+            Item::Power(Powerup::Damage, charge) => {
+                self.amp_until = self.time + f32::from(charge) * 0.1;
+                self.amp_warning = (self.amp_until - 5.0).max(self.time);
+                "DAMAGE AMPLIFIER".into()
+            }
+            Item::Power(Powerup::Invisibility, charge) => {
+                self.invis_until = self.time + (f32::from(charge) + 1.0) * 0.5;
+                "INVISIBILITY".into()
             }
         };
         self.notice(message);
@@ -929,31 +1043,49 @@ impl Practice {
         self.effects.retain(|effect| effect.expires > self.time);
         self.decals.update(self.time);
         let mut sounds = Vec::new();
+        if self.damage_amp_active() && self.time >= self.amp_warning {
+            self.amp_warning += 1.0;
+            sounds.extend(map.powerups.amp_out.iter().cloned());
+        }
         self.ballistics
             .update(map, self.target.as_ref(), self.time, dt, &mut sounds);
+        let pickup_center = player.as_deref().map_or(
+            camera.position - Vec3(0.0, 0.0, map.collision.profile.eye_height),
+            |walker| walker.position,
+        );
         for index in 0..map.props.len() {
             let prop = &mut map.props[index];
-            if !prop.visible && self.time >= self.respawn[index] {
+            if self.respawn[index].is_some_and(|time| self.time >= time) {
                 prop.visible = true;
+                self.respawn[index] = None;
             }
             let Some(item) = prop.item else { continue };
-            let offset = prop.position - camera.position;
+            let offset = prop.position - pickup_center;
             let horizontal = offset.0 * offset.0 + offset.1 * offset.1;
+            let radius = prop.pickup_radius + crate::collision::PLAYER_RADIUS;
             if collect
                 && self.health > 0
                 && prop.visible
-                && horizontal < 45.0 * 45.0
-                && (offset.2 + 23.0).abs() < 55.0
+                && horizontal <= radius * radius
+                && offset.2.abs() <= prop.pickup_height + crate::collision::PLAYER_HEIGHT
                 && self.pickup(item, &map.arsenal)
             {
                 prop.visible = false;
                 self.pickup_time = self.time;
-                self.respawn[index] = self.time + prop.respawn_time.unwrap_or(25.0);
+                self.respawn[index] = Some(self.time + prop.respawn_time.unwrap_or(25.0));
                 if let Some(sound) = &prop.pickup_sound {
                     sounds.push(Arc::clone(sound));
                 }
+                if matches!(item, Item::Power(Powerup::Boots, _)) {
+                    sounds.extend(map.powerups.boots_on.iter().cloned());
+                }
             }
         }
+        let damage_scale = self.damage_scale();
+        if let Some(target) = &mut self.target {
+            target.outgoing_scale = damage_scale;
+        }
+        let shots_before = self.shots;
         if let Some(slot) = input.slot {
             let choices: Vec<_> = self
                 .owned()
@@ -981,6 +1113,18 @@ impl Practice {
         }
         sounds.extend(self.update_weapon(&map.arsenal));
         let guiding = self.ordnance.guided_view().is_some();
+        if self.health > 0
+            && !guiding
+            && self.charge.is_none()
+            && matches!(self.weapon_state, WeaponState::Ready)
+            && self.time >= self.next_shot
+            && self.switch_priority(self.weapon) == 0
+            && let Some(replacement) = self
+                .owned()
+                .max_by_key(|&weapon| self.switch_priority(weapon))
+        {
+            self.request_weapon(replacement);
+        }
         let ready = self.health > 0 && !guiding && matches!(self.weapon_state, WeaponState::Ready);
         let minigun = ready
             && self.weapon == Weapon::Minigun
@@ -1074,6 +1218,10 @@ impl Practice {
             blasts.extend(self.fire(map, camera, !primary_shot && alternate_shot, &mut sounds));
         }
         self.was_guiding = self.ordnance.guided_view().is_some();
+        if self.shots != shots_before && damage_scale > 1 {
+            let warning = usize::from(self.amp_until - self.time < 5.0);
+            sounds.extend(map.powerups.amp_fire[warning].iter().cloned());
+        }
         if let Some(target) = &mut self.target {
             for blast in &blasts {
                 if let Some((damage, _)) = blast.hit_player(&map.collision, target.position) {
@@ -1089,16 +1237,16 @@ impl Practice {
             }
         }
         if let Some(player) = player {
-            self.update_liquid_damage(map, player.position, camera.position);
+            self.update_liquid(map, player.position, camera.position, &mut sounds);
             if let Some((damage, momentum)) = hammer_hit {
                 player.apply_self_damage_momentum(momentum, map.collision.profile);
-                self.splash_damage(damage);
+                self.splash_damage(damage.saturating_mul(damage_scale));
             }
             for blast in blasts {
                 if let Some((damage, momentum)) = blast.hit_player(&map.collision, player.position)
                 {
                     player.apply_self_damage_momentum(momentum, map.collision.profile);
-                    self.splash_damage(damage);
+                    self.splash_damage(damage.saturating_mul(damage_scale));
                 }
             }
             if let Some((damage, impulse)) =
@@ -1106,7 +1254,7 @@ impl Practice {
                     .nuclear_wave(map, self.time, player.position, 0)
             {
                 player.add_velocity(impulse);
-                self.splash_damage(damage);
+                self.splash_damage(damage.saturating_mul(damage_scale));
             }
         }
         sounds
@@ -1476,7 +1624,15 @@ impl Practice {
             let absorbed = (*charge).min((u32::from(damage) * kind.absorption() / 100) as u16);
             *charge -= absorbed;
             damage -= absorbed;
+            if matches!(kind, ArmorKind::Belt) && absorbed > 0 {
+                self.shield_flash_until = self.time + 0.16;
+                self.shield_hit_pending = true;
+            }
         }
+        self.health_damage(damage);
+    }
+
+    fn health_damage(&mut self, damage: u16) {
         if damage > 0 {
             self.health = self.health.saturating_sub(damage);
             self.hit_taken = self.hit_taken.saturating_add(damage);
@@ -1485,13 +1641,48 @@ impl Practice {
         }
     }
 
-    fn update_liquid_damage(&mut self, map: &Map, center: Vec3, eye: Vec3) {
+    fn update_liquid(&mut self, map: &Map, center: Vec3, eye: Vec3, sounds: &mut Vec<Arc<Wave>>) {
         if self.health == 0 {
             return;
         }
         let regions = &map.collision.regions;
-        let feet = regions.at(center - Vec3(0.0, 0.0, crate::collision::PLAYER_HEIGHT));
+        let foot = center - Vec3(0.0, 0.0, crate::collision::PLAYER_HEIGHT);
+        let feet = regions.at(foot);
         let head = regions.at(eye);
+        if let Some(previous) = self.last_foot_zone.replace(feet)
+            && previous.water != feet.water
+            && self.time - self.splash_at >= 0.25
+        {
+            self.splash_at = self.time;
+            let zone = if feet.water { feet } else { previous };
+            if let Some([entry, exit]) = zone.liquid_audio.and_then(|id| map.liquid_audio.get(id)) {
+                let sound = if !feet.water {
+                    exit.as_ref()
+                } else if entry.is_some()
+                    && map
+                        .collision
+                        .ray(foot + Vec3(0.0, 0.0, 8.0), Vec3(0.0, 0.0, -32.0))
+                        .is_some()
+                {
+                    map.player_audio.water_step.as_ref().or(entry.as_ref())
+                } else {
+                    entry.as_ref()
+                };
+                sounds.extend(sound.cloned());
+            }
+        }
+        if !head.water
+            && let Some(deadline) = self.drown_at.take()
+        {
+            let remaining = deadline - self.time;
+            if remaining < 8.0 {
+                sounds.extend(
+                    map.player_audio.gasp[usize::from(remaining >= 2.0)]
+                        .iter()
+                        .cloned(),
+                );
+            }
+        }
         if feet.pain {
             self.drown_at = None;
             let next = self.zone_pain_at.get_or_insert(self.time + 0.01);
@@ -1514,7 +1705,7 @@ impl Practice {
                     .get_or_insert(self.time + map.collision.profile.underwater_time);
                 if self.time >= *next {
                     *next += 2.0;
-                    self.splash_damage(5);
+                    self.health_damage(5);
                 }
             } else {
                 self.drown_at = None;
@@ -2444,5 +2635,98 @@ mod tests {
         assert!(map.props[pickup].visible);
         assert_eq!(practice.weapon, Weapon::Enforcer);
         assert_eq!(practice.ammo(), Some(29));
+    }
+
+    #[test]
+    #[ignore = "requires the local GOTY map and game packages"]
+    fn deck16_powerups_use_stock_charges_and_scale_combat() {
+        let path = std::path::Path::new("local/goty/Maps/DM-Deck16][.unr");
+        let bytes = std::fs::read(path).unwrap();
+        let package = Package::read(&bytes).unwrap();
+        let mut map = Map::load(&package, Some(path)).unwrap();
+        let mut practice = Practice::new(&map);
+        let mut camera = Camera::from_start(map.starts[6]);
+        let idle = || Input {
+            primary: false,
+            alternate: false,
+            slot: None,
+            cycle: 0,
+        };
+        let boots = map
+            .props
+            .iter()
+            .position(|prop| matches!(prop.item, Some(Item::Power(Powerup::Boots, 3))))
+            .unwrap();
+        let bounds = map.props[boots].pickup_radius + crate::collision::PLAYER_RADIUS;
+        camera.position = map.props[boots].position + Vec3(bounds + 1.0, 0.0, 27.0);
+        practice.update(&mut map, &camera, 0.016, idle(), true, None);
+        assert!(
+            map.props[boots].visible,
+            "outside the authored pickup cylinder"
+        );
+        camera.position = map.props[boots].position + Vec3(0.0, 0.0, 27.0);
+        practice.update(&mut map, &camera, 0.016, idle(), true, None);
+        assert!(!map.props[boots].visible);
+        assert_eq!(practice.boot_charges, 3);
+        practice.update(&mut map, &camera, 35.0, idle(), false, None);
+        assert_eq!(practice.boot_charges, 3, "charges are not a timed buff");
+        assert!(map.props[boots].visible, "map pickup respawned");
+        let jump = map.collision.profile.jump_speed;
+        for _ in 0..3 {
+            assert_eq!(practice.jump_speed(jump), jump * 3.0);
+            assert!(practice.used_boot_jump());
+            practice.landed(0.0, jump);
+        }
+        assert_eq!(practice.jump_speed(jump), jump);
+        assert!(!practice.has_jump_boots());
+
+        let amp = map
+            .props
+            .iter()
+            .position(|prop| matches!(prop.item, Some(Item::Power(Powerup::Damage, 300))))
+            .unwrap();
+        camera.position = map.props[amp].position + Vec3(0.0, 0.0, 27.0);
+        practice.update(&mut map, &camera, 0.016, idle(), true, None);
+        assert!(!map.props[amp].visible);
+        assert!((practice.amp_until - practice.time - 30.0).abs() < 0.001);
+        assert!(map.powerups.amp_skin.is_some() && map.hud.amp.is_some());
+        assert!(map.powerups.amp_fire.iter().all(Option::is_some));
+        assert!(map.powerups.boots_on.is_some());
+        assert!(map.powerups.boots_jump.is_some());
+        assert!(map.powerups.shield_hit.is_some());
+        let camera = map
+            .starts
+            .iter()
+            .find_map(|&start| {
+                let camera = Camera::from_start(start);
+                practice.place_training_target(&map, &camera);
+                practice.target.as_ref().map(|_| camera)
+            })
+            .expect("unobstructed Deck16 spawn");
+        practice.weapon = Weapon::Sniper;
+        practice.weapon_state = WeaponState::Ready;
+        practice.next_shot = practice.time;
+        let mut shoot = idle();
+        shoot.primary = true;
+        practice.update(&mut map, &camera, 0.016, shoot, false, None);
+        assert_eq!(
+            practice.target.as_ref().unwrap().health,
+            0,
+            "one amplified rifle shot kills"
+        );
+        practice.update(&mut map, &camera, 30.0, idle(), false, None);
+        assert!(!practice.damage_amp_active());
+        assert!(!map.props[amp].visible);
+        practice.ammo.fill(0);
+        practice.ammo[Weapon::Pulse.ammo_pool()] = 1;
+        practice.ammo[Weapon::Ripper.ammo_pool()] = 1;
+        practice.update(&mut map, &camera, 0.016, idle(), false, None);
+        assert_eq!(practice.pending_weapon(), Weapon::Ripper);
+        assert!(practice.pickup(Item::Gun(Weapon::Shock), &map.arsenal));
+        assert_eq!(
+            practice.pending_weapon(),
+            Weapon::Ripper,
+            "lower ranked pickup cannot steal focus"
+        );
     }
 }

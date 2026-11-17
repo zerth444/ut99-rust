@@ -15,6 +15,7 @@ pub struct Art {
     pub crosshair: Option<Arc<Texture>>,
     pub doll: Option<Arc<Texture>>,
     pub belt: Option<Arc<Texture>>,
+    pub amp: Option<Arc<Texture>>,
 }
 
 impl Art {
@@ -149,7 +150,7 @@ impl Art {
             for (y, amount) in [
                 (0.0, f32::from(game.armor_charge(ArmorKind::Chest)) / 100.0),
                 (64.0, f32::from(game.armor_charge(ArmorKind::Thigh)) / 50.0),
-                (128.0, f32::from(game.jump_boost > game.time)),
+                (128.0, f32::from(game.has_jump_boots())),
             ] {
                 if amount > 0.0 {
                     art(
@@ -176,6 +177,23 @@ impl Art {
             );
         }
         let x = doll_x - 140.0 * scale;
+        if game.damage_amp_active()
+            && let Some(amp) = &self.amp
+        {
+            let (w, h) = amp.size();
+            art(
+                frame,
+                amp.image(0.0),
+                [
+                    x - w * scale - 12.0 * scale,
+                    12.0 * scale,
+                    w * scale,
+                    h * scale,
+                ],
+                [0.0, 0.0, w, h],
+                WHITE,
+            );
+        }
         let health_y = 64.0 * scale;
         let blink = if game.health < 50 {
             1.5 * game.time.rem_euclid(0.5)

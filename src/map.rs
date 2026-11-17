@@ -90,6 +90,8 @@ pub struct Map {
     pub player_idle: crate::game::Motion,
     pub ordnance: crate::game::ordnance::Arsenal,
     pub ballistics: crate::game::ballistics::Art,
+    pub powerups: crate::game::PowerupArt,
+    pub liquid_audio: Vec<[Option<Arc<crate::sound::Wave>>; 2]>,
     pub teleporters: Vec<crate::teleport::Teleporter>,
 }
 
@@ -135,6 +137,8 @@ impl Map {
             ordnance,
             ballistics,
             zones,
+            powerups,
+            liquid_audio,
         } = path
             .map(|path| {
                 crate::props::load(
@@ -152,8 +156,11 @@ impl Map {
                 package,
                 &zone_actors,
                 collision.regions.level,
-                |actor, zone| {
-                    crate::movement::stock_liquid_zone(package.object_name(actor.class), zone)
+                |actor, zone, properties| {
+                    let mut zone =
+                        crate::movement::stock_liquid_zone(package.object_name(actor.class), zone);
+                    zone.apply(properties)?;
+                    Ok(zone)
                 },
             )?
         } else {
@@ -236,6 +243,8 @@ impl Map {
             player_idle,
             ordnance,
             ballistics,
+            powerups,
+            liquid_audio,
             teleporters,
         })
     }
@@ -649,7 +658,7 @@ mod tests {
     fn deck16_swimmer_can_surface_and_dive() {
         let path = Path::new("local/goty/Maps/DM-Deck16][.unr");
         let bytes = std::fs::read(path).unwrap();
-        let map = Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap();
+        let mut map = Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap();
         let world = &map.collision;
         let up = Vec3(0.0, 0.0, 1.0);
         let location = map
@@ -673,6 +682,8 @@ mod tests {
         let slime = world.regions.at(start);
         assert!(slime.pain);
         assert_eq!(slime.damage_per_second, 40);
+        let sounds = &map.liquid_audio[slime.liquid_audio.expect("slime zone sounds")];
+        assert!(sounds.iter().all(Option::is_some));
         let mut lower = start.2;
         let mut upper = location.2 + 8.0;
         for _ in 0..12 {
@@ -697,6 +708,36 @@ mod tests {
         }
         assert!(world.regions.at(walker.position).water);
         assert!(walker.position.2 < upper - 20.0);
+
+        let mut game = crate::game::Practice::new(&map);
+        let mut camera = crate::render::Camera::from_start(map.starts[0]);
+        let mut cross = |position: Vec3| {
+            walker.position = position;
+            camera.position = position + up * 27.0;
+            game.update(
+                &mut map,
+                &camera,
+                0.3,
+                crate::game::Input {
+                    primary: false,
+                    alternate: false,
+                    slot: None,
+                    cycle: 0,
+                },
+                false,
+                Some(&mut walker),
+            )
+        };
+        cross(location + up * 64.0);
+        let feet_in_slime = start + up * crate::collision::PLAYER_HEIGHT;
+        assert!(
+            !cross(feet_in_slime).is_empty(),
+            "entering the slime plays a sound"
+        );
+        assert!(
+            !cross(location + up * 64.0).is_empty(),
+            "leaving the slime plays a sound"
+        );
     }
 
     #[test]

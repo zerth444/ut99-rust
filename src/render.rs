@@ -239,6 +239,7 @@ impl Frame {
                 None,
                 &map.scene_lights,
                 Some(mover),
+                None,
             );
         }
         for prop in map.props.iter().filter(|prop| prop.visible) {
@@ -267,6 +268,7 @@ impl Frame {
                     None,
                     &map.scene_lights,
                     parent,
+                    None,
                 );
             }
         }
@@ -564,7 +566,24 @@ impl Frame {
             }
             self.depth.fill(0.0);
             self.layer(Layer::Weapon);
-            self.draw_faces_blended(pose.current, &view, time, false, Some(pose));
+            let skin = if game.damage_amp_active() {
+                map.powerups.amp_skin.as_deref()
+            } else if game.invisible() {
+                map.powerups.invis_skin.as_deref()
+            } else {
+                None
+            };
+            self.draw_lit_faces(
+                pose.current,
+                &View::camera(&view),
+                time,
+                false,
+                Some(pose),
+                skin.map(|_| 1.0),
+                &[],
+                None,
+                skin,
+            );
         }
         self.layer(Layer::Hud);
         if let Some(weapon) = map.arsenal.get(&crate::game::Weapon::Redeemer) {
@@ -614,21 +633,23 @@ impl Frame {
                 return;
             }
         }
-        let flash = ((game.hit_flash_until - game.time) / 0.20).clamp(0.0, 1.0) * 0.22;
-        if flash > 0.0 {
+        let red = ((game.hit_flash_until - game.time) / 0.20).clamp(0.0, 1.0) * 0.22;
+        let shield = ((game.shield_flash_until - game.time) / 0.16).clamp(0.0, 1.0) * 0.18;
+        if red > 0.0 || shield > 0.0 {
+            let tint = [red.max(shield), shield, shield * 0.6];
             if let Some(commands) = &mut self.commands {
                 quad(
                     commands,
                     [self.width, self.height],
                     [0, 0, self.width as i32, self.height as i32],
                     [0.0, 0.0, 1.0, 1.0],
-                    [flash, 0.0, 0.0, 0.0],
+                    [tint[0], tint[1], tint[2], 0.0],
                     None,
                     Mode::Screen,
                     commands::WHITE,
                 );
             } else {
-                let tint = pack([flash, 0.0, 0.0], 255.0);
+                let tint = pack(tint, 255.0);
                 for pixel in &mut self.pixels {
                     *pixel = blend_light(tint, *pixel);
                 }
@@ -951,7 +972,7 @@ impl Frame {
         pose: Option<crate::game::Pose<'_>>,
         glow: Option<f32>,
     ) {
-        self.draw_lit_faces(faces, view, time, sky, pose, glow, &[], None);
+        self.draw_lit_faces(faces, view, time, sky, pose, glow, &[], None, None);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -965,16 +986,25 @@ impl Frame {
         glow: Option<f32>,
         lights: &[crate::light::Light],
         mover: Option<&crate::mover::Mover>,
+        skin: Option<&crate::texture::Texture>,
     ) {
         let mut transformed = Vec::new();
         let mut clipped = Vec::new();
+        let vertex_key = |Vec3(x, y, z): Vec3| [x.to_bits(), y.to_bits(), z.to_bits()];
+        let skin_normals = skin.map(|_| {
+            let mut normals = HashMap::<_, Vec3>::new();
+            for face in faces {
+                for &vertex in &face.vertices {
+                    let sum = normals.entry(vertex_key(vertex)).or_default();
+                    *sum = *sum + face.normal;
+                }
+            }
+            normals
+        });
 
         for face in faces.iter().filter(|face| face.sky == sky) {
-            let flags = face.flags
-                | face
-                    .texture
-                    .as_ref()
-                    .map_or(0, |texture| texture.poly_flags);
+            let texture = skin.or(face.texture.as_deref());
+            let flags = face.flags | texture.map_or(0, |texture| texture.poly_flags);
             if flags & 1 != 0 || (sky && flags & 0x80 != 0) {
                 continue;
             }
@@ -996,11 +1026,29 @@ impl Frame {
             }
             transformed.clear();
             transformed.extend(face.vertices.iter().enumerate().map(|(i, &vertex)| {
-                let texture_point = vertex - face.origin;
+                let point = position(i, vertex);
+                let (u, v) = if let (Some(skin), Some(normals)) = (skin, &skin_normals) {
+                    let (width, height) = skin.size();
+                    let incident = crate::mover::unit(point - view.eye);
+                    let normal = crate::mover::unit(
+                        normals.get(&vertex_key(vertex)).copied().unwrap_or(normal),
+                    );
+                    let reflected = incident - normal * (2.0 * incident.dot(normal));
+                    (
+                        (0.5 + 0.5 * reflected.dot(view.right)) * width,
+                        (0.5 + 0.5 * reflected.dot(view.up)) * height,
+                    )
+                } else {
+                    let texture_point = vertex - face.origin;
+                    (
+                        texture_point.dot(face.u_axis),
+                        texture_point.dot(face.v_axis),
+                    )
+                };
                 Vertex {
-                    position: view.point(position(i, vertex)),
-                    u: texture_point.dot(face.u_axis),
-                    v: texture_point.dot(face.v_axis),
+                    position: view.point(point),
+                    u,
+                    v,
                 }
             }));
             if transformed.iter().all(|p| p.position.2 < NEAR) {
@@ -1036,8 +1084,12 @@ impl Frame {
             };
             let u_pan = if flags & 0x200 != 0 { time * 64.0 } else { 0.0 };
             let v_pan = if flags & 0x400 != 0 { time * 64.0 } else { 0.0 };
-            let pan = [face.pan[0] + u_pan, face.pan[1] + v_pan];
-            let texture = face.texture.as_ref().map(|texture| texture.image(time));
+            let pan = if skin.is_some() {
+                [0.0; 2]
+            } else {
+                [face.pan[0] + u_pan, face.pan[1] + v_pan]
+            };
+            let texture = texture.map(|texture| texture.image(time));
             let a = project(clipped[0], self.width, self.height, self.zoom);
             for pair in clipped[1..].windows(2) {
                 self.triangle(

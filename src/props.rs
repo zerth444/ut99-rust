@@ -90,6 +90,11 @@ struct Appearance {
     ammo_amount: Option<u16>,
     max_ammo: Option<u16>,
     respawn_time: Option<f32>,
+    charge: Option<u16>,
+    healing_amount: Option<u16>,
+    super_heal: Option<bool>,
+    collision_radius: Option<f32>,
+    collision_height: Option<f32>,
     lifetime: Option<f32>,
     skin: Option<Object>,
     texture: Option<Object>,
@@ -123,6 +128,11 @@ struct VisualProperties {
     ammo_amount: Option<u16>,
     max_ammo: Option<u16>,
     respawn_time: Option<f32>,
+    charge: Option<u16>,
+    healing_amount: Option<u16>,
+    super_heal: Option<bool>,
+    collision_radius: Option<f32>,
+    collision_height: Option<f32>,
     lifetime: Option<f32>,
     skin: Option<i32>,
     texture: Option<i32>,
@@ -160,6 +170,11 @@ impl VisualProperties {
             ammo_amount: None,
             max_ammo: None,
             respawn_time: None,
+            charge: None,
+            healing_amount: None,
+            super_heal: None,
+            collision_radius: None,
+            collision_height: None,
             lifetime: None,
             skin: None,
             texture: None,
@@ -198,6 +213,11 @@ impl VisualProperties {
                 "AmmoAmount" => props_out.ammo_amount = u16::try_from(value.u32()?).ok(),
                 "MaxAmmo" => props_out.max_ammo = u16::try_from(value.u32()?).ok(),
                 "RespawnTime" => props_out.respawn_time = Some(value.f32()?),
+                "Charge" => props_out.charge = u16::try_from(value.u32()?).ok(),
+                "HealingAmount" => props_out.healing_amount = u16::try_from(value.u32()?).ok(),
+                "bSuperHeal" => props_out.super_heal = prop.boolean,
+                "CollisionRadius" => props_out.collision_radius = Some(value.f32()?),
+                "CollisionHeight" => props_out.collision_height = Some(value.f32()?),
                 "LifeSpan" => props_out.lifetime = Some(value.f32()?),
                 "Skin" => props_out.skin = Some(value.compact()?),
                 "Texture" => props_out.texture = Some(value.compact()?),
@@ -270,6 +290,11 @@ impl VisualProperties {
         parent.ammo_amount = self.ammo_amount.or(parent.ammo_amount);
         parent.max_ammo = self.max_ammo.or(parent.max_ammo);
         parent.respawn_time = self.respawn_time.or(parent.respawn_time);
+        parent.charge = self.charge.or(parent.charge);
+        parent.healing_amount = self.healing_amount.or(parent.healing_amount);
+        parent.super_heal = self.super_heal.or(parent.super_heal);
+        parent.collision_radius = self.collision_radius.or(parent.collision_radius);
+        parent.collision_height = self.collision_height.or(parent.collision_height);
         parent.lifetime = self.lifetime.or(parent.lifetime);
         if let Some(value) = self.scale {
             parent.scale = value;
@@ -346,6 +371,8 @@ pub struct Prop {
     pub faces: Vec<Face>,
     pub position: Vec3,
     pub radius: f32,
+    pub pickup_radius: f32,
+    pub pickup_height: f32,
     pub item: Option<Item>,
     pub visible: bool,
     pub pickup_sound: Option<Arc<Wave>>,
@@ -371,6 +398,8 @@ pub struct Scene {
     pub ordnance: ordnance::Arsenal,
     pub ballistics: crate::game::ballistics::Art,
     pub zones: Vec<crate::movement::Zone>,
+    pub powerups: crate::game::PowerupArt,
+    pub liquid_audio: Vec<[Option<Arc<Wave>>; 2]>,
 }
 
 pub fn load(
@@ -513,10 +542,19 @@ pub fn load(
                 faces,
                 position: placement.location,
                 radius,
+                pickup_radius: visual.collision_radius.unwrap_or(30.0),
+                pickup_height: visual.collision_height.unwrap_or(30.0),
                 item: item.map(|item| match item {
                     Item::Ammo(weapon, count) => {
                         Item::Ammo(weapon, visual.ammo_amount.unwrap_or(count))
                     }
+                    Item::Power(kind, charge) => Item::Power(kind, visual.charge.unwrap_or(charge)),
+                    Item::Health(amount, cap) => Item::Health(
+                        visual.healing_amount.unwrap_or(amount),
+                        visual
+                            .super_heal
+                            .map_or(cap, |super_heal| if super_heal { 199 } else { 100 }),
+                    ),
                     _ => item,
                 }),
                 respawn_time: visual.respawn_time.filter(|value| *value > 0.0),
@@ -756,8 +794,35 @@ pub fn load(
         crosshair: hud_texture("CHair1"),
         doll: hud_texture("Man"),
         belt: hud_texture("ManBelt"),
+        amp: hud_texture("I_UDamage"),
+    };
+    let mut pickup_sound = |name| {
+        let sound = ["botpack", "unrealshare", "unreali"]
+            .into_iter()
+            .find_map(|package| find_export(&assets, package, name, "Sound"));
+        cached_wave(&assets, &mut waves, sound)
+    };
+    let mut powered_skin = |name| {
+        let id = find_export(&assets, "unrealshare", name, "FireTexture")?;
+        cached_texture(&assets, &mut textures, id)
+    };
+    let powerups = crate::game::PowerupArt {
+        boots_on: pickup_sound("BootSnd"),
+        boots_jump: pickup_sound("BootJmp"),
+        amp_fire: [pickup_sound("AmpFire"), pickup_sound("AmpFire2b")],
+        amp_out: pickup_sound("AmpOut"),
+        amp_skin: powered_skin("UDamageFX"),
+        invis_skin: powered_skin("Invis"),
+        shield_hit: pickup_sound("Sbelthe2"),
     };
     let (player, mut player_audio) = read_player(&mut assets, &mut waves);
+    player_audio.gasp = ["hgasp1", "gasp02"].map(|name| {
+        cached_wave(
+            &assets,
+            &mut waves,
+            find_export(&assets, "botpack", name, "Sound"),
+        )
+    });
     player_audio.pain = ["injurL2", "injurL04", "injurM04", "injurH5"].map(|name| {
         cached_wave(
             &assets,
@@ -783,29 +848,47 @@ pub fn load(
         )
     });
     let ballistics = read_ballistics(&mut assets, &mut class_cache, &mut textures, &mut waves);
-    let zones = crate::movement::load_zones(map, zone_actors, level, |actor, mut zone| {
-        let mut class = assets.resolve(0, actor.class);
-        let mut visited = HashSet::new();
-        let mut chain = Vec::new();
-        while let Some(id) = class.filter(|id| visited.insert(*id)) {
-            let (_, export) = assets.object(id);
-            if assets.packages[id.package].name(export.name).ok() == Some("ZoneInfo") {
-                break;
+    let mut liquid_audio = Vec::new();
+    let zones =
+        crate::movement::load_zones(map, zone_actors, level, |actor, mut zone, placement| {
+            let mut class = assets.resolve(0, actor.class);
+            let mut visited = HashSet::new();
+            let mut chain = Vec::new();
+            while let Some(id) = class.filter(|id| visited.insert(*id)) {
+                let (_, export) = assets.object(id);
+                if assets.packages[id.package].name(export.name).ok() == Some("ZoneInfo") {
+                    break;
+                }
+                chain.push(id);
+                class = assets.resolve(id.package, export.superclass);
             }
-            chain.push(id);
-            class = assets.resolve(id.package, export.superclass);
-        }
-        if chain.is_empty() {
-            return crate::movement::stock_liquid_zone(map.object_name(actor.class), zone);
-        }
-        for id in chain.into_iter().rev() {
-            let (package, export) = assets.object(id);
-            if let Ok(properties) = class_properties(package, export) {
-                let _ = zone.apply(properties);
+            if chain.is_empty() {
+                zone = crate::movement::stock_liquid_zone(map.object_name(actor.class), zone);
             }
-        }
-        zone
-    })?;
+            let mut sounds = [None; 2];
+            let mut apply_audio = |assets: &mut Assets<'_>, package, refs: [Option<i32>; 2]| {
+                for (sound, reference) in sounds.iter_mut().zip(refs) {
+                    if let Some(reference) = reference {
+                        *sound = assets.resolve(package, reference);
+                    }
+                }
+            };
+            for id in chain.into_iter().rev() {
+                let (package, export) = assets.object(id);
+                if let Ok(properties) = class_properties(package, export)
+                    && let Ok(references) = zone.apply(properties)
+                {
+                    apply_audio(&mut assets, id.package, references);
+                }
+            }
+            apply_audio(&mut assets, 0, zone.apply(placement)?);
+            let audio = sounds.map(|id| cached_wave(&assets, &mut waves, id));
+            if audio.iter().any(Option::is_some) {
+                zone.liquid_audio = Some(liquid_audio.len());
+                liquid_audio.push(audio);
+            }
+            Ok(zone)
+        })?;
     Ok(Scene {
         props,
         arsenal,
@@ -817,6 +900,8 @@ pub fn load(
         ordnance,
         ballistics,
         zones,
+        powerups,
+        liquid_audio,
     })
 }
 
