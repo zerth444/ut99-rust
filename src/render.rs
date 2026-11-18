@@ -361,6 +361,7 @@ impl Frame {
         camera: &Camera,
         game: &crate::game::deathmatch::Match,
         fov: f32,
+        body_blend: f32,
     ) {
         let player = &game.fighters[0];
         let piloting = game.guidance_left().is_some();
@@ -402,11 +403,8 @@ impl Frame {
                 } else {
                     None
                 };
-                let model = view.in_model(
-                    fighter.walker.position,
-                    Vec3(fighter.yaw.cos(), fighter.yaw.sin(), 0.0),
-                    1.0,
-                );
+                let (position, yaw) = fighter.body_transform(body_blend);
+                let model = view.in_model(position, Vec3(yaw.cos(), yaw.sin(), 0.0), 1.0);
                 self.draw_lit_faces(
                     pose.current,
                     &model,

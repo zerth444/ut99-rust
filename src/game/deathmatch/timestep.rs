@@ -19,6 +19,10 @@ pub struct Timestep {
 }
 
 impl Timestep {
+    pub fn body_blend(&self) -> f32 {
+        (self.remainder / STEP).clamp(0.0, 1.0) as f32
+    }
+
     pub fn clear(&mut self) {
         *self = Self::default();
     }

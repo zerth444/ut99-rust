@@ -19,6 +19,7 @@ const CHAIN_FLAGS: DXGI_SWAP_CHAIN_FLAG = DXGI_SWAP_CHAIN_FLAG(0);
 mod tests {
     use super::*;
     use crate::{
+        game::deathmatch::{Command, Match, Rules, Timestep},
         map::Map,
         package::Package,
         render::{Camera, Frame},
@@ -37,7 +38,7 @@ mod tests {
             let bytes = std::fs::read(path).unwrap();
             Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap()
         };
-        let deck = load("local/goty/Maps/DM-Deck16][.unr");
+        let mut deck = load("local/goty/Maps/DM-Deck16][.unr");
         let logo = load("local/goty/Maps/UT-Logo-Map.unr");
         let class = [
             b'S' as u16,
@@ -75,10 +76,27 @@ mod tests {
         let mut presenter = Presenter::new(window.0, (320, 200), false).unwrap();
         let mut atlases = Vec::new();
         let mut atlas_sizes = Vec::new();
-        for map in [&deck, &logo, &deck] {
+        let mut game = Match::new(&deck, 6, Rules::default());
+        let mut clock = Timestep::default();
+        for _ in 0..121 {
+            clock.advance(
+                &mut game,
+                &mut deck,
+                Command::default(),
+                [false; 2],
+                false,
+                1.0 / 240.0,
+            );
+        }
+        assert!((clock.body_blend() - 0.5).abs() < 0.001);
+        for (is_match, map) in [(true, &deck), (false, &logo), (true, &deck)] {
             let mut frame = Frame::hardware(map);
             (frame.width, frame.height) = (320, 200);
-            frame.draw(map, &Camera::from_start(map.starts[0]), 0.0);
+            if is_match {
+                frame.draw_deathmatch(map, &game.player_view(map), &game, 90.0, clock.body_blend());
+            } else {
+                frame.draw(map, &Camera::from_start(map.starts[0]), 0.0);
+            }
             presenter
                 .draw((320, 200), frame.commands.as_mut().unwrap(), false)
                 .unwrap();

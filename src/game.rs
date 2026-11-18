@@ -266,6 +266,19 @@ impl Motion {
             fraction: position.fract(),
         })
     }
+
+    fn sample_loop(&self, elapsed: f32) -> Option<Pose<'_>> {
+        let duration = self.duration();
+        if duration <= 0.0 {
+            return None;
+        }
+        let time = elapsed.rem_euclid(duration);
+        let mut pose = self.sample(time)?;
+        if time * self.rate >= (self.frames.len() - 1) as f32 {
+            pose.next = &self.frames[0];
+        }
+        Some(pose)
+    }
 }
 
 #[derive(Clone, Copy)]

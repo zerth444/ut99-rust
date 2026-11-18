@@ -379,7 +379,7 @@ fn node_at(points: &mut Vec<Vec3>, point: Vec3) -> usize {
     points.len() - 1
 }
 
-fn walk_link(world: &Collision, from: Vec3, to: Vec3) -> bool {
+pub(super) fn walk_link(world: &Collision, from: Vec3, to: Vec3) -> bool {
     let delta = to - from;
     let horizontal = delta.0.hypot(delta.1);
     if delta.2.abs() > 28.0 + horizontal * 0.43 {

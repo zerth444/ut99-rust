@@ -67,6 +67,7 @@ pub struct Face {
 pub struct Start {
     pub position: Vec3,
     pub yaw: f32,
+    pub enabled: bool,
 }
 
 pub(crate) struct LiftExit {
@@ -210,14 +211,17 @@ impl Map {
             let mut start = Start {
                 position: Vec3::default(),
                 yaw: 0.0,
+                enabled: true,
             };
-            while let Some((name, mut value)) = properties.next()? {
-                match name {
+            while let Some(property) = properties.next_tag()? {
+                let mut value = property.value;
+                match property.name {
                     "Location" => start.position = Vec3::read(&mut value)?,
                     "Rotation" => {
                         value.u32()?;
                         start.yaw = (value.u32()? as i32) as f32 * std::f32::consts::TAU / 65_536.0;
                     }
+                    "bEnabled" => start.enabled = property.boolean.unwrap_or(true),
                     _ => {}
                 }
             }

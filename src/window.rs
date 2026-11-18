@@ -567,7 +567,12 @@ unsafe fn message_loop(
                     (frame.width, frame.height) = (size.0 as usize, size.1 as usize);
                     game.hud_scale = settings.hud_scale as f32 / 100.0;
                     game.show_decals = settings.show_decals;
-                    frame.draw_deathmatch(map, &view, game, settings.field_of_view as f32);
+                    let blend = if active && mouse.captured && !game.finished {
+                        match_clock.body_blend()
+                    } else {
+                        1.0
+                    };
+                    frame.draw_deathmatch(map, &view, game, settings.field_of_view as f32, blend);
                     hud.draw_deathmatch(
                         &mut frame,
                         game,

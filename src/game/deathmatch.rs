@@ -91,7 +91,10 @@ pub struct Fighter {
     pub(crate) hurt_at: f32,
     pub(crate) shield_at: f32,
     landed_at: f32,
+    airborne_since: Option<f32>,
     stride_time: f32,
+    gait: Gait,
+    previous_body: (Vec3, f32),
     protected_until: f32,
     ready_at: f32,
     liquid: LiquidState,
@@ -104,8 +107,10 @@ pub struct Fighter {
 impl Fighter {
     fn spawn(map: &Map, spawn: usize, time: f32) -> Self {
         let start = map.starts[spawn];
+        let walker = Walker::spawn(&map.collision, start.position);
         Self {
-            walker: Walker::spawn(&map.collision, start.position),
+            previous_body: (walker.position, start.yaw),
+            walker,
             yaw: start.yaw,
             pitch: 0.0,
             health: 100,
@@ -131,7 +136,9 @@ impl Fighter {
             hurt_at: f32::NEG_INFINITY,
             shield_at: f32::NEG_INFINITY,
             landed_at: f32::NEG_INFINITY,
+            airborne_since: None,
             stride_time: 0.0,
+            gait: Gait::Idle,
             protected_until: time + SPAWN_PROTECTION,
             ready_at: time,
             liquid: LiquidState::default(),
@@ -233,52 +240,91 @@ impl Fighter {
         }
     }
 
-    pub(crate) fn pose<'a>(&self, map: &'a Map, id: usize, time: f32) -> Option<super::Pose<'a>> {
+    fn capture_body(&mut self) {
+        self.previous_body = (self.walker.position, self.yaw);
+    }
+
+    pub(crate) fn body_transform(&self, blend: f32) -> (Vec3, f32) {
+        let (position, yaw) = self.previous_body;
+        (
+            position + (self.walker.position - position) * blend,
+            yaw + angle_delta(self.yaw, yaw) * blend,
+        )
+    }
+
+    fn update_gait(&mut self, dt: f32) {
+        let velocity = self.walker.velocity();
+        let speed = velocity.0.hypot(velocity.1);
+        self.stride_time += dt * (speed / 285.0).clamp(0.0, 2.0);
+        let (sin, cos) = self.yaw.sin_cos();
+        let forward = velocity.dot(Vec3(cos, sin, 0.0));
+        let side = velocity.dot(Vec3(-sin, cos, 0.0));
+        let strafe = Gait::Strafe(usize::from(side > 0.0));
+        self.gait = if speed < if self.gait == Gait::Idle { 47.0 } else { 27.0 } {
+            Gait::Idle
+        } else if side.abs() > forward.abs() * if self.gait == strafe { 0.92 } else { 1.32 } {
+            strafe
+        } else if forward
+            < if self.gait == Gait::Backpedal {
+                -15.0
+            } else {
+                -35.0
+            }
+        {
+            Gait::Backpedal
+        } else if speed < if self.gait == Gait::Run { 145.0 } else { 185.0 } {
+            Gait::Walk
+        } else {
+            Gait::Run
+        };
+    }
+
+    pub(crate) fn pose<'a>(&self, map: &'a Map, id: usize, time: f32) -> Option<Pose<'a>> {
         if let Some(death) = self.fell_at {
             let clip = &map.player_deaths[id % map.player_deaths.len()];
             return clip.sample((time - death).min((clip.duration() - 0.001).max(0.0)));
         }
         let clips = &map.player_clips;
-        let velocity = self.walker.velocity();
-        let speed = velocity.0.hypot(velocity.1);
         let firing = time - self.fired_at;
+        let hurt = time - self.hurt_at;
+        let landed = time - self.landed_at;
         let (clip, age) = if map.collision.regions.at(self.walker.position).water {
             (&clips.swim, time)
-        } else if time - self.hurt_at < 0.12 {
-            (&clips.hurt, 0.0)
+        } else if hurt < 0.12 && clips.hurt.duration() > 0.0 {
+            return clips.hurt.sample(hurt.min(clips.hurt.duration() - 0.001));
         } else if !self.walker.grounded {
-            (&clips.air, 0.0)
-        } else if time - self.landed_at < 0.13 {
-            (&clips.land, 0.0)
-        } else if speed < 35.0 {
-            if firing < clips.fire.duration() {
-                (&clips.fire, firing)
-            } else {
-                (&map.player_idle, time)
+            let age = self.airborne_since.map_or(0.0, |started| time - started);
+            return clips
+                .air
+                .sample(age.min((clips.air.duration() - 0.001).max(0.0)))
+                .or_else(|| map.player_idle.sample(0.0));
+        } else if landed < 0.13 && clips.land.duration() > 0.0 {
+            return clips.land.sample(landed.min(clips.land.duration() - 0.001));
+        } else {
+            match self.gait {
+                Gait::Idle if firing < clips.fire.duration() => return clips.fire.sample(firing),
+                Gait::Idle => (&map.player_idle, time),
+                Gait::Strafe(side) => (&clips.strafe[side], self.stride_time),
+                Gait::Backpedal => (&clips.backpedal, self.stride_time),
+                Gait::Walk | Gait::Run if firing < 0.27 && !clips.fire_run.frames.is_empty() => {
+                    (&clips.fire_run, self.stride_time)
+                }
+                Gait::Walk => (&clips.walk, self.stride_time),
+                Gait::Run => (&clips.run, self.stride_time),
             }
-        } else {
-            let (sin, cos) = self.yaw.sin_cos();
-            let forward = velocity.dot(Vec3(cos, sin, 0.0));
-            let side = velocity.dot(Vec3(-sin, cos, 0.0));
-            let gait = if side.abs() > forward.abs() * 1.15 {
-                &clips.strafe[usize::from(side > 0.0)]
-            } else if forward < -30.0 {
-                &clips.backpedal
-            } else if firing < 0.27 {
-                &clips.fire_run
-            } else if speed < 165.0 {
-                &clips.walk
-            } else {
-                &clips.run
-            };
-            (gait, self.stride_time)
         };
-        if clip.duration() > 0.0 {
-            clip.sample(age.rem_euclid(clip.duration()))
-        } else {
-            map.player_idle.sample(0.0)
-        }
+        clip.sample_loop(age)
+            .or_else(|| map.player_idle.sample(0.0))
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Gait {
+    Idle,
+    Walk,
+    Run,
+    Backpedal,
+    Strafe(usize),
 }
 
 #[derive(Clone, Copy)]
@@ -310,6 +356,9 @@ impl ActivePowerups {
 struct Bot {
     target: Option<usize>,
     react_at: f32,
+    combat_move: Vec3,
+    aim_bias: Option<[f32; 2]>,
+    weapon_mode: Option<(Weapon, bool, f32)>,
     goal: Option<Step>,
     rethink_at: f32,
     last_seen: Option<(Vec3, f32)>,
@@ -320,6 +369,7 @@ struct Bot {
     jump: JumpProgress,
     jump_until: Option<f32>,
     evasion: Option<Evasion>,
+    evade_again_at: f32,
 }
 
 struct Evasion {
@@ -404,6 +454,8 @@ pub struct Match {
     pickups: Vec<Option<f32>>,
     kill_z: f32,
     navigation: Navigation,
+    recent_spawns: Vec<Option<u64>>,
+    spawn_sequence: u64,
     message: String,
     message_until: f32,
 }
@@ -431,6 +483,8 @@ impl Match {
                 .fold(f32::INFINITY, f32::min)
                 - 4096.0,
             navigation: Navigation::new(map),
+            recent_spawns: vec![None; map.starts.len()],
+            spawn_sequence: 0,
             message: String::new(),
             message_until: 0.0,
         };
@@ -440,12 +494,21 @@ impl Match {
 
     fn spawn_all(&mut self, map: &Map) {
         self.fighters.clear();
-        self.fighters
-            .push(Fighter::spawn(map, self.preferred_start, 0.0));
-        for id in 1..=self.rules.bots {
-            let spawn = self.choose_spawn(map, id, None);
-            self.fighters.push(Fighter::spawn(map, spawn, 0.0));
+        for id in 0..=self.rules.bots {
+            let spawn = if id == 0 && usable_start(map, self.preferred_start).is_some() {
+                self.preferred_start
+            } else {
+                self.choose_spawn(map, id, None)
+            };
+            let fighter = self.spawn_at(map, spawn);
+            self.fighters.push(fighter);
         }
+    }
+
+    fn spawn_at(&mut self, map: &Map, start: usize) -> Fighter {
+        self.recent_spawns[start] = Some(self.spawn_sequence);
+        self.spawn_sequence += 1;
+        Fighter::spawn(map, start, self.time)
     }
 
     fn restart(&mut self, map: &mut Map) {
@@ -470,22 +533,40 @@ impl Match {
         map.starts
             .iter()
             .enumerate()
-            .max_by(|(a, start_a), (b, start_b)| {
-                let value = |index, start: &crate::map::Start| {
-                    let distance = self
-                        .fighters
-                        .iter()
-                        .enumerate()
-                        .filter(|(id, other)| *id != fighter && other.health > 0)
-                        .map(|(_, other)| distance_squared(other.walker.position, start.position))
-                        .fold(f32::INFINITY, f32::min);
-                    (distance.min(700.0 * 700.0), previous != Some(index))
-                };
-                let (da, fresh_a) = value(*a, start_a);
-                let (db, fresh_b) = value(*b, start_b);
-                da.total_cmp(&db).then_with(|| fresh_a.cmp(&fresh_b))
+            .filter_map(|(index, _)| {
+                let start = usable_start(map, index)?;
+                let mut nearest = 850.0_f32;
+                let mut exposed = 0.0_f32;
+                let mut occupied = false;
+                for (id, other) in self.fighters.iter().enumerate() {
+                    if id == fighter || other.health == 0 {
+                        continue;
+                    }
+                    let offset = start - other.walker.position;
+                    occupied |= offset.0.hypot(offset.1) < 2.0 * PLAYER_RADIUS + 8.0
+                        && offset.2.abs() < 2.0 * PLAYER_HEIGHT;
+                    let distance = offset.dot(offset).sqrt();
+                    nearest = nearest.min(distance);
+                    let eye = other.camera(map).position;
+                    let sightline = start + Vec3(0.0, 0.0, 12.0) - eye;
+                    if distance < 1050.0 && map.collision.ray(eye, sightline).is_none() {
+                        exposed = exposed.max(290.0 * (1.0 - distance / 1050.0));
+                    }
+                }
+                let last = self.recent_spawns[index];
+                let recency = last.map_or(0.0, |last| {
+                    45.0 * (5_u64.saturating_sub(self.spawn_sequence - last)) as f32
+                });
+                let repeat = if previous == Some(index) { 190.0 } else { 0.0 };
+                let score = nearest - exposed - recency - repeat;
+                Some((index, !occupied, score, last))
             })
-            .map_or(self.preferred_start, |(spawn, _)| spawn)
+            .max_by(|a, b| {
+                a.1.cmp(&b.1)
+                    .then_with(|| a.2.total_cmp(&b.2))
+                    .then_with(|| b.3.cmp(&a.3))
+            })
+            .map_or(self.preferred_start, |(spawn, _, _, _)| spawn)
     }
 
     pub fn remaining(&self) -> u16 {
@@ -593,6 +674,9 @@ impl Match {
             return sounds;
         }
         self.time += dt;
+        for fighter in &mut self.fighters {
+            fighter.capture_body();
+        }
         self.traces.retain(|trace| trace.expires > self.time);
         let flight = self.pilot_index();
         let manual_detonation = flight.and_then(|index| {
@@ -654,10 +738,16 @@ impl Match {
         let mut hits = Vec::new();
         for (id, input) in inputs.iter().enumerate() {
             if let Some(fell) = self.fighters[id].fell_at {
-                if self.time - fell >= RESPAWN_DELAY {
+                let extra = if id == 0 {
+                    0.0
+                } else {
+                    let [bias, _] = ai::shot_bias(id, u32::from(self.fighters[id].deaths));
+                    (bias + 1.0) * 0.22
+                };
+                if self.time - fell >= RESPAWN_DELAY + extra {
                     let old = self.fighters[id].spawn;
                     let spawn = self.choose_spawn(map, id, Some(old));
-                    let mut respawned = Fighter::spawn(map, spawn, self.time);
+                    let mut respawned = self.spawn_at(map, spawn);
                     respawned.score = self.fighters[id].score;
                     respawned.deaths = self.fighters[id].deaths;
                     self.fighters[id] = respawned;
@@ -700,9 +790,13 @@ impl Match {
                 input.jump.then_some(jump_speed),
                 dt,
             );
-            let velocity = fighter.walker.velocity();
-            fighter.stride_time += dt * (velocity.0.hypot(velocity.1) / 285.0).clamp(0.0, 2.0);
+            fighter.update_gait(dt);
             let swimming = map.collision.regions.at(fighter.walker.position).water;
+            if fighter.walker.grounded || swimming {
+                fighter.airborne_since = None;
+            } else {
+                fighter.airborne_since.get_or_insert(self.time);
+            }
             if motion.jump || dodged {
                 let boost = use_boots && motion.jump;
                 if boost {
@@ -766,6 +860,8 @@ impl Match {
             ) {
                 fighter.walker = Walker::spawn(&map.collision, position);
                 fighter.yaw = yaw.unwrap_or(fighter.yaw);
+                fighter.capture_body();
+                fighter.airborne_since = None;
                 fighter.power.boosted_airborne = false;
                 fighter.bot.goal = None;
                 fighter.bot.lift = None;
@@ -1050,6 +1146,9 @@ impl Match {
             return;
         }
         fighter.fired_at = self.time;
+        if fighter.protected_until.is_finite() {
+            fighter.protected_until = fighter.protected_until.min(self.time);
+        }
         fighter.fired_count = fighter.fired_count.wrapping_add(1);
         fighter.last_alt = alt;
         let mut seed = self.time.to_bits().rotate_left(5) ^ (id as u32).wrapping_mul(0x9e37_79b9);
@@ -1498,15 +1597,18 @@ impl Match {
         if let Some(evading) = &fighter.bot.evasion
             && self.time < evading.until
         {
-            return drive(fighter, evading.direction, dt);
+            return evade(fighter, evading.direction, dt);
         }
-        if let Some(direction) = self.evade_direction(map, id, &skill) {
+        if self.time >= fighter.bot.evade_again_at
+            && let Some(direction) = self.evade_direction(map, id, &skill)
+        {
             let fighter = &mut self.fighters[id];
             fighter.bot.evasion = Some(Evasion {
                 direction,
                 until: self.time + 0.32,
             });
-            let mut command = drive(fighter, direction, dt);
+            fighter.bot.evade_again_at = self.time + 0.9;
+            let mut command = evade(fighter, direction, dt);
             if skill.dodge {
                 command.dodge = Some(command.movement);
             }
@@ -1514,6 +1616,12 @@ impl Match {
         }
         let fighter = &self.fighters[id];
         let eye = fighter.camera(map);
+        let continuing = fighter.bot.target;
+        let tracked_alive = continuing.is_some_and(|target| self.fighters[target].health > 0);
+        let attacker = fighter
+            .last_hostile_impulse
+            .filter(|&(_, at)| self.time - at < 0.7)
+            .map(|(id, _)| id);
         let target = self
             .fighters
             .iter()
@@ -1524,6 +1632,13 @@ impl Match {
             .filter_map(|(other, fighter)| {
                 let delta = fighter.walker.position + Vec3(0.0, 0.0, 12.0) - eye.position;
                 let distance = delta.dot(delta);
+                let known = continuing == Some(other) || attacker == Some(other);
+                if !known
+                    && distance > 180.0_f32.powi(2)
+                    && delta.dot(eye.forward()) < 0.15 * delta.0.hypot(delta.1)
+                {
+                    return None;
+                }
                 if fighter.invis_left(self.time) > 0.0
                     && self.time - fighter.fired_at > 0.42
                     && distance > 145.0_f32.powi(2)
@@ -1539,7 +1654,25 @@ impl Match {
                         fighter.walker.velocity(),
                     ))
             })
-            .min_by(|a, b| a.3.total_cmp(&b.3));
+            .min_by(|a, b| {
+                let score = |id, distance| {
+                    if Some(id) == continuing {
+                        distance * 0.55
+                    } else {
+                        distance
+                    }
+                };
+                f32::total_cmp(&score(a.0, a.3), &score(b.0, b.3))
+            })
+            .filter(|&(next, _, _, distance, _)| {
+                !tracked_alive
+                    || continuing == Some(next)
+                    || attacker == Some(next)
+                    || fighter.bot.last_seen.is_none_or(|(point, at)| {
+                        self.time - at >= 0.28
+                            || distance < distance_squared(point, eye.position) * 0.44
+                    })
+            });
         let fighter = &mut self.fighters[id];
         if let Some(command) = try_retreat(
             &self.navigation,
@@ -1559,16 +1692,32 @@ impl Match {
             if bot.target != Some(other) {
                 bot.target = Some(other);
                 bot.react_at = self.time + skill.reaction + (id % 3) as f32 * 0.07;
+                bot.weapon_mode = None;
             }
             let range = distance.sqrt();
             let charge = fighter.charge;
-            let weapon = if charge.is_some() {
+            let weapon = if charge.is_some()
+                || (self.time - fighter.selected_at < 1.1
+                    && fighter.inventory.usable(fighter.weapon))
+            {
                 fighter.weapon
             } else {
                 fighter.inventory.preferred(range)
             };
             let (alt, shot) = charge.map_or_else(
-                || arsenal::bot_shot(weapon, fighter.inventory.ammo(weapon), range),
+                || {
+                    let ammo = fighter.inventory.ammo(weapon);
+                    if let Some((chosen, alt, until)) = bot.weapon_mode
+                        && chosen == weapon
+                        && self.time < until
+                        && ammo >= arsenal::shot(weapon, alt).ammo
+                    {
+                        return (alt, arsenal::shot(weapon, alt));
+                    }
+                    let result = arsenal::bot_shot(weapon, ammo, range);
+                    bot.weapon_mode = Some((weapon, result.0, self.time + 0.55));
+                    result
+                },
                 |charge| (charge.alternate, arsenal::shot(weapon, charge.alternate)),
             );
             let mut clear = true;
@@ -1596,7 +1745,12 @@ impl Match {
             };
             let strafe = (self.time * 1.75 + id as f32 * 1.7).sin();
             let error = range.max(370.0) * skill.error;
-            let [side_error, height_error] = ai::shot_bias(id, fighter.fired_count);
+            let desired_bias = ai::shot_bias(id, fighter.fired_count);
+            let bias = bot.aim_bias.get_or_insert(desired_bias);
+            for (axis, desired) in bias.iter_mut().zip(desired_bias) {
+                *axis += (desired - *axis) * (1.0 - (-12.0 * dt).exp());
+            }
+            let [side_error, height_error] = *bias;
             delta = delta
                 + eye.right() * (side_error * error)
                 + Vec3(0.0, 0.0, height_error * error * 0.55);
@@ -1623,8 +1777,15 @@ impl Match {
             } else {
                 ((range - (attack_range * 0.58).min(360.0)) / 450.0).clamp(-0.28, 0.65)
             };
+            let offset = target_position - fighter.walker.position;
+            let forward = unit(Vec3(offset.0, offset.1, 0.0));
+            let right = Vec3(-forward.1, forward.0, 0.0);
+            let desired = forward * advance + right * (strafe * skill.strafe);
+            bot.combat_move =
+                bot.combat_move + (desired - bot.combat_move) * (1.0 - (-8.0 * dt).exp());
+            let movement = safe_combat_move(map, &fighter.walker, bot.combat_move);
             return Command {
-                movement: [advance, strafe * skill.strafe],
+                movement: movement_input(movement, fighter.yaw + yaw),
                 look: [yaw, tilt],
                 primary: hold_trigger && !alt,
                 alternate: hold_trigger && alt,
@@ -1633,25 +1794,36 @@ impl Match {
                 ..Command::default()
             };
         }
-        bot.target = None;
-        let position = fighter.walker.position;
-        if self.time >= bot.rethink_at
-            || bot.goal.is_some_and(|goal| {
-                matches!(goal, Step::Walk(point)
-                    if near_waypoint(point, position))
-            })
+        if let Some((point, seen)) = bot.last_seen
+            && tracked_alive
+            && self.time - seen < 0.28
         {
-            let stalled = bot.plan_origin.is_some_and(|origin| {
-                matches!(bot.goal, Some(Step::Walk(point)) if !near_waypoint(point, position))
+            let (turn, pitch) = aim_error(point - eye.position, fighter.yaw, fighter.pitch);
+            let yaw = turn.clamp(-skill.turn * dt, skill.turn * dt);
+            bot.combat_move = bot.combat_move * (-7.0 * dt).exp();
+            let movement = safe_combat_move(map, &fighter.walker, bot.combat_move);
+            return Command {
+                movement: movement_input(movement, fighter.yaw + yaw),
+                look: [yaw, pitch.clamp(-skill.turn * dt, skill.turn * dt)],
+                ..Command::default()
+            };
+        }
+        if bot.target.take().is_some() {
+            bot.goal = None;
+            bot.rethink_at = self.time;
+        }
+        bot.combat_move = Vec3::default();
+        let position = fighter.walker.position;
+        let check_progress = self.time >= bot.rethink_at;
+        let arrived = matches!(bot.goal, Some(Step::Walk(point)) if near_waypoint(point, position));
+        let stalled = check_progress
+            && !arrived
+            && bot.plan_origin.is_some_and(|origin| {
+                matches!(bot.goal, Some(Step::Walk(_)))
                     && distance_squared(origin, position) < 24.0_f32.powi(2)
             });
+        if arrived || stalled || (check_progress && bot.goal.is_none()) {
             bot.plan_origin = Some(position);
-            let visible = |point: Vec3| {
-                let delta = point - position;
-                delta.2.abs() < 100.0
-                    && delta.dot(delta) > 70.0_f32.powi(2)
-                    && map.collision.ray(position, delta).is_none()
-            };
             let mut supplies: Vec<_> = map
                 .props
                 .iter()
@@ -1690,30 +1862,33 @@ impl Match {
                 .into_iter()
                 .take(if stalled { 0 } else { 2 })
                 .find_map(|point| self.navigation.next_step(&map.collision, position, point));
-            bot.goal = supply
-                .or_else(|| {
-                    if stalled {
-                        return None;
-                    }
-                    chase.and_then(|point| {
-                        self.navigation.next_step(&map.collision, position, point)
-                    })
-                })
-                .or_else(|| {
-                    (0..12)
-                        .filter_map(|offset| {
-                            let yaw = fighter.yaw
-                                + (offset as f32 + id as f32 + self.time.floor())
-                                    * std::f32::consts::TAU
-                                    / 12.0;
-                            let direction = Vec3(yaw.cos(), yaw.sin(), 0.0);
-                            let point = position + direction * 325.0;
-                            (visible(point)
-                                && map.collision.ray(point, Vec3(0.0, 0.0, -95.0)).is_some())
+            let pursue = (!stalled)
+                .then_some(chase)
+                .flatten()
+                .and_then(|point| self.navigation.next_step(&map.collision, position, point));
+            let stocked = fighter.inventory.preferred(560.0).switch_priority()
+                > Weapon::Enforcer.switch_priority();
+            bot.goal = if stocked {
+                pursue.or(supply)
+            } else {
+                supply.or(pursue)
+            };
+            if bot.goal.is_none() {
+                bot.goal = (0..12).find_map(|offset| {
+                    let yaw = fighter.yaw
+                        + (offset as f32 + id as f32 + self.time.floor()) * std::f32::consts::TAU
+                            / 12.0;
+                    let direction = Vec3(yaw.cos(), yaw.sin(), 0.0);
+                    [280.0, 140.0].into_iter().find_map(|distance| {
+                        let point = position + direction * distance;
+                        navigation::walk_link(&map.collision, position, point)
                             .then_some(Step::Walk(point))
-                        })
-                        .next()
+                    })
                 });
+            }
+            bot.rethink_at = self.time + 1.35;
+        } else if check_progress {
+            bot.plan_origin = Some(position);
             bot.rethink_at = self.time + 1.35;
         }
         if let Some(command) = follow_transfer(map, fighter, self.time, dt) {
@@ -1723,7 +1898,7 @@ impl Match {
             return steer(fighter, goal, dt);
         }
         Command {
-            look: [(4.6 * dt).min(1.5), -fighter.pitch * (dt * 4.0).min(1.0)],
+            look: [(1.8 * dt).min(1.5), -fighter.pitch * (dt * 4.0).min(1.0)],
             ..Command::default()
         }
     }
@@ -1963,6 +2138,56 @@ fn near_waypoint(waypoint: Vec3, position: Vec3) -> bool {
     delta.0.hypot(delta.1) < WAYPOINT_RADIUS && delta.2.abs() < 56.0
 }
 
+fn safe_combat_move(map: &Map, walker: &Walker, desired: Vec3) -> Vec3 {
+    let origin = walker.position;
+    if !walker.grounded || map.collision.regions.at(origin).water {
+        return desired;
+    }
+    let safe = |movement: Vec3| {
+        let speed = movement.0.hypot(movement.1);
+        if speed < 0.01 {
+            return true;
+        }
+        let step = movement * ((PLAYER_RADIUS + 52.0 * speed.min(1.0)) / speed);
+        let point = origin + step;
+        let ground = map.collision.ray(point, Vec3(0.0, 0.0, -95.0));
+        map.collision.ray(origin, step).is_none()
+            && ground.is_some_and(|ground| {
+                let zone = map.collision.regions.at(ground + Vec3(0.0, 0.0, 4.0));
+                !zone.pain && !zone.water
+            })
+    };
+    if safe(desired) {
+        desired
+    } else {
+        let [x, y] = [Vec3(desired.0, 0.0, 0.0), Vec3(0.0, desired.1, 0.0)];
+        [x, y]
+            .into_iter()
+            .filter(|&movement| safe(movement))
+            .max_by(|a, b| a.dot(*a).total_cmp(&b.dot(*b)))
+            .unwrap_or_default()
+    }
+}
+
+fn movement_input(movement: Vec3, yaw: f32) -> [f32; 2] {
+    let (sin, cos) = yaw.sin_cos();
+    [
+        movement.dot(Vec3(cos, sin, 0.0)),
+        movement.dot(Vec3(-sin, cos, 0.0)),
+    ]
+}
+
+fn evade(fighter: &Fighter, direction: Vec3, dt: f32) -> Command {
+    if fighter.bot.target.is_some() {
+        Command {
+            movement: movement_input(direction, fighter.yaw),
+            ..Command::default()
+        }
+    } else {
+        drive(fighter, direction, dt)
+    }
+}
+
 fn steer(fighter: &Fighter, point: Vec3, dt: f32) -> Command {
     let delta = point - fighter.walker.position;
     let distance = delta.0.hypot(delta.1);
@@ -1984,9 +2209,8 @@ fn drive(fighter: &Fighter, movement: Vec3, dt: f32) -> Command {
     }
     let (turn, _) = aim_error(movement, fighter.yaw, fighter.pitch);
     let yaw_change = turn.clamp(-4.6 * dt, 4.6 * dt);
-    let (side, forward) = (turn - yaw_change).sin_cos();
     Command {
-        movement: [forward * speed, side * speed],
+        movement: movement_input(movement, fighter.yaw + yaw_change),
         look: [yaw_change, -fighter.pitch * (dt * 4.0).min(1.0)],
         ..Command::default()
     }
@@ -2045,11 +2269,23 @@ fn distance_squared(a: Vec3, b: Vec3) -> f32 {
     delta.dot(delta)
 }
 
+fn usable_start(map: &Map, index: usize) -> Option<Vec3> {
+    let start = map.starts[index];
+    let walker = Walker::spawn(&map.collision, start.position);
+    let zone = map.collision.regions.at(walker.position);
+    (start.enabled && walker.grounded && !zone.water && !zone.pain).then_some(walker.position)
+}
+
 fn aim_error(delta: Vec3, yaw: f32, pitch: f32) -> (f32, f32) {
-    let turn = (delta.1.atan2(delta.0) - yaw + std::f32::consts::PI)
-        .rem_euclid(std::f32::consts::TAU)
-        - std::f32::consts::PI;
-    (turn, delta.2.atan2(delta.0.hypot(delta.1)) - pitch)
+    (
+        angle_delta(delta.1.atan2(delta.0), yaw),
+        delta.2.atan2(delta.0.hypot(delta.1)) - pitch,
+    )
+}
+
+fn angle_delta(target: f32, current: f32) -> f32 {
+    (target - current + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
+        - std::f32::consts::PI
 }
 
 #[cfg(test)]
@@ -2072,10 +2308,12 @@ mod tests {
             crate::map::Start {
                 position: Vec3(0.0, 0.0, 39.2),
                 yaw: 0.0,
+                enabled: true,
             },
             crate::map::Start {
                 position: Vec3(520.0, 325.0, 39.2),
                 yaw: std::f32::consts::PI,
+                enabled: true,
             },
         ];
         map.navigation_points.clear();
@@ -2559,10 +2797,12 @@ mod tests {
             crate::map::Start {
                 position: Vec3(440.0, 0.0, 39.2),
                 yaw: std::f32::consts::PI,
+                enabled: true,
             },
             crate::map::Start {
                 position: Vec3(0.0, 0.0, 39.2),
                 yaw: 0.0,
+                enabled: true,
             },
         ];
         map.navigation_points.clear();
@@ -2666,6 +2906,7 @@ mod tests {
         map.starts = vec![crate::map::Start {
             position: Vec3(-175.0, 0.0, 39.2),
             yaw: 0.0,
+            enabled: true,
         }];
         map.navigation_points = vec![entry, exit];
         map.collision
@@ -3181,6 +3422,97 @@ mod tests {
 
     #[test]
     #[ignore = "requires local GOTY data"]
+    fn bot_keeps_its_target_through_a_brief_occlusion() {
+        let (mut map, _) = flight_fixture();
+        let mut game = Match::new(
+            &map,
+            0,
+            Rules {
+                bots: 2,
+                ..Rules::default()
+            },
+        );
+        for (id, x, y) in [(0, 400.0, 0.0), (1, 0.0, 0.0), (2, 365.0, 220.0)] {
+            let fighter = &mut game.fighters[id];
+            fighter.walker = Walker::spawn(&map.collision, Vec3(x, y, 39.2));
+            fighter.yaw = 0.0;
+            fighter.protected_until = 0.0;
+        }
+        game.time = 2.0;
+        game.bot_command(&map, 1, 1.0 / 120.0);
+        let reaction = game.fighters[1].bot.react_at;
+        assert_eq!(game.fighters[1].bot.target, Some(0));
+        game.fighters[2].walker.position = Vec3(320.0, 120.0, 39.2);
+        game.time = 3.0;
+        game.bot_command(&map, 1, 1.0 / 120.0);
+        assert_eq!(game.fighters[1].bot.target, Some(0));
+        map.collision
+            .add_box(Vec3(180.0, -42.0, 0.0), Vec3(220.0, 42.0, 100.0));
+        game.time = 3.1;
+        let behind_cover = game.bot_command(&map, 1, 1.0 / 120.0);
+        assert_eq!(game.fighters[1].bot.target, Some(0));
+        assert!(!behind_cover.primary && !behind_cover.alternate);
+        game.fighters[0].walker.position = Vec3(400.0, -120.0, 39.2);
+        game.time = 3.2;
+        game.bot_command(&map, 1, 1.0 / 120.0);
+        assert_eq!(game.fighters[1].bot.target, Some(0));
+        assert_eq!(game.fighters[1].bot.react_at, reaction);
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY data"]
+    fn bot_respawns_on_a_fresh_safe_start_and_keeps_its_score() {
+        let (mut map, _) = flight_fixture();
+        map.collision
+            .add_box(Vec3(-120.0, 200.0, 0.0), Vec3(120.0, 215.0, 160.0));
+        map.starts = [
+            Vec3(0.0, 0.0, 39.2),
+            Vec3(520.0, 0.0, 39.2),
+            Vec3(0.0, 535.0, 39.2),
+            Vec3(830.0, 0.0, 39.2),
+            Vec3(0.0, -650.0, 500.0),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, position)| crate::map::Start {
+            position,
+            yaw: 0.0,
+            enabled: index != 3,
+        })
+        .collect();
+        let mut game = Match::new(
+            &map,
+            0,
+            Rules {
+                bots: 1,
+                ..Rules::default()
+            },
+        );
+        assert_eq!(game.fighters[1].spawn, 2);
+        let bot = &mut game.fighters[1];
+        bot.health = 0;
+        bot.score = 3;
+        bot.deaths = 1;
+        bot.fell_at = Some(0.0);
+        game.time = 1.0;
+        game.step(&mut map, Command::default(), 1.0 / 120.0);
+        assert_eq!(game.fighters[1].health, 0);
+        game.time = 2.0;
+        game.step(&mut map, Command::default(), 1.0 / 120.0);
+        let bot = &game.fighters[1];
+        assert_eq!(bot.spawn, 1);
+        assert_eq!((bot.score, bot.deaths, bot.health), (3, 1, 100));
+        assert!(bot.walker.grounded && bot.protected_until > game.time);
+        let (before, yaw_before) = bot.body_transform(0.0);
+        let (after, yaw_after) = bot.body_transform(1.0);
+        assert!(
+            distance_squared(before, after) < 0.001
+                && angle_delta(yaw_after, yaw_before).abs() < 0.001
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY data"]
     fn match_renders_shared_hud_and_reuploads_deck16_after_logo() {
         use crate::render::{Frame, commands::LIGHTMAPS};
 
@@ -3214,11 +3546,11 @@ mod tests {
         assert!(game.traces.is_empty());
         let camera = game.fighters[0].camera(&map);
         let mut frame = Frame::hardware(&map);
-        frame.draw_deathmatch(&map, &camera, &game, 90.0);
+        frame.draw_deathmatch(&map, &camera, &game, 90.0, 1.0);
         let first = frame.commands.take().unwrap();
         let menu = Frame::hardware(&logo).commands.unwrap();
         let mut frame = Frame::hardware(&map);
-        frame.draw_deathmatch(&map, &camera, &game, 90.0);
+        frame.draw_deathmatch(&map, &camera, &game, 90.0, 1.0);
         let resumed = frame.commands.unwrap();
         assert_ne!(first.scene_id, menu.scene_id);
         assert_ne!(menu.scene_id, resumed.scene_id);
@@ -3330,12 +3662,21 @@ mod tests {
         pawn.walker.add_velocity(Vec3(250.0, 0.0, 0.0));
         pose(&pawn, &map.player_clips.air, 0.0);
         pawn.walker.grounded = true;
+        pawn.update_gait(0.0);
         pose(&pawn, &map.player_clips.fire_run, 0.0);
         pose(&pawn, &map.player_clips.run, 1.0);
         pawn.hurt_at = 1.0;
         pose(&pawn, &map.player_clips.hurt, 1.0);
         pawn.fell_at = Some(1.0);
         pose(&pawn, &map.player_deaths[1], 1.0);
+        pawn.yaw = std::f32::consts::TAU - 0.04;
+        pawn.capture_body();
+        let origin = pawn.walker.position;
+        pawn.yaw = 0.04;
+        pawn.walker.position = origin + Vec3(12.0, 0.0, 0.0);
+        let (midpoint, angle) = pawn.body_transform(0.5);
+        assert_eq!(midpoint.0, origin.0 + 6.0);
+        assert!(angle_delta(angle, 0.0).abs() < 0.001);
     }
 
     #[test]
@@ -3445,6 +3786,12 @@ mod tests {
         let bot = &game.fighters[1];
         assert!(distance_squared(bot.walker.position, exit) < 35.0_f32.powi(2));
         assert!(bot.portal.is_some());
+        let (before, yaw_before) = bot.body_transform(0.0);
+        let (after, yaw_after) = bot.body_transform(1.0);
+        assert!(
+            distance_squared(before, after) < 0.001
+                && angle_delta(yaw_after, yaw_before).abs() < 0.001
+        );
         assert!(bot.bot.goal.is_none());
     }
 
@@ -3491,7 +3838,7 @@ mod tests {
         {
             let camera = game.fighters[0].camera(&map);
             let mut frame = crate::render::Frame::new();
-            frame.draw_deathmatch(&map, &camera, &game, 90.0);
+            frame.draw_deathmatch(&map, &camera, &game, 90.0, 1.0);
             let scene = frame.pixels.clone();
             crate::hud::Hud::new().draw_deathmatch(
                 &mut frame,
