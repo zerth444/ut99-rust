@@ -23,6 +23,40 @@ pub struct Camera {
 }
 
 impl Camera {
+    pub(crate) fn following_death(map: &Map, body: Vec3, yaw: f32, time_since_death: f32) -> Self {
+        let age = time_since_death.max(0.0);
+        let angle = yaw + 0.8 + age.min(1.6) * 0.45;
+        let target = body - Vec3(0.0, 0.0, 12.0 + age.min(1.0) * 12.0);
+        let desired = Vec3(-angle.cos() * 118.0, -angle.sin() * 118.0, 54.0);
+        let clear_position = |delta| {
+            map.collision
+                .ray(target, delta)
+                .map_or(target + delta, |point| {
+                    point - crate::mover::unit(delta) * 5.0
+                })
+        };
+        let mut position = clear_position(desired);
+        if (target - position).dot(target - position) < 50.0_f32.powi(2) {
+            for delta in [
+                Vec3(-desired.1, desired.0, desired.2),
+                Vec3(desired.1, -desired.0, desired.2),
+                Vec3(-desired.0, -desired.1, desired.2),
+            ] {
+                let candidate = clear_position(delta);
+                if (target - candidate).dot(target - candidate)
+                    > (target - position).dot(target - position)
+                {
+                    position = candidate;
+                }
+            }
+        }
+        let look = target - position;
+        Self {
+            position,
+            yaw: look.1.atan2(look.0),
+            pitch: look.2.atan2(look.0.hypot(look.1)),
+        }
+    }
     pub fn from_start(start: Start) -> Self {
         Self {
             position: start.position + Vec3(0.0, 0.0, 24.0),
@@ -366,24 +400,25 @@ impl Frame {
     ) {
         let player = &game.fighters[0];
         let piloting = game.guidance_left().is_some();
+        let dead = player.fell_at.is_some();
         let (roll, height) = game.warhead_shake(camera.position);
         let shaken = Camera {
             position: camera.position + Vec3(0.0, 0.0, height),
             ..*camera
         };
-        let camera = if piloting || game.finished {
+        let camera = if piloting || game.finished || dead {
             camera
         } else {
             &shaken
         };
         self.roll = if piloting {
             game.guided_roll()
-        } else if game.finished {
+        } else if game.finished || dead {
             0.0
         } else {
             roll
         };
-        let fov = if player.zoomed() && !piloting && !game.finished {
+        let fov = if player.zoomed() && !piloting && !game.finished && !dead {
             player.field_of_view(fov)
         } else {
             fov
@@ -437,12 +472,9 @@ impl Frame {
             .visuals(&map.ballistics, game.time, |visual| {
                 self.draw_world_effect(&view, game.time, visual);
             });
-        for (id, fighter) in game
-            .fighters
-            .iter()
-            .enumerate()
-            .skip(usize::from(!piloting && game.result_camera(map).is_none()))
-        {
+        for (id, fighter) in game.fighters.iter().enumerate().skip(usize::from(
+            !piloting && !dead && game.result_camera(map).is_none(),
+        )) {
             if let Some(pose) = fighter.pose(map, id, game.time) {
                 let cloak = fighter.health > 0
                     && fighter.invis_left(game.time) > 0.0
@@ -673,23 +705,7 @@ impl Frame {
         game: &crate::game::Practice,
     ) {
         let death_camera = game.death.as_ref().map(|death| {
-            let age = (game.time - death.started).max(0.0);
-            let angle = death.yaw + 0.8 + age.min(1.6) * 0.45;
-            let up = Vec3(0.0, 0.0, 1.0);
-            let target = death.position - up * (12.0 + age.min(1.0) * 12.0);
-            let delta = Vec3(-angle.cos() * 118.0, -angle.sin() * 118.0, 54.0);
-            let position = map
-                .collision
-                .ray(target, delta)
-                .map_or(target + delta, |point| {
-                    point - crate::mover::unit(delta) * 5.0
-                });
-            let look = target - position;
-            Camera {
-                position,
-                yaw: look.1.atan2(look.0),
-                pitch: look.2.atan2(look.0.hypot(look.1)),
-            }
+            Camera::following_death(map, death.position, death.yaw, game.time - death.started)
         });
         let guided_camera = game.ordnance.guided_view();
         let (shake_roll, shake_height) = game.ordnance.nuclear_shake(camera.position, game.time);

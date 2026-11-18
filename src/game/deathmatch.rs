@@ -1,7 +1,5 @@
 //! Offline arena simulation. The window supplies input and displays snapshots.
 
-use std::collections::VecDeque;
-
 mod ai;
 mod arsenal;
 mod guidance;
@@ -774,7 +772,6 @@ pub struct Match {
     navigation: Navigation,
     recent_spawns: Vec<Option<u64>>,
     spawn_sequence: u64,
-    feed: VecDeque<(String, f32)>,
     announcement: Option<(&'static str, f32)>,
     first_frag: bool,
     player_frags: (u8, f32),
@@ -814,7 +811,6 @@ impl Match {
             navigation: Navigation::new(map),
             recent_spawns: vec![None; map.starts.len()],
             spawn_sequence: 0,
-            feed: VecDeque::with_capacity(4),
             announcement: None,
             first_frag: false,
             player_frags: (0, f32::NEG_INFINITY),
@@ -859,7 +855,6 @@ impl Match {
         self.bolts.clear();
         self.pickups.fill(None);
         self.restore_map(map);
-        self.feed.clear();
         self.announcement = None;
         self.first_frag = false;
         self.player_frags = (0, f32::NEG_INFINITY);
@@ -952,10 +947,6 @@ impl Match {
         }
     }
 
-    pub fn difficulty(&self) -> Difficulty {
-        self.rules.difficulty
-    }
-
     pub fn standings(&self) -> Vec<usize> {
         let mut ids: Vec<_> = (0..self.fighters.len()).collect();
         ids.sort_by_key(|&id| (std::cmp::Reverse(self.fighters[id].score), id));
@@ -977,13 +968,6 @@ impl Match {
         } else {
             format!("BOT {id}")
         }
-    }
-
-    pub fn notices(&self) -> impl Iterator<Item = &str> {
-        self.feed
-            .iter()
-            .rev()
-            .filter_map(|(text, until)| (self.time < *until).then_some(text.as_str()))
     }
 
     pub fn pickup_notice(&self) -> Option<Item> {
@@ -1110,6 +1094,9 @@ impl Match {
         if let Some(camera) = self.result_camera(map) {
             return camera;
         }
+        if let Some(camera) = self.death_camera(map, 1.0) {
+            return camera;
+        }
         if let Some(index) = self.pilot_index() {
             let bolt = &self.bolts[index];
             return bolt
@@ -1125,6 +1112,9 @@ impl Match {
         if self.finished || self.pilot_index().is_some() {
             return self.player_view(map);
         }
+        if let Some(camera) = self.death_camera(map, blend) {
+            return camera;
+        }
         let player = &self.fighters[0];
         let mut camera = player.camera(map);
         let mut profile = map.collision.profile;
@@ -1139,6 +1129,17 @@ impl Match {
             .ray_surface(eye, delta)
             .map_or(eye + delta, |(point, normal)| point + normal * 0.5);
         camera
+    }
+
+    fn death_camera(&self, map: &Map, blend: f32) -> Option<Camera> {
+        let player = &self.fighters[0];
+        let (position, yaw) = player.body_transform(blend);
+        Some(Camera::following_death(
+            map,
+            position,
+            yaw,
+            self.time - player.fell_at?,
+        ))
     }
 
     pub(crate) fn result_camera(&self, map: &Map) -> Option<Camera> {
@@ -3201,7 +3202,7 @@ impl Match {
                 .filter(|&(_, at)| self.time - at <= ENVIRONMENT_CREDIT_WINDOW)
                 .map(|(owner, _)| owner)
         });
-        let message = if let Some(owner) = owner.filter(|&owner| owner != hit.victim) {
+        if let Some(owner) = owner.filter(|&owner| owner != hit.victim) {
             self.fighters[owner].score += 1;
             if !self.first_frag {
                 self.first_frag = true;
@@ -3221,15 +3222,9 @@ impl Match {
                     _ => {}
                 }
             }
-            format!("{} fragged {}", Self::label(owner), Self::label(hit.victim))
         } else {
             self.fighters[hit.victim].score -= 1;
-            format!("{} went down", Self::label(hit.victim))
-        };
-        if self.feed.len() == 4 {
-            self.feed.pop_front();
         }
-        self.feed.push_back((message, self.time + 3.0));
     }
 
     fn bot_command(&mut self, map: &Map, id: usize, dt: f32) -> Command {
@@ -4509,12 +4504,10 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(game.guidance_left().is_none(), "{cause}");
-            assert!(
-                distance_squared(
-                    game.player_view(&map).position,
-                    game.fighters[0].camera(&map).position
-                ) < 0.01
-            );
+            let expected = game
+                .death_camera(&map, 1.0)
+                .unwrap_or_else(|| game.fighters[0].camera(&map));
+            assert!(distance_squared(game.player_view(&map).position, expected.position) < 0.01);
         }
     }
 
@@ -6522,6 +6515,35 @@ mod tests {
                 && angle_delta(yaw_after, yaw_before).abs() < 0.001
         );
         assert!(bot.bot.goal.is_none());
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY data"]
+    fn death_camera_tracks_the_local_body_until_the_player_respawns() {
+        let (mut map, mut game) = flight_fixture();
+        game.time = 2.0;
+        game.apply_hit(
+            &map,
+            Hit {
+                victim: 0,
+                owner: Some(1),
+                damage: 200,
+                impulse: Vec3::default(),
+                bypass_armor: true,
+            },
+            &mut SoundEvents::default(),
+        );
+        let body = game.fighters[0].walker.position;
+        let view = game.render_view(&map, 1.0, 0.0);
+        let delta = body - view.position;
+        assert!(delta.dot(delta) > 80.0_f32.powi(2));
+        assert!(unit(delta).dot(view.look_direction()) > 0.99);
+        assert!(game.fighters[0].pose(&map, 0, game.time).is_some());
+        game.time += RESPAWN_DELAY;
+        game.step(&mut map, Command::default(), 1.0 / 120.0);
+        assert!(game.fighters[0].fell_at.is_none());
+        let eye = game.fighters[0].camera(&map).position;
+        assert!(distance_squared(eye, game.player_view(&map).position) < 0.01);
     }
 
     #[test]

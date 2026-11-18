@@ -681,7 +681,7 @@ unsafe fn message_loop(
                     hud.draw_deathmatch(&mut frame, game, map, scoreboard, mouse.captured);
                     if settings.show_fps && !scoreboard && !game.finished {
                         let label = stats.label(window, size, presenter.software);
-                        hud.text(&mut frame, 16, 35, 0.8, &label, [0.72, 0.95, 0.78]);
+                        hud.centered(&mut frame, 8, 0.8, &label, [0.72, 0.95, 0.78]);
                     }
                     if presenter
                         .draw(

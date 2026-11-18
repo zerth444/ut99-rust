@@ -178,7 +178,8 @@ impl MenuArt {
                     menu("Area")
                 } else {
                     themed("ClientArea")
-                },
+                }
+                .map(Texture::opaque),
                 dropdown: menu("Area"),
                 highlight: menu("HM"),
             }
@@ -426,6 +427,7 @@ const GAME: [&str; 7] = [
     "Frag Limit",
     "Time Limit",
 ];
+const FIELD_COLOR: [f32; 3] = [0.76, 0.79, 0.89];
 const NAV_HEIGHT: i32 = 16;
 const NAV_BUTTON_WIDTH: i32 = 88;
 impl Menu {
@@ -635,8 +637,12 @@ impl Menu {
         let ui = Layout::new(size, self.dpi);
         let [x, y] = ui.local(x, y);
         if let Some(setup) = &mut self.match_setup {
-            let [left, top, ..] = ui.match_rect(size);
+            let [left, top, width, _] = ui.match_rect(size);
             let (x, y) = (x - left, y - top);
+            if (width - 16..width - 2).contains(&x) && (0..16).contains(&y) {
+                self.match_setup = None;
+                return Action::None;
+            }
             let count = self.match_names.len();
             self.status.clear();
             if (12..209).contains(&x) && (52..196).contains(&y) {
@@ -657,7 +663,7 @@ impl Menu {
                     }
                 }
             }
-            if (207..229).contains(&y) {
+            if (210..226).contains(&y) {
                 match x {
                     12..89 | 96..173 => setup.turn_page(x >= 96, count),
                     222..305 => self.match_setup = None,
@@ -862,36 +868,14 @@ impl Menu {
             label(frame, x + 7, 1, caption);
         }
         if let Some(setup) = &self.match_setup {
-            let rect @ [x, y, width, _] = ui.match_rect(size);
-            let text = |frame: &mut Frame, left: i32, top: i32, size: f32, value: &str, color| {
-                font.text(
-                    frame,
-                    ((x + left) as f32 * ui.scale).round() as i32,
-                    ((y + top) as f32 * ui.scale).round() as i32,
-                    size * ui.scale,
-                    value,
-                    color,
-                );
-            };
-            let fill = |frame: &mut Frame, [left, top, w, h]: [i32; 4], color| {
-                ui.tile(frame, None, [x + left, y + top, w, h], color);
-            };
-            let ink = [0.91, 0.93, 0.96];
-            let dim = [0.64, 0.70, 0.75];
-            let highlight = [0.23, 0.40, 0.43];
-            let control = [0.17, 0.23, 0.27];
-            let enabled = |on| if on { ink } else { [0.46, 0.49, 0.52] };
-            let button = |frame: &mut Frame, rect: [i32; 4], value: &str, primary, on| {
-                fill(frame, rect, if primary && on { highlight } else { control });
-                text(frame, rect[0] + 8, rect[1] + 4, 0.64, value, enabled(on));
-            };
-            ui.tile(frame, None, rect, [0.09, 0.12, 0.15]);
-            fill(frame, [0, 0, width, 2], highlight);
-            text(frame, 12, 9, 0.97, "Local Deathmatch", ink);
-            text(frame, 12, 33, 0.69, "Maps", dim);
-            text(frame, 222, 33, 0.69, "Match rules", dim);
-            fill(frame, [12, 52, 197, 144], [0.07, 0.09, 0.11]);
+            let rect @ [x, y, _, _] = ui.match_rect(size);
+            ui.window(frame, art, rect);
+            label(frame, x + 5, y + 1, "Local Deathmatch");
+            label(frame, x + 12, y + 31, "Maps");
+            label(frame, x + 222, y + 31, "Match rules");
+            ui.tile(frame, None, [x + 12, y + 52, 197, 144], FIELD_COLOR);
             let page = setup.page();
+            let count = self.match_names.len();
             for (row, name) in self
                 .match_names
                 .iter()
@@ -899,57 +883,54 @@ impl Menu {
                 .take(MAPS_PER_PAGE)
                 .enumerate()
             {
-                let top = 52 + 18 * row as i32;
+                let top = y + 52 + 18 * row as i32;
                 if page + row == setup.map {
-                    fill(
+                    ui.tile(
                         frame,
-                        [12, top, 197, 18],
-                        if setup.focus == 0 { highlight } else { control },
+                        art.highlight.as_ref(),
+                        [x + 12, top, 197, 18],
+                        [0.52, 0.64, 0.81],
                     );
+                    if setup.focus == 0 {
+                        ui.solid_outline(frame, [x + 12, top, 197, 18]);
+                    }
                 }
                 let name: String = name.chars().take(23).collect();
-                text(frame, 18, top + 2, 0.66, &name, ink);
+                label(frame, x + 18, top + 2, &name);
             }
             for (field, name) in MATCH_FIELDS.into_iter().enumerate() {
-                let y = 52 + field as i32 * 36;
+                let top = y + 52 + field as i32 * 36;
+                label(frame, x + 222, top, name);
+                let control = [x + 222, top + 12, 194, 18];
+                ui.tile(frame, None, control, FIELD_COLOR);
                 if setup.focus == field + 1 {
-                    fill(frame, [222, y, 194, 34], highlight);
+                    ui.solid_outline(frame, control);
                 }
-                text(frame, 230, y + 1, 0.61, name, dim);
-                text(frame, 230, y + 15, 0.72, &setup.value(field), ink);
+                label(frame, x + 228, top + 14, &setup.value(field));
                 let (min, max) = MATCH_BOUNDS[field];
-                button(
-                    frame,
-                    [333, y + 5, 24, 24],
-                    "-",
-                    false,
-                    setup.values[field] > min,
-                );
-                button(
-                    frame,
-                    [392, y + 5, 24, 24],
-                    "+",
-                    false,
-                    setup.values[field] < max,
-                );
+                if setup.values[field] > min {
+                    label(frame, x + 340, top + 14, "<");
+                }
+                if setup.values[field] < max {
+                    label(frame, x + 400, top + 14, ">");
+                }
             }
-            let count = self.match_names.len();
-            button(frame, [12, 207, 77, 22], "Previous", false, page > 0);
-            button(
-                frame,
-                [96, 207, 77, 22],
-                "Next",
-                false,
-                page + MAPS_PER_PAGE < count,
-            );
-            button(frame, [222, 207, 83, 22], "Cancel", false, true);
-            button(frame, [313, 207, 103, 22], "Start match", true, count > 0);
-            let status = if count == 0 {
-                "No installed Deathmatch maps"
-            } else {
-                &self.status
-            };
-            text(frame, 12, 236, 0.63, status, [1.0, 0.70, 0.56]);
+            for (left, width, caption, visible) in [
+                (12, 77, "Previous", page > 0),
+                (96, 77, "Next", page + MAPS_PER_PAGE < count),
+                (222, 83, "Cancel", true),
+                (313, 103, "Start match", count > 0),
+            ] {
+                if visible {
+                    ui.button(frame, art, [x + left, y + 210, width, 16]);
+                    label(frame, x + left + 8, y + 211, caption);
+                }
+            }
+            if count == 0 {
+                label(frame, x + 12, y + 235, "No installed Deathmatch maps");
+            } else if !self.status.is_empty() {
+                label(frame, x + 12, y + 235, &self.status);
+            }
             return;
         }
         if !self.preferences {
@@ -1061,12 +1042,7 @@ impl Menu {
         for (index, (caption, value)) in self.rows().iter().zip(values).enumerate() {
             let row_y = y + row_y(index);
             if self.selected == index {
-                ui.tile(
-                    frame,
-                    art.highlight.as_ref(),
-                    [x + 8, row_y + 3, 3, 15],
-                    [0.21, 0.33, 0.50],
-                );
+                ui.solid_outline(frame, [x + 12, row_y + 2, 122, 18]);
             }
             label(frame, x + 15, row_y + 4, caption);
             let checkbox = match (self.tab, index) {
@@ -1124,7 +1100,7 @@ impl Menu {
                     frame,
                     None,
                     [left, row_y + 2, CHOICE_WIDTH, 18],
-                    [0.76, 0.79, 0.89],
+                    FIELD_COLOR,
                 );
                 if let Some(atlas) = &art.window {
                     ui.segment(
@@ -1139,12 +1115,7 @@ impl Menu {
                 label(frame, left + 5, row_y + 4, &value);
                 continue;
             }
-            ui.tile(
-                frame,
-                None,
-                [x + 279, row_y + 2, 130, 18],
-                [0.76, 0.79, 0.89],
-            );
+            ui.tile(frame, None, [x + 279, row_y + 2, 130, 18], FIELD_COLOR);
             if self.tab == 0 || self.tab == 4 {
                 ui.label(frame, font, menu_font, x + 291, row_y + 4, "<");
                 ui.label(frame, font, menu_font, x + 401, row_y + 4, ">");
@@ -1254,9 +1225,15 @@ impl Layout {
         }
     }
 
-    fn button(&self, frame: &mut Frame, art: &SkinArt, rect: [i32; 4]) {
+    fn button(&self, frame: &mut Frame, art: &SkinArt, rect @ [x, y, w, h]: [i32; 4]) {
         if let Some(button) = &art.button {
-            self.segment(frame, button, rect, [0.0, 0.0, 48.0, 16.0]);
+            for (piece, source) in [
+                ([x, y, 4, h], [0.0, 0.0, 4.0, 16.0]),
+                ([x + 4, y, w - 8, h], [4.0, 0.0, 40.0, 16.0]),
+                ([x + w - 4, y, 4, h], [44.0, 0.0, 4.0, 16.0]),
+            ] {
+                self.segment(frame, button, piece, source);
+            }
         } else {
             self.tile(frame, None, rect, [0.71, 0.75, 0.86]);
         }
@@ -1486,6 +1463,9 @@ mod tests {
         );
         assert!(front.art.skins[0].bar_ends.iter().all(Option::is_some));
         assert!(front.art.skins[0].bar_hover.iter().all(Option::is_some));
+        let panel = front.art.skins[0].panel.as_ref().unwrap().image(0.0);
+        assert_eq!(panel.sample(1.5, 0.5, true), panel.sample(1.5, 0.5, false));
+        assert!(panel.bgra().iter().all(|pixel| pixel >> 24 == 255));
         assert!(front.has_desktop() && front.art.fonts[0].is_some());
         assert!(front.art.sounds.iter().all(Option::is_some));
         let mut heard = 0;

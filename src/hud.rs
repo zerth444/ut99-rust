@@ -52,37 +52,8 @@ impl Hud {
             .is_some_and(|weapon| weapon.guided_hud[0].is_some());
         let scale = (game.hud_scale * frame.width as f32 / 1280.0).clamp(0.55, 1.6);
         let player = &game.fighters[0];
-        let seconds = if game.limits().1 == 0 {
-            game.time as u32
-        } else {
-            u32::from(game.remaining())
-        };
         let white = [0.92, 0.96, 1.0];
         let accent = [0.42, 0.87, 0.95];
-        let clock = if game.overtime {
-            "SUDDEN DEATH".to_owned()
-        } else if has_art {
-            format!("{:02}:{:02}", seconds / 60, seconds % 60)
-        } else {
-            format!(
-                "DEATHMATCH   {:02}:{:02}   FRAGS {}   {}",
-                seconds / 60,
-                seconds % 60,
-                player.score,
-                game.difficulty().label().to_ascii_uppercase()
-            )
-        };
-        self.text(frame, 16, 12, scale, &clock, accent);
-        for (line, message) in game.notices().enumerate() {
-            self.text(
-                frame,
-                16,
-                60 + (line as f32 * 22.0 * scale) as i32,
-                scale,
-                message,
-                white,
-            );
-        }
         if !has_art {
             self.text(
                 frame,
@@ -112,14 +83,9 @@ impl Hud {
             active.push(format!("CLOAK {:.0}S", player.invis_left(game.time).ceil()));
         }
         if !active.is_empty() {
-            self.text(
+            self.centered(
                 frame,
-                16,
-                if has_art {
-                    60 + (4.0 * 22.0 * scale) as i32
-                } else {
-                    frame.height as i32 - (61.0 * scale) as i32
-                },
+                (frame.height * 3 / 4) as i32,
                 scale,
                 &active.join("   "),
                 accent,
@@ -434,13 +400,12 @@ impl Hud {
         }
         let mut y = (10.0 * scale) as i32;
         if let Some(stats) = stats {
-            self.text(frame, 12, y, scale, stats, [0.72, 0.95, 0.78]);
-            y += (CELL_H as f32 * scale) as i32;
+            self.centered(frame, y, scale, stats, [0.72, 0.95, 0.78]);
+            y += (CELL_H as f32 * 0.5 * scale) as i32;
         }
         if let Some(track) = music {
-            self.text(
+            self.centered(
                 frame,
-                12,
                 y,
                 scale,
                 &format!("NOW PLAYING  {track}"),
@@ -449,7 +414,14 @@ impl Hud {
         }
     }
 
-    fn centered(&self, frame: &mut Frame, y: i32, scale: f32, text: &str, color: [f32; 3]) {
+    pub(crate) fn centered(
+        &self,
+        frame: &mut Frame,
+        y: i32,
+        scale: f32,
+        text: &str,
+        color: [f32; 3],
+    ) {
         let width = self.glyphs.as_ref().map_or(0.0, |atlas| {
             text.chars()
                 .map(|ch| atlas.advance[glyph_index(ch)])

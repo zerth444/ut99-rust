@@ -13,6 +13,7 @@ pub struct TextureImage {
     height: usize,
     pixels: Vec<u8>,
     palette: Vec<[f32; 3]>,
+    opaque: bool,
 }
 
 impl Texture {
@@ -140,6 +141,7 @@ impl Texture {
                     height,
                     pixels: field.clone(),
                     palette: palette.clone(),
+                    opaque: false,
                 });
             }
         }
@@ -262,6 +264,7 @@ impl Texture {
                 height,
                 pixels,
                 palette: image.palette.clone(),
+                opaque: image.opaque,
             });
         }
         Ok(Self {
@@ -273,6 +276,14 @@ impl Texture {
 
     pub fn size(&self) -> (f32, f32) {
         self.frames[0].size()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn opaque(mut self) -> Self {
+        for frame in &mut self.frames {
+            frame.opaque = true;
+        }
+        self
     }
 
     pub fn image(&self, time: f32) -> &TextureImage {
@@ -300,6 +311,7 @@ impl TextureImage {
             height,
             pixels,
             palette,
+            opaque: false,
         }
     }
     pub(crate) fn bgra(&self) -> Vec<u32> {
@@ -309,7 +321,7 @@ impl TextureImage {
             .enumerate()
             .map(|(i, color)| {
                 let [r, g, b] = color.map(|c| c.clamp(0.0, 255.0) as u32);
-                (u32::from(i != 0) * 255 << 24) | (r << 16) | (g << 8) | b
+                (u32::from(self.opaque || i != 0) * 255 << 24) | (r << 16) | (g << 8) | b
             })
             .collect();
         self.pixels
@@ -325,7 +337,7 @@ impl TextureImage {
         let x = (u.floor() as isize).rem_euclid(self.width as isize) as usize;
         let y = (v.floor() as isize).rem_euclid(self.height as isize) as usize;
         let color = self.pixels[y * self.width + x] as usize;
-        if masked && color == 0 {
+        if masked && !self.opaque && color == 0 {
             None
         } else {
             Some(self.palette[color])
@@ -367,6 +379,7 @@ impl TextureImage {
             height,
             pixels: pixels.to_vec(),
             palette,
+            opaque: false,
         })
     }
 }
