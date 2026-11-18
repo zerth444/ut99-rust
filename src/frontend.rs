@@ -42,6 +42,8 @@ struct MenuArt {
 #[derive(Default)]
 struct SkinArt {
     bar: Option<Texture>,
+    bar_ends: [Option<Texture>; 2],
+    bar_hover: [Option<Texture>; 3],
     window: Option<Texture>,
     button: Option<Texture>,
     panel: Option<Texture>,
@@ -161,16 +163,15 @@ impl MenuArt {
         let skins = GUI_SKINS.map(|(_, prefix)| {
             let themed = |name: &str| texture(&format!("{prefix}{name}"));
             let gold = prefix == "Gold";
+            let bar = |name: &str| if gold { texture(name) } else { themed(name) };
             let menu = |part: &str| {
                 let prefix = if gold { "B" } else { prefix };
                 texture(&format!("{prefix}Menu{part}"))
             };
             SkinArt {
-                bar: if gold {
-                    texture("BarTile")
-                } else {
-                    themed("BarTile")
-                },
+                bar: bar("BarTile"),
+                bar_ends: [bar("BarL"), bar("BarWin")],
+                bar_hover: ["BarOutL", "BarOutM", "BarOutR"].map(bar),
                 window: themed("ActiveFrame"),
                 button: themed("Button"),
                 panel: if gold {
@@ -425,7 +426,8 @@ const GAME: [&str; 7] = [
     "Frag Limit",
     "Time Limit",
 ];
-const MENU_BUTTON_HEIGHT: i32 = 32;
+const NAV_HEIGHT: i32 = 16;
+const NAV_BUTTON_WIDTH: i32 = 88;
 impl Menu {
     pub fn state(&self) -> MenuState {
         MenuState {
@@ -463,7 +465,7 @@ impl Menu {
         {
             *highlight = index;
         }
-        self.nav_hover = layout.nav_item(size, x, y, self.session);
+        self.nav_hover = Layout::nav_item(x, y, self.session);
     }
 
     pub fn start_drag(&mut self, size: [i32; 2], x: i32, y: i32) -> bool {
@@ -681,7 +683,7 @@ impl Menu {
             return Action::None;
         }
         if !self.preferences {
-            if let Some(index) = ui.nav_item(size, x, y, self.session) {
+            if let Some(index) = Layout::nav_item(x, y, self.session) {
                 self.nav_focus = index;
                 return self.activate(index, settings);
             }
@@ -823,6 +825,42 @@ impl Menu {
         }
         let label =
             |frame: &mut Frame, x, y, text: &str| ui.label(frame, font, menu_font, x, y, text);
+        let [width, _] = ui.local(size[0], size[1]);
+        ui.tile(
+            frame,
+            art.bar.as_ref(),
+            [0, 0, width, NAV_HEIGHT],
+            [0.24, 0.27, 0.31],
+        );
+        for (texture, x) in art.bar_ends.iter().zip([0, width - NAV_HEIGHT]) {
+            if let Some(texture) = texture {
+                ui.tile(
+                    frame,
+                    Some(texture),
+                    [x, 0, NAV_HEIGHT, NAV_HEIGHT],
+                    [1.0; 3],
+                );
+            }
+        }
+        let nav_active = !self.preferences && self.match_setup.is_none() && self.quit.is_none();
+        for (item, caption) in self.session.entries().iter().enumerate() {
+            let x = item as i32 * NAV_BUTTON_WIDTH;
+            if nav_active && self.nav_hover.unwrap_or(self.nav_focus) == item {
+                for (texture, (left, width)) in art.bar_hover.iter().zip([
+                    (x, 1),
+                    (x + 1, NAV_BUTTON_WIDTH - 2),
+                    (x + NAV_BUTTON_WIDTH - 1, 1),
+                ]) {
+                    ui.tile(
+                        frame,
+                        texture.as_ref(),
+                        [left, 0, width, NAV_HEIGHT],
+                        [0.25, 0.38, 0.55],
+                    );
+                }
+            }
+            label(frame, x + 7, 1, caption);
+        }
         if let Some(setup) = &self.match_setup {
             let rect @ [x, y, width, _] = ui.match_rect(size);
             let text = |frame: &mut Frame, left: i32, top: i32, size: f32, value: &str, color| {
@@ -915,52 +953,6 @@ impl Menu {
             return;
         }
         if !self.preferences {
-            let rect @ [x, y, width, _] = ui.nav_rect(size, self.session);
-            let text = |frame: &mut Frame, xx, yy, scale, label: &str, color| {
-                font.text(
-                    frame,
-                    (xx as f32 * ui.scale).round() as i32,
-                    (yy as f32 * ui.scale).round() as i32,
-                    scale * ui.scale,
-                    label,
-                    color,
-                );
-            };
-            let title = match self.session {
-                MenuSession::Main => "Main Menu",
-                MenuSession::Practice => "Practice paused",
-                MenuSession::Match => "Match paused",
-            };
-            ui.tile(frame, None, rect, [0.08, 0.10, 0.13]);
-            ui.tile(frame, None, [x, y, width, 2], [0.28, 0.56, 0.58]);
-            text(frame, x + 14, y + 9, 1.1, title, [0.94, 0.97, 1.0]);
-            for (item, label) in self.session.entries().iter().enumerate() {
-                let row = y + 42 + item as i32 * MENU_BUTTON_HEIGHT;
-                let selected = self.nav_hover.unwrap_or(self.nav_focus) == item;
-                ui.tile(
-                    frame,
-                    None,
-                    [x + 10, row, width - 20, 29],
-                    if selected {
-                        [0.22, 0.40, 0.44]
-                    } else {
-                        [0.13, 0.18, 0.22]
-                    },
-                );
-                text(frame, x + 18, row + 4, 0.91, label, [0.94, 0.97, 1.0]);
-            }
-            if settings.context_help && self.session.paused() {
-                text(
-                    frame,
-                    x + 14,
-                    y + 176,
-                    0.72,
-                    "Esc to resume    M for main menu",
-                    [0.70, 0.76, 0.81],
-                );
-            }
-            let label =
-                |frame: &mut Frame, x, y, label| ui.label(frame, font, menu_font, x, y, label);
             if let Some(yes) = self.quit {
                 let rect = ui.quit_rect(size);
                 let [x, y, ..] = rect;
@@ -1195,20 +1187,11 @@ struct Layout {
 }
 
 impl Layout {
-    fn nav_rect(&self, size: [i32; 2], session: MenuSession) -> [i32; 4] {
-        let [w, h] = self.local(size[0], size[1]);
-        let height = if session.paused() { 204 } else { 148 };
-        [(w - 272) / 2, (h - height) / 2, 272, height]
-    }
-
-    fn nav_item(&self, size: [i32; 2], x: i32, y: i32, session: MenuSession) -> Option<usize> {
-        let [left, top, width, _] = self.nav_rect(size, session);
-        let row = y - top - 42;
-        if !(left + 10..left + width - 10).contains(&x) || row < 0 || row % MENU_BUTTON_HEIGHT >= 29
-        {
+    fn nav_item(x: i32, y: i32, session: MenuSession) -> Option<usize> {
+        if x < 0 || !(0..NAV_HEIGHT).contains(&y) {
             return None;
         }
-        let item = (row / MENU_BUTTON_HEIGHT) as usize;
+        let item = (x / NAV_BUTTON_WIDTH) as usize;
         (item < session.entries().len()).then_some(item)
     }
     fn match_rect(&self, size: [i32; 2]) -> [i32; 4] {
@@ -1365,14 +1348,7 @@ mod tests {
         menu.match_names = vec!["DM-Deck16][".into()];
         let size = [900, 600];
         let click = |menu: &mut Menu, item, settings: &mut Settings| {
-            let [x, y, ..] = Layout::new(size, menu.dpi).nav_rect(size, menu.session);
-            menu.click(
-                size,
-                x + 23,
-                y + 50 + item * MENU_BUTTON_HEIGHT,
-                VK_LBUTTON,
-                settings,
-            )
+            menu.click(size, 12 + item * NAV_BUTTON_WIDTH, 8, VK_LBUTTON, settings)
         };
 
         assert!(menu.key(VK_RETURN, &mut settings) == Action::None);
@@ -1508,6 +1484,8 @@ mod tests {
                 .iter()
                 .all(|skin| skin.bar.is_some() && skin.panel.is_some())
         );
+        assert!(front.art.skins[0].bar_ends.iter().all(Option::is_some));
+        assert!(front.art.skins[0].bar_hover.iter().all(Option::is_some));
         assert!(front.has_desktop() && front.art.fonts[0].is_some());
         assert!(front.art.sounds.iter().all(Option::is_some));
         let mut heard = 0;
