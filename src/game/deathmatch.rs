@@ -6,11 +6,11 @@ use super::{Item, Weapon, shock::cylinder_hit};
 use crate::{
     collision::{PLAYER_HEIGHT, PLAYER_RADIUS, Walker},
     map::{Map, Vec3},
-    mover::unit,
+    mover::{LiftStop, unit},
     render::Camera,
     sound::{BLAST_SOUND_RADIUS, CONTACT_SOUND_RADIUS, SoundEvents},
 };
-use navigation::Navigation;
+use navigation::{LiftRide, Navigation, Step, WAYPOINT_RADIUS};
 
 const RESPAWN_DELAY: f32 = 1.25;
 const SPAWN_PROTECTION: f32 = 0.75;
@@ -102,9 +102,24 @@ impl Fighter {
 struct Bot {
     target: Option<usize>,
     react_at: f32,
-    goal: Option<Vec3>,
+    goal: Option<Step>,
     rethink_at: f32,
     last_seen: Option<(Vec3, f32)>,
+    lift: Option<ActiveLift>,
+    plan_origin: Option<Vec3>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LiftPhase {
+    Board,
+    Ride,
+    Leave,
+}
+
+struct ActiveLift {
+    ride: LiftRide,
+    phase: LiftPhase,
+    expires: f32,
 }
 
 struct Bolt {
@@ -254,21 +269,41 @@ impl Match {
         }
         self.time += dt;
         self.traces.retain(|trace| trace.expires > self.time);
+        let mut inputs = Vec::with_capacity(self.fighters.len());
+        inputs.push(command);
+        for id in 1..self.fighters.len() {
+            inputs.push(self.bot_command(map, id, dt));
+        }
         {
+            let mut requests = vec![None::<(bool, LiftStop)>; map.movers.len()];
+            for fighter in self.fighters.iter().filter(|fighter| fighter.health > 0) {
+                if let Some(lift) = &fighter.bot.lift {
+                    let riding = lift.phase != LiftPhase::Board;
+                    let stop = if riding {
+                        lift.ride.from.opposite()
+                    } else {
+                        lift.ride.from
+                    };
+                    let request = &mut requests[lift.ride.mover];
+                    if request.is_none_or(|(previous_riding, _)| riding && !previous_riding) {
+                        *request = Some((riding, stop));
+                    }
+                }
+            }
             let mut walkers: Vec<_> = self
                 .fighters
                 .iter_mut()
                 .filter(|fighter| fighter.health > 0)
                 .map(|fighter| &mut fighter.walker)
                 .collect();
-            for mover in &mut map.movers {
-                mover.tick_many(&mut map.collision, &mut walkers, dt);
+            for (mover, request) in map.movers.iter_mut().zip(requests) {
+                mover.tick_many(
+                    &mut map.collision,
+                    &mut walkers,
+                    dt,
+                    request.map(|(_, stop)| stop),
+                );
             }
-        }
-        let mut inputs = Vec::with_capacity(self.fighters.len());
-        inputs.push(command);
-        for id in 1..self.fighters.len() {
-            inputs.push(self.bot_command(map, id, dt));
         }
         let mut hits = Vec::new();
         for (id, input) in inputs.iter().enumerate() {
@@ -315,6 +350,9 @@ impl Match {
             ) {
                 fighter.walker = Walker::spawn(&map.collision, position);
                 fighter.yaw = yaw.unwrap_or(fighter.yaw);
+                fighter.bot.goal = None;
+                fighter.bot.lift = None;
+                fighter.bot.rethink_at = self.time;
             }
             let zone = map.collision.regions.at(fighter.walker.position);
             if fighter.walker.position.2 < self.kill_z {
@@ -575,6 +613,10 @@ impl Match {
         if fighter.health == 0 {
             return Command::default();
         }
+        if let Some(command) = follow_transfer(map, &mut self.fighters[id], self.time, dt) {
+            return command;
+        }
+        let fighter = &self.fighters[id];
         let eye = fighter.camera(map);
         let target = self
             .fighters
@@ -594,6 +636,7 @@ impl Match {
         let bot = &mut fighter.bot;
         if let Some((other, target_position, mut delta, distance)) = target {
             bot.last_seen = Some((target_position, self.time));
+            bot.plan_origin = None;
             if bot.target != Some(other) {
                 bot.target = Some(other);
                 bot.react_at = self.time + 0.23 + (id % 3) as f32 * 0.09;
@@ -627,10 +670,16 @@ impl Match {
         bot.target = None;
         let position = fighter.walker.position;
         if self.time >= bot.rethink_at
-            || bot
-                .goal
-                .is_some_and(|goal| distance_squared(goal, position) < 42.0_f32.powi(2))
+            || bot.goal.is_some_and(|goal| {
+                matches!(goal, Step::Walk(point)
+                    if near_waypoint(point, position))
+            })
         {
+            let stalled = bot.plan_origin.is_some_and(|origin| {
+                matches!(bot.goal, Some(Step::Walk(point)) if !near_waypoint(point, position))
+                    && distance_squared(origin, position) < 24.0_f32.powi(2)
+            });
+            bot.plan_origin = Some(position);
             let visible = |point: Vec3| {
                 let delta = point - position;
                 delta.2.abs() < 100.0
@@ -663,10 +712,13 @@ impl Match {
                 .map(|(point, _)| point);
             let supply = supplies
                 .into_iter()
-                .take(2)
+                .take(if stalled { 0 } else { 2 })
                 .find_map(|point| self.navigation.next_step(&map.collision, position, point));
             bot.goal = supply
                 .or_else(|| {
+                    if stalled {
+                        return None;
+                    }
                     chase.and_then(|point| {
                         self.navigation.next_step(&map.collision, position, point)
                     })
@@ -682,30 +734,112 @@ impl Match {
                             let point = position + direction * 325.0;
                             (visible(point)
                                 && map.collision.ray(point, Vec3(0.0, 0.0, -95.0)).is_some())
-                            .then_some(point)
+                            .then_some(Step::Walk(point))
                         })
                         .next()
                 });
             bot.rethink_at = self.time + 1.35;
         }
-        let turn = bot.goal.map_or(1.5, |goal| {
-            aim_error(goal - position, fighter.yaw, fighter.pitch).0
-        });
+        if let Some(command) = follow_transfer(map, fighter, self.time, dt) {
+            return command;
+        }
+        if let Some(Step::Walk(goal)) = fighter.bot.goal {
+            return steer(fighter, goal, dt);
+        }
         Command {
-            movement: [
-                if bot.goal.is_some() && turn.abs() < 0.9 {
-                    0.78
-                } else {
-                    0.0
-                },
-                0.0,
-            ],
-            look: [
-                turn.clamp(-4.6 * dt, 4.6 * dt),
-                -fighter.pitch * (dt * 4.0).min(1.0),
-            ],
+            look: [(4.6 * dt).min(1.5), -fighter.pitch * (dt * 4.0).min(1.0)],
             ..Command::default()
         }
+    }
+}
+
+fn follow_transfer(map: &Map, fighter: &mut Fighter, time: f32, dt: f32) -> Option<Command> {
+    if fighter.bot.lift.is_none() {
+        match fighter.bot.goal? {
+            Step::Walk(_) => return None,
+            Step::Teleport(position) => {
+                if time >= fighter.bot.rethink_at {
+                    fighter.bot.goal = None;
+                    return None;
+                }
+                return Some(steer(fighter, position, dt));
+            }
+            Step::Lift(ride) => {
+                let travel = map.movers[ride.mover]
+                    .lift_ride_seconds()
+                    .unwrap_or_default();
+                fighter.bot.lift = Some(ActiveLift {
+                    ride,
+                    phase: LiftPhase::Board,
+                    expires: time + 2.0 * travel + 8.0,
+                });
+            }
+        }
+    }
+    let lift = fighter.bot.lift.as_mut().unwrap();
+    let mover = &map.movers[lift.ride.mover];
+    let destination = lift.ride.from.opposite();
+    let position = fighter.walker.position;
+    let reached_exit = lift.phase == LiftPhase::Leave
+        && fighter.walker.grounded
+        && !mover.has_rider(&fighter.walker)
+        && near_waypoint(lift.ride.exit, position);
+    if time >= lift.expires || reached_exit {
+        fighter.bot.lift = None;
+        fighter.bot.goal = None;
+        fighter.bot.rethink_at = time;
+        return Some(Command::default());
+    }
+    let target = match lift.phase {
+        LiftPhase::Board => {
+            if !mover.lift_at(lift.ride.from) {
+                lift.ride.entry
+            } else {
+                let board = mover.lift_board_position(lift.ride.from);
+                if mover.has_rider(&fighter.walker)
+                    && (board.0 - position.0).hypot(board.1 - position.1) < 34.0
+                {
+                    lift.phase = LiftPhase::Ride;
+                    return Some(Command::default());
+                }
+                board
+            }
+        }
+        LiftPhase::Ride if mover.lift_at(destination) => {
+            lift.phase = LiftPhase::Leave;
+            lift.ride.exit
+        }
+        LiftPhase::Ride => return Some(Command::default()),
+        LiftPhase::Leave => lift.ride.exit,
+    };
+    let jump = lift.phase == LiftPhase::Leave
+        && target.2 - position.2 > map.collision.profile.step_height
+        && (target.0 - position.0).hypot(target.1 - position.1) < 130.0;
+    Some(Command {
+        jump,
+        ..steer(fighter, target, dt)
+    })
+}
+
+fn near_waypoint(waypoint: Vec3, position: Vec3) -> bool {
+    let delta = waypoint - position;
+    delta.0.hypot(delta.1) < WAYPOINT_RADIUS && delta.2.abs() < 56.0
+}
+
+fn steer(fighter: &Fighter, point: Vec3, dt: f32) -> Command {
+    let delta = point - fighter.walker.position;
+    let distance = delta.0.hypot(delta.1);
+    if distance < 10.0 {
+        return Command::default();
+    }
+    let (turn, _) = aim_error(delta, fighter.yaw, fighter.pitch);
+    let yaw_change = turn.clamp(-4.6 * dt, 4.6 * dt);
+    let (side, forward) = (turn - yaw_change).sin_cos();
+    let speed = (distance / 145.0).clamp(0.19, 0.8);
+    Command {
+        movement: [forward * speed, side * speed],
+        look: [yaw_change, -fighter.pitch * (dt * 4.0).min(1.0)],
+        ..Command::default()
     }
 }
 
@@ -766,6 +900,116 @@ mod tests {
         let path = std::path::Path::new("local/goty/Maps/DM-Deck16][.unr");
         let bytes = std::fs::read(path).unwrap();
         Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires the local GOTY map"]
+    fn bot_navigates_both_deck16_lifts_in_both_directions() {
+        let mut map = arena();
+        let mut game = Match::new(
+            &map,
+            6,
+            Rules {
+                bots: 1,
+                ..Rules::default()
+            },
+        );
+        game.fighters[0].protected_until = f32::INFINITY;
+        assert_eq!(map.movers.len(), 2);
+        for index in 0..map.movers.len() {
+            let lift = &map.movers[index];
+            let exits: Vec<_> = map
+                .lift_exits
+                .iter()
+                .filter(|exit| Some(exit.tag) == lift.tag)
+                .map(|exit| exit.position)
+                .collect();
+            assert_eq!(exits.len(), 2);
+            let home = exits
+                .iter()
+                .copied()
+                .min_by(|a, b| a.2.total_cmp(&b.2))
+                .unwrap();
+            let away = exits
+                .iter()
+                .copied()
+                .max_by(|a, b| a.2.total_cmp(&b.2))
+                .unwrap();
+            let bot = &mut game.fighters[1];
+            bot.walker = Walker::spawn(&map.collision, home);
+            for (from, to, stop) in [(home, away, LiftStop::Away), (away, home, LiftStop::Home)] {
+                let position = game.fighters[1].walker.position;
+                assert!(distance_squared(position, from) < 50.0_f32.powi(2));
+                // Start with the platform at the far end so the bot must call it first.
+                for _ in 0..300 {
+                    map.movers[index].tick_many(
+                        &mut map.collision,
+                        &mut [],
+                        1.0 / 60.0,
+                        Some(stop),
+                    );
+                }
+                assert!(map.movers[index].lift_at(stop));
+                let route = game.navigation.next_step(&map.collision, position, to);
+                assert!(
+                    matches!(route, Some(Step::Lift(ride)) if ride.mover == index),
+                    "{route:?}"
+                );
+                game.fighters[1].bot.goal = route;
+                for _ in 0..720 {
+                    game.step(&mut map, Command::default(), 1.0 / 60.0);
+                    if game.fighters[1].bot.lift.is_none() && game.fighters[1].bot.goal.is_none() {
+                        break;
+                    }
+                }
+                let bot = &game.fighters[1];
+                assert!(
+                    bot.walker.grounded,
+                    "{stop:?} {:?} vs {to:?}",
+                    bot.walker.position
+                );
+                assert!(
+                    distance_squared(bot.walker.position, to) < 50.0_f32.powi(2),
+                    "bot failed to ride to {stop:?}: {:?}, destination {to:?}, lift at stop: {}",
+                    bot.walker.position,
+                    map.movers[index].lift_at(stop)
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the local GOTY map"]
+    fn route_through_a_portal_is_followed_by_the_actual_bot() {
+        let data = std::fs::read("local/goty/Maps/CTF-Face.unr").unwrap();
+        let package = Package::read(&data).unwrap();
+        let mut map = Map::load(&package, None).unwrap();
+        let mut game = Match::new(
+            &map,
+            0,
+            Rules {
+                bots: 1,
+                ..Rules::default()
+            },
+        );
+        let (entry, exit) = crate::teleport::links(&map.teleporters)
+            .find(|(from, to)| {
+                matches!(
+                    game.navigation.next_step(&map.collision, *from, *to),
+                    Some(Step::Teleport(_))
+                )
+            })
+            .expect("a portal route through the tower");
+        game.fighters[0].protected_until = f32::INFINITY;
+        let bot = &mut game.fighters[1];
+        bot.walker = Walker::spawn(&map.collision, entry);
+        bot.bot.goal = game.navigation.next_step(&map.collision, entry, exit);
+        bot.bot.rethink_at = 2.0;
+        game.step(&mut map, Command::default(), 1.0 / 60.0);
+        let bot = &game.fighters[1];
+        assert!(distance_squared(bot.walker.position, exit) < 35.0_f32.powi(2));
+        assert!(bot.portal.is_some());
+        assert!(bot.bot.goal.is_none());
     }
 
     #[test]

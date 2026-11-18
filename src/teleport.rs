@@ -104,6 +104,13 @@ pub fn link_count(portals: &[Teleporter]) -> usize {
         .count()
 }
 
+pub(crate) fn links(portals: &[Teleporter]) -> impl Iterator<Item = (Vec3, Vec3)> + '_ {
+    portals.iter().filter_map(|portal| {
+        let destination = portals.get(portal.target?)?;
+        Some((portal.position, destination.position))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

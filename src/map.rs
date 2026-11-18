@@ -69,6 +69,11 @@ pub struct Start {
     pub yaw: f32,
 }
 
+pub(crate) struct LiftExit {
+    pub position: Vec3,
+    pub tag: usize,
+}
+
 pub struct Map {
     pub scene_lights: Vec<crate::light::Light>,
     pub(crate) animated_lightmaps: Vec<Arc<Lightmap>>,
@@ -78,6 +83,7 @@ pub struct Map {
     pub faces: Vec<Face>,
     pub starts: Vec<Start>,
     pub navigation_points: Vec<Vec3>,
+    pub(crate) lift_exits: Vec<LiftExit>,
     pub collision: Collision,
     pub sky_origin: Option<Vec3>,
     pub ambient: Vec<crate::sound::Emitter>,
@@ -171,17 +177,27 @@ impl Map {
         let teleporters = crate::teleport::load(package, &actors)?;
         let mut starts = Vec::new();
         let mut navigation_points = Vec::new();
+        let mut lift_exits = Vec::new();
         for actor in actors {
             let class = package.object_name(actor.class);
             if matches!(
                 class,
-                Some("PathNode" | "LiftCenter" | "LiftExit" | "InventorySpot" | "NavigationPoint")
+                Some("PathNode" | "LiftExit" | "InventorySpot" | "NavigationPoint")
             ) {
                 let mut properties = package.properties(actor)?;
+                let mut position = None;
+                let mut tag = None;
                 while let Some((name, mut value)) = properties.next()? {
-                    if name == "Location" {
-                        navigation_points.push(Vec3::read(&mut value)?);
-                        break;
+                    match name {
+                        "Location" => position = Some(Vec3::read(&mut value)?),
+                        "LiftTag" if class == Some("LiftExit") => tag = Some(value.index()?),
+                        _ => {}
+                    }
+                }
+                if let Some(position) = position {
+                    navigation_points.push(position);
+                    if let Some(tag) = tag {
+                        lift_exits.push(LiftExit { position, tag });
                     }
                 }
             }
@@ -246,6 +262,7 @@ impl Map {
             faces,
             starts,
             navigation_points,
+            lift_exits,
             collision,
             sky_origin,
             ambient,

@@ -56,6 +56,21 @@ pub struct Mover {
     scene_progress: Option<f32>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LiftStop {
+    Home,
+    Away,
+}
+
+impl LiftStop {
+    pub fn opposite(self) -> Self {
+        match self {
+            Self::Home => Self::Away,
+            Self::Away => Self::Home,
+        }
+    }
+}
+
 impl Mover {
     pub(crate) fn collision_hull(&self) -> Option<usize> {
         self.hull
@@ -147,7 +162,36 @@ impl Mover {
     }
 
     pub fn tick(&mut self, world: &mut Collision, walker: &mut Walker, dt: f32) {
-        self.tick_many(world, &mut [walker], dt);
+        self.tick_many(world, &mut [walker], dt, None);
+    }
+
+    pub(crate) fn lift_ride_seconds(&self) -> Option<f32> {
+        (self.hull.is_some()
+            && self.travel.2.abs() > 45.0
+            && matches!(self.activation, Activation::Stand))
+        .then_some(self.time)
+    }
+
+    pub(crate) fn lift_board_position(&self, stop: LiftStop) -> Vec3 {
+        let center = (self.min + self.max) * 0.5;
+        let home = Vec3(
+            center.0,
+            center.1,
+            self.max.2 + crate::collision::PLAYER_HEIGHT,
+        );
+        if stop == LiftStop::Home {
+            home
+        } else {
+            home + self.travel
+        }
+    }
+
+    pub(crate) fn lift_at(&self, stop: LiftStop) -> bool {
+        self.fraction == if stop == LiftStop::Home { 0.0 } else { 1.0 }
+    }
+
+    pub(crate) fn has_rider(&self, walker: &Walker) -> bool {
+        self.hull.is_some() && walker.on_box(self.min + self.offset, self.max + self.offset)
     }
 
     pub(crate) fn reset_motion(&mut self, world: &mut Collision) {
@@ -161,7 +205,13 @@ impl Mover {
         }
     }
 
-    pub fn tick_many(&mut self, world: &mut Collision, walkers: &mut [&mut Walker], dt: f32) {
+    pub(crate) fn tick_many(
+        &mut self,
+        world: &mut Collision,
+        walkers: &mut [&mut Walker],
+        dt: f32,
+        service: Option<LiftStop>,
+    ) {
         let min = self.min + self.offset;
         let max = self.max + self.offset;
         let on_board = |walker: &Walker| self.hull.is_some() && walker.on_box(min, max);
@@ -178,7 +228,15 @@ impl Mover {
                 .any(|walker| self.triggers.iter().any(|trigger| trigger.touches(walker))),
             Activation::Unsupported => false,
         };
-        if self.fraction == 0.0 {
+        if let Some(stop) = service {
+            self.opening = stop == LiftStop::Away;
+            if self.fraction == 1.0 && self.opening {
+                self.countdown = self.pause;
+            }
+            if self.fraction == 0.0 {
+                self.ready = true;
+            }
+        } else if self.fraction == 0.0 {
             self.ready |= !requested;
             if requested && self.ready {
                 self.opening = true;
