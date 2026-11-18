@@ -407,6 +407,7 @@ pub struct Scene {
     pub hud: crate::hud_art::Art,
     pub player: crate::movement::Profile,
     pub player_audio: crate::movement::PlayerAudio,
+    pub match_announcer: [Option<Arc<Wave>>; 5],
     pub player_deaths: [Motion; 3],
     pub player_idle: Motion,
     pub player_clips: ActorClips,
@@ -454,6 +455,7 @@ pub fn load(
                     | "core"
                     | "botpack"
                     | "dmatch"
+                    | "announcer"
                     | "unrealshare"
                     | "unreali"
                     | "soldierskins"
@@ -976,12 +978,27 @@ pub fn load(
             }
             Ok(zone)
         })?;
+    let match_announcer = [
+        "FirstBlood",
+        "DoubleKill",
+        "MultiKill",
+        "Winner",
+        "LostMatch",
+    ]
+    .map(|name| {
+        cached_wave(
+            &assets,
+            &mut waves,
+            find_export(&assets, "announcer", name, "Sound"),
+        )
+    });
     Ok(Scene {
         props,
         arsenal,
         hud,
         player,
         player_audio,
+        match_announcer,
         player_deaths,
         player_idle,
         player_clips,

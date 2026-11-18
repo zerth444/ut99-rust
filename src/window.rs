@@ -168,6 +168,7 @@ unsafe fn message_loop(
     let mut presenter = None;
     let mut windowed = None;
     let mut pilot_view = None;
+    let mut practice_arena = None;
     let mut obs_announced = false;
     set_window_size(window, settings.resolution);
     if obs || settings.fullscreen {
@@ -190,7 +191,12 @@ unsafe fn message_loop(
             obs,
             MenuSession::Main,
         )? {
-            Action::Deathmatch => {
+            Action::Deathmatch(_) => {
+                if let Some(arena) = frontend.pending_arena.take() {
+                    practice_arena = Some((std::mem::replace(map, arena), start));
+                    start = 6.min(map.starts.len() - 1);
+                    frame = Frame::hardware(map);
+                }
                 match_rules = Some(deathmatch::Rules {
                     difficulty: deathmatch::Difficulty::from_level(settings.bot_difficulty),
                     ..deathmatch::Rules::default()
@@ -274,6 +280,11 @@ unsafe fn message_loop(
                                         if let Some(game) = deathmatch.take() {
                                             game.restore_map(map);
                                         }
+                                        if let Some((arena, previous_start)) = practice_arena.take()
+                                        {
+                                            *map = arena;
+                                            start = previous_start;
+                                        }
                                         let action = run_frontend(
                                             window,
                                             map,
@@ -289,7 +300,14 @@ unsafe fn message_loop(
                                         )?;
                                         match action {
                                             Action::Quit => return Ok(()),
-                                            Action::Deathmatch => {
+                                            Action::Deathmatch(_) => {
+                                                if let Some(arena) = frontend.pending_arena.take() {
+                                                    practice_arena = Some((
+                                                        std::mem::replace(map, arena),
+                                                        start,
+                                                    ));
+                                                    start = 6.min(map.starts.len() - 1);
+                                                }
                                                 deathmatch = Some(deathmatch::Match::new(
                                                     map,
                                                     start,
@@ -535,7 +553,7 @@ unsafe fn message_loop(
                         (0, 0)
                     };
                     let sensitivity = 0.0027 * settings.sensitivity as f32 / 100.0
-                        * if game.fighters[0].zoomed { 0.43 } else { 1.0 };
+                        * if game.fighters[0].zoomed() { 0.43 } else { 1.0 };
                     let pitch_sign = if settings.invert_mouse { 1.0 } else { -1.0 };
                     let command = deathmatch::Command {
                         movement: [axis(forward, back), axis(right, left)],
@@ -933,6 +951,7 @@ fn run_frontend(
         .flatten();
     let mut menu = Menu::default();
     menu.session = session;
+    menu.match_names = frontend.match_names();
     let logo = frontend.logo.as_ref().map(|(map, _)| map);
     let mut frame = Frame::hardware(
         intro
@@ -1030,7 +1049,17 @@ fn run_frontend(
                         frontend.play_menu_sound(audio, sound);
                     }
                     match action {
-                        Action::Play | Action::Deathmatch | Action::LeaveMatch => {
+                        Action::Deathmatch(index) => match frontend.load_match(index) {
+                            Ok(arena) => {
+                                frontend.pending_arena = arena;
+                                return Ok(action);
+                            }
+                            Err(error) => {
+                                eprintln!("Loading Deathmatch map: {error}");
+                                menu.status = "COULD NOT LOAD MAP".into();
+                            }
+                        },
+                        Action::Play | Action::LeaveMatch => {
                             return Ok(action);
                         }
                         Action::Quit => {

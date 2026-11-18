@@ -382,8 +382,8 @@ impl Frame {
         } else {
             roll
         };
-        let fov = if player.zoomed && !piloting {
-            fov.min(35.0)
+        let fov = if player.zoomed() && !piloting {
+            player.field_of_view(fov)
         } else {
             fov
         };
@@ -421,6 +421,9 @@ impl Frame {
                 self.draw_world_effect(&view, game.time, visual);
             });
         self.draw_shock(map, &view, &game.shock, game.time);
+        for &effect in &game.hammer_effects {
+            self.effect(camera, effect);
+        }
         for beam in game.pulse_beams(map) {
             self.draw_pulse_beam(map, &view, &beam, game.time);
         }
@@ -540,7 +543,7 @@ impl Frame {
         self.zoom = 1.0;
         self.roll = 0.0;
         if player.health > 0 && !game.finished {
-            if !player.zoomed
+            if !player.zoomed()
                 && !piloting
                 && let Some(weapon) = map.arsenal.get(&player.weapon)
             {
@@ -579,7 +582,7 @@ impl Frame {
         );
         let hud = game.hud_state(map, game.hud_scale);
         map.hud.draw(self, &hud, &map.arsenal);
-        if player.zoomed && !piloting && player.health > 0 && !game.finished {
+        if player.zoomed() && !piloting && player.health > 0 && !game.finished {
             self.draw_scope(map, player.weapon);
         } else if (hud.crosshair_visible && map.hud.crosshair.is_none()) || piloting {
             self.draw_crosshair();

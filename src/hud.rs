@@ -150,6 +150,15 @@ impl Hud {
                 [1.0, 0.78, 0.34].map(|channel| channel * remaining),
             );
         }
+        if let Some(announcement) = game.announcement() {
+            self.centered(
+                frame,
+                (84.0 * scale) as i32,
+                1.2 * scale,
+                announcement,
+                [0.96, 0.83, 0.45],
+            );
+        }
         if player.health == 0 {
             self.centered(frame, frame.height as i32 / 2, scale, "RESPAWNING", white);
         } else if !captured {

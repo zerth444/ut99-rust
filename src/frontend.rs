@@ -2,7 +2,11 @@ mod font;
 mod intro;
 pub(crate) mod smoke;
 
-use std::{fs, io, path::Path, sync::Arc};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
@@ -21,6 +25,8 @@ pub use intro::Intro;
 pub struct Frontend {
     pub intro: Option<Intro>,
     pub logo: Option<(Map, Camera)>,
+    match_maps: Vec<PathBuf>,
+    pub pending_arena: Option<Map>,
     art: MenuArt,
 }
 
@@ -73,9 +79,32 @@ impl Frontend {
         let logo = load_logo()
             .map_err(|error| optional(&logo_path, error))
             .ok();
+        let mut match_maps: Vec<_> = fs::read_dir(maps)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case("unr"))
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.to_ascii_lowercase().starts_with("dm-"))
+                    && path.file_name() != map_path.file_name()
+            })
+            .collect();
+        match_maps.sort_by_key(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        });
+        match_maps.insert(0, map_path.to_path_buf());
         Self {
             intro,
             logo,
+            match_maps,
+            pending_arena: None,
             art: MenuArt::load(
                 &maps.join("../System/UMenu.u"),
                 &maps.join("../Textures/UWindowFonts.utx"),
@@ -91,6 +120,24 @@ impl Frontend {
 
     pub fn has_desktop(&self) -> bool {
         self.art.desktop.is_some()
+    }
+
+    pub fn match_names(&self) -> Vec<String> {
+        self.match_maps
+            .iter()
+            .filter_map(|path| path.file_stem())
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    pub fn load_match(&self, index: usize) -> io::Result<Option<Map>> {
+        if index != 0 {
+            let path = &self.match_maps[index];
+            let bytes = fs::read(path)?;
+            let package = Package::read(&bytes)?;
+            return Ok(Some(Map::load(&package, Some(path))?));
+        }
+        Ok(None)
     }
 }
 
@@ -159,7 +206,7 @@ impl MenuArt {
 pub enum Action {
     None,
     Play,
-    Deathmatch,
+    Deathmatch(usize),
     LeaveMatch,
     Quit,
     Changed,
@@ -210,6 +257,8 @@ impl MenuSession {
 #[derive(Default)]
 pub struct Menu {
     pub session: MenuSession,
+    pub match_names: Vec<String>,
+    match_choice: Option<usize>,
     preferences: bool,
     tab: usize,
     selected: usize,
@@ -403,7 +452,7 @@ impl Pulldown {
 impl Menu {
     pub fn state(&self) -> MenuState {
         MenuState {
-            window: self.preferences || self.quit.is_some(),
+            window: self.preferences || self.quit.is_some() || self.match_choice.is_some(),
             pulldown: self.pulldown.map(|(section, _)| section),
         }
     }
@@ -480,7 +529,15 @@ impl Menu {
         match section {
             Pulldown::Game if item == 0 => Action::Play,
             Pulldown::Game if item == 1 && self.session == MenuSession::Match => Action::LeaveMatch,
-            Pulldown::Game if item == 2 && !self.session.paused() => Action::Deathmatch,
+            Pulldown::Game if item == 2 && !self.session.paused() => {
+                if self.match_names.len() < 2 {
+                    Action::Deathmatch(0)
+                } else {
+                    self.match_choice = Some(0);
+                    self.status.clear();
+                    Action::None
+                }
+            }
             Pulldown::Game => {
                 self.quit = Some(true);
                 Action::None
@@ -498,6 +555,19 @@ impl Menu {
     }
 
     pub fn key(&mut self, key: u16, settings: &mut Settings) -> Action {
+        if let Some(selected) = self.match_choice {
+            let count = self.match_names.len();
+            match key {
+                VK_UP => self.match_choice = Some((selected + count - 1) % count),
+                VK_DOWN => self.match_choice = Some((selected + 1) % count),
+                VK_PRIOR => self.match_choice = Some(selected.saturating_sub(8)),
+                VK_NEXT => self.match_choice = Some((selected + 8).min(count - 1)),
+                VK_ESCAPE => self.match_choice = None,
+                VK_RETURN | VK_SPACE => return Action::Deathmatch(selected),
+                _ => {}
+            }
+            return Action::None;
+        }
         if let Some(yes) = &mut self.quit {
             match key {
                 VK_LEFT | VK_RIGHT | VK_TAB => *yes = !*yes,
@@ -608,6 +678,27 @@ impl Menu {
         }
         let ui = Layout::new(size, self.dpi);
         let [x, y] = ui.local(x, y);
+        if let Some(selected) = self.match_choice {
+            let [left, top, width, _] = ui.match_rect(size);
+            let page = selected / 8 * 8;
+            if (left + 8..left + width - 8).contains(&x) && (top + 22..top + 166).contains(&y) {
+                let row = ((y - top - 22) / 18) as usize;
+                if page + row < self.match_names.len() {
+                    self.match_choice = Some(page + row);
+                    return Action::Deathmatch(page + row);
+                }
+            }
+            if (top + 174..top + 194).contains(&y) {
+                if (left + 8..left + 87).contains(&x) {
+                    self.match_choice = Some(selected.saturating_sub(8));
+                } else if (left + 92..left + 171).contains(&x) {
+                    self.match_choice = Some((selected + 8).min(self.match_names.len() - 1));
+                } else if (left + width - 87..left + width - 8).contains(&x) {
+                    self.match_choice = None;
+                }
+            }
+            return Action::None;
+        }
         if self.quit.is_some() {
             let [left, top, ..] = ui.quit_rect(size);
             if (top + 57..top + 75).contains(&y) {
@@ -772,6 +863,35 @@ impl Menu {
         }
         let label =
             |frame: &mut Frame, x, y, text: &str| ui.label(frame, font, menu_font, x, y, text);
+        if let Some(selected) = self.match_choice {
+            let rect @ [x, y, width, _] = ui.match_rect(size);
+            ui.window(frame, art, rect);
+            label(frame, x + 8, y + 1, "Choose Deathmatch map");
+            let page = selected / 8 * 8;
+            for (row, name) in self.match_names.iter().skip(page).take(8).enumerate() {
+                let top = y + 22 + 18 * row as i32;
+                if page + row == selected {
+                    ui.tile(
+                        frame,
+                        art.highlight.as_ref(),
+                        [x + 8, top, width - 16, 18],
+                        [0.31, 0.47, 0.62],
+                    );
+                }
+                let name: String = name.chars().take(40).collect();
+                label(frame, x + 14, top + 1, &name);
+            }
+            for (left, caption) in [
+                (x + 8, "Previous"),
+                (x + 92, "Next"),
+                (x + width - 87, "Back"),
+            ] {
+                ui.button(frame, art, [left, y + 174, 79, 20]);
+                label(frame, left + 10, y + 176, caption);
+            }
+            label(frame, x + 10, y + 199, &self.status);
+            return;
+        }
         let width = (frame.width as f32 / ui.scale).ceil() as i32;
         ui.tile(
             frame,
@@ -1125,6 +1245,10 @@ struct Layout {
 }
 
 impl Layout {
+    fn match_rect(&self, size: [i32; 2]) -> [i32; 4] {
+        let [w, h] = self.local(size[0], size[1]);
+        [(w - 350) / 2, (h - 222) / 2, 350, 222]
+    }
     fn new([width, height]: [i32; 2], dpi: u32) -> Self {
         let desktop_scale = (dpi / 24).clamp(4, 12) as f32 * 0.25;
         let fit = (width as f32 / 440.0).min(height as f32 / 370.0);
@@ -1369,7 +1493,7 @@ mod tests {
         menu.click(size, 70, 8, VK_LBUTTON, &mut settings);
         menu.key(VK_DOWN, &mut settings);
         menu.key(VK_DOWN, &mut settings);
-        assert!(menu.key(VK_RETURN, &mut settings) == Action::Deathmatch);
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::Deathmatch(0));
 
         menu.click(size, 180, 8, VK_LBUTTON, &mut settings);
         assert!(menu.click(size, 180, 25, VK_LBUTTON, &mut settings) == Action::Changed);
@@ -1383,6 +1507,19 @@ mod tests {
         assert!(menu.quit.is_none());
         menu.click(size, 70, 8, VK_LBUTTON, &mut settings);
         assert!(menu.click(size, 72, 48, VK_LBUTTON, &mut settings) == Action::LeaveMatch);
+    }
+
+    #[test]
+    fn deathmatch_map_picker_keeps_play_direct_and_can_select_another_arena() {
+        let mut settings = Settings::default();
+        let mut menu = Menu::default();
+        menu.match_names = vec!["DM-Deck16][".into(), "DM-Liandri".into()];
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::Play);
+        assert!(menu.activate(Pulldown::Game, 2, &mut settings) == Action::None);
+        menu.key(VK_DOWN, &mut settings);
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::Deathmatch(1));
+        assert!(menu.key(VK_ESCAPE, &mut settings) == Action::None);
+        assert!(menu.match_choice.is_none());
     }
 
     #[test]

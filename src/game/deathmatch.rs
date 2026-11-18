@@ -77,11 +77,15 @@ pub struct Fighter {
     pub selected_at: f32,
     pickup_time: f32,
     pub last_alt: bool,
-    pub zoomed: bool,
+    zoom: super::SniperZoom,
+    rocket_lock: Option<(usize, u16, f32)>,
+    rocket_locked: bool,
+    enforcer_windup: Option<f32>,
+    enforcer_recover: Option<f32>,
+    hammer_charge: Option<f32>,
     pulse: Option<(bool, f32)>,
     pulse_ended: Option<(bool, f32)>,
     pub(crate) minigun_firing: bool,
-    alt_held: bool,
     charge: Option<Charge>,
     charge_locked: Option<bool>,
     wait_for_fire_release: bool,
@@ -126,11 +130,15 @@ impl Fighter {
             selected_at: f32::NEG_INFINITY,
             pickup_time: f32::NEG_INFINITY,
             last_alt: false,
-            zoomed: false,
+            zoom: super::SniperZoom::default(),
+            rocket_lock: None,
+            rocket_locked: false,
+            enforcer_windup: None,
+            enforcer_recover: None,
+            hammer_charge: None,
             pulse: None,
             pulse_ended: None,
             minigun_firing: false,
-            alt_held: false,
             charge: None,
             charge_locked: None,
             wait_for_fire_release: false,
@@ -172,6 +180,14 @@ impl Fighter {
         (self.weapon != Weapon::Hammer).then(|| self.inventory.ammo(self.weapon))
     }
 
+    pub fn zoomed(&self) -> bool {
+        self.zoom.level > 0.0
+    }
+
+    pub fn field_of_view(&self, base: f32) -> f32 {
+        self.zoom.fov(base)
+    }
+
     pub fn charge_status(&self, map: &Map, time: f32) -> Option<(u16, f32)> {
         let charge = self.charge?;
         let elapsed = time - charge.since;
@@ -197,21 +213,32 @@ impl Fighter {
     }
 
     pub(crate) fn weapon_pose<'a>(&self, art: &'a WeaponAssets, time: f32) -> Pose<'a> {
-        self.charge
-            .and_then(|charge| {
-                let age = time - charge.since;
-                if self.weapon == Weapon::Rocket {
-                    let rocket = art.rocket.as_ref()?;
-                    let (slot, rotating, phase) =
-                        charge.rocket_phase(rocket, time, self.inventory.ammo(self.weapon));
-                    let clip = if rotating {
-                        &rocket.rotations[slot]
-                    } else {
-                        &rocket.loads[slot]
-                    };
-                    return clip.hold_pose(phase);
-                }
-                art.charge_pose(age)
+        self.hammer_charge
+            .and_then(|since| art.hammer_pose(time - since))
+            .or_else(|| {
+                self.enforcer_windup
+                    .and_then(|since| art.attack_start.hold_pose(time - since))
+            })
+            .or_else(|| {
+                self.enforcer_recover
+                    .and_then(|since| art.attack_end.sample(time - since))
+            })
+            .or_else(|| {
+                self.charge.and_then(|charge| {
+                    let age = time - charge.since;
+                    if self.weapon == Weapon::Rocket {
+                        let rocket = art.rocket.as_ref()?;
+                        let (slot, rotating, phase) =
+                            charge.rocket_phase(rocket, time, self.inventory.ammo(self.weapon));
+                        let clip = if rotating {
+                            &rocket.rotations[slot]
+                        } else {
+                            &rocket.loads[slot]
+                        };
+                        return clip.hold_pose(phase);
+                    }
+                    art.charge_pose(age)
+                })
             })
             .or_else(|| {
                 let (alternate, start) = self.pulse?;
@@ -281,7 +308,12 @@ impl Fighter {
         self.minigun_firing = false;
         self.charge = None;
         self.charge_locked = None;
-        self.zoomed = false;
+        self.zoom = super::SniperZoom::default();
+        self.rocket_lock = None;
+        self.rocket_locked = false;
+        self.enforcer_windup = None;
+        self.enforcer_recover = None;
+        self.hammer_charge = None;
         self.fired_at = f32::NEG_INFINITY;
         self.selected_at = time;
         self.ready_at =
@@ -475,6 +507,7 @@ struct Bolt {
     next_trail: f32,
     gel: Option<GelSurface>,
     gel_trigger: Option<f32>,
+    seeking: Option<(usize, u16, Vec3, f32)>,
 }
 
 struct GelSurface {
@@ -670,6 +703,7 @@ pub struct Match {
     pub traces: Vec<Trace>,
     pub rocket_trails: ordnance::RocketTrails,
     pub warhead_smoke: ordnance::WarheadSmoke,
+    pub(crate) hammer_effects: Vec<super::Effect>,
     pub(crate) drops: Vec<DroppedWeapon>,
     outgoing_damage: Option<DamageReadout>,
     bolts: Vec<Bolt>,
@@ -681,6 +715,9 @@ pub struct Match {
     spawn_sequence: u64,
     message: String,
     message_until: f32,
+    announcement: Option<(&'static str, f32)>,
+    first_frag: bool,
+    player_frags: (u8, f32),
 }
 
 impl Match {
@@ -700,6 +737,7 @@ impl Match {
             traces: Vec::new(),
             rocket_trails: ordnance::RocketTrails::default(),
             warhead_smoke: ordnance::WarheadSmoke::default(),
+            hammer_effects: Vec::new(),
             drops: Vec::new(),
             outgoing_damage: None,
             bolts: Vec::new(),
@@ -716,6 +754,9 @@ impl Match {
             spawn_sequence: 0,
             message: String::new(),
             message_until: 0.0,
+            announcement: None,
+            first_frag: false,
+            player_frags: (0, f32::NEG_INFINITY),
         };
         game.spawn_all(map);
         game
@@ -747,6 +788,7 @@ impl Match {
         self.traces.clear();
         self.rocket_trails = ordnance::RocketTrails::default();
         self.warhead_smoke = ordnance::WarheadSmoke::default();
+        self.hammer_effects.clear();
         self.drops.clear();
         self.outgoing_damage = None;
         self.decals = decals::Marks::default();
@@ -756,6 +798,9 @@ impl Match {
         self.pickups.fill(None);
         self.restore_map(map);
         self.message_until = 0.0;
+        self.announcement = None;
+        self.first_frag = false;
+        self.player_frags = (0, f32::NEG_INFINITY);
         self.spawn_all(map);
     }
 
@@ -827,9 +872,9 @@ impl Match {
             armor: player.armor,
             boots: player.boot_charges() > 0 || player.power.boosted_airborne,
             amplified: player.amp_left(self.time) > 0.0,
-            rocket_locked: false,
+            rocket_locked: player.rocket_locked,
             crosshair_visible: player.health > 0
-                && !player.zoomed
+                && !player.zoomed()
                 && !self.finished
                 && self.pilot_index().is_none(),
             weapon: player.weapon,
@@ -865,6 +910,17 @@ impl Match {
 
     pub fn notice(&self) -> Option<&str> {
         (self.time < self.message_until).then_some(self.message.as_str())
+    }
+
+    pub fn announcement(&self) -> Option<&'static str> {
+        self.announcement
+            .filter(|&(_, until)| self.time < until)
+            .map(|(text, _)| text)
+    }
+
+    fn announce(&mut self, map: &Map, index: usize, text: &'static str, sounds: &mut SoundEvents) {
+        self.announcement = Some((text, self.time + 2.0));
+        sounds.extend(map.match_announcer[index].iter().cloned());
     }
 
     pub fn damage_notice(&self) -> Option<(u16, u16, f32)> {
@@ -903,6 +959,7 @@ impl Match {
             Some((true, _)) => art.alternate.as_ref(),
             Some((false, _)) => art.fire.as_ref(),
             None if player.minigun_firing => art.fire.as_ref(),
+            None if player.hammer_charge.is_some() => art.charge_loop.as_ref(),
             None => None,
         }
     }
@@ -996,6 +1053,8 @@ impl Match {
             fighter.capture_body();
         }
         self.traces.retain(|trace| trace.expires > self.time);
+        self.hammer_effects
+            .retain(|effect| effect.expires > self.time);
         let flight = self.pilot_index();
         let manual_detonation = flight.and_then(|index| {
             let bolt = &mut self.bolts[index];
@@ -1250,6 +1309,7 @@ impl Match {
         self.separate_fighters(map);
         self.collect(map, &mut sounds);
         self.update_drops(map, dt, &mut sounds);
+        self.update_rocket_locks(map, &mut sounds);
         if let Some(detonation) = manual_detonation {
             self.detonate(map, vec![detonation], &mut hits, &mut sounds);
         }
@@ -1276,7 +1336,7 @@ impl Match {
                 .iter()
                 .any(|hit| hit.victim == id && hit.damage == u16::MAX)
             {
-                self.fire(map, id, input, &mut hits, &mut sounds);
+                self.fire_step(map, id, input, dt, &mut hits, &mut sounds);
             }
         }
         self.advance_warhead_waves(map, dt, &mut hits, &mut sounds);
@@ -1292,6 +1352,23 @@ impl Match {
                 .fighters
                 .iter()
                 .any(|fighter| fighter.score >= self.rules.frag_limit);
+        if self.finished {
+            let standings = self.standings();
+            let leader = standings[0];
+            let tied = standings
+                .get(1)
+                .is_some_and(|&id| self.fighters[id].score == self.fighters[leader].score);
+            if !tied {
+                let (index, text) = if leader == 0 {
+                    (3, "MATCH WON")
+                } else {
+                    (4, "MATCH LOST")
+                };
+                self.announce(map, index, text, &mut sounds);
+            } else {
+                self.announcement = None;
+            }
+        }
         if flight.is_some() && self.pilot_index().is_none() {
             self.fighters[0].wait_for_fire_release = command.primary || command.alternate;
             self.guidance_lost_until = self.time + 0.3;
@@ -1445,6 +1522,163 @@ impl Match {
         });
     }
 
+    fn update_rocket_locks(&mut self, map: &Map, sounds: &mut SoundEvents) {
+        for id in 0..self.fighters.len() {
+            let fighter = &self.fighters[id];
+            if fighter.weapon != Weapon::Rocket || fighter.health == 0 {
+                continue;
+            }
+            let eye = fighter.camera(map);
+            let candidate = self
+                .fighters
+                .iter()
+                .enumerate()
+                .filter(|&(target, other)| {
+                    target != id
+                        && other.health > 0
+                        && (other.invis_left(self.time) <= 0.0 || self.time - other.fired_at < 0.42)
+                })
+                .filter_map(|(target, other)| {
+                    let alignment = super::rocket_target_visible(map, &eye, other.walker.position)?;
+                    let keep = fighter.rocket_lock.is_some_and(|(previous, deaths, _)| {
+                        previous == target && deaths == other.deaths
+                    });
+                    Some((target, other.deaths, alignment, keep))
+                })
+                .max_by(|a, b| a.3.cmp(&b.3).then(a.2.total_cmp(&b.2)));
+            let fighter = &mut self.fighters[id];
+            let previous = fighter.rocket_locked;
+            fighter.rocket_lock = candidate.map(|(target, deaths, _, keep)| {
+                let since = fighter
+                    .rocket_lock
+                    .filter(|_| keep)
+                    .map_or(self.time, |(_, _, since)| since);
+                (target, deaths, since)
+            });
+            fighter.rocket_locked = fighter
+                .rocket_lock
+                .is_some_and(|(_, _, since)| self.time - since >= super::ROCKET_LOCK_TIME);
+            if id == 0
+                && previous != fighter.rocket_locked
+                && let Some(art) = map.arsenal.get(&Weapon::Rocket)
+            {
+                sounds.extend(art.rocket_lock[usize::from(previous)].iter().cloned());
+            }
+        }
+    }
+
+    fn fire_hammer(
+        &mut self,
+        map: &Map,
+        id: usize,
+        input: Command,
+        hits: &mut Vec<Hit>,
+        sounds: &mut SoundEvents,
+    ) {
+        let fighter = &self.fighters[id];
+        let camera = fighter.camera(map);
+        let alternate = fighter.hammer_charge.is_none() && input.alternate && !input.primary;
+        let forward = camera.look_direction();
+        let charge = fighter
+            .hammer_charge
+            .map_or(0.0, |since| (self.time - since) * 0.75);
+        let contact = charge > 1.0
+            && map.collision.ray(camera.position, forward * 25.0).is_none()
+            && nearest_hit(
+                &self.fighters,
+                id,
+                camera.position,
+                forward * 25.0,
+                [0.0; 2],
+            )
+            .is_some();
+        let fighter = &mut self.fighters[id];
+        let art = map.arsenal.get(&Weapon::Hammer);
+        if (input.primary && !contact) || (fighter.hammer_charge.is_none() && !alternate) {
+            if input.primary && fighter.hammer_charge.is_none() && self.time >= fighter.ready_at {
+                fighter.hammer_charge = Some(self.time);
+                let wave = art.and_then(|art| art.load_sound.as_ref()).cloned();
+                if id == 0 {
+                    sounds.extend(wave);
+                } else {
+                    sounds.extend_at(wave, camera.position, CONTACT_SOUND_RADIUS, 0.75);
+                }
+            }
+            return;
+        }
+        if self.time < fighter.ready_at {
+            return;
+        }
+        fighter.hammer_charge = None;
+        fighter.ready_at =
+            self.time + art.map_or(0.82, |art| art.primary_motion.duration().max(0.82));
+        fighter.fired_at = self.time;
+        fighter.fired_count = fighter.fired_count.wrapping_add(1);
+        fighter.last_alt = alternate;
+        fighter.protected_until = fighter.protected_until.min(self.time);
+        let scale = if fighter.amp_left(self.time) > 0.0 {
+            3
+        } else {
+            1
+        };
+        super::emit_shot_sound(
+            map,
+            Weapon::Hammer,
+            alternate,
+            (id != 0).then_some(camera.position),
+            sounds,
+        );
+        if alternate {
+            self.shock.deflect(map, &camera);
+            for bolt in self
+                .bolts
+                .iter_mut()
+                .filter(|bolt| bolt.gel.is_none() && bolt.pilot.is_none())
+            {
+                if let Some(velocity) =
+                    super::hammer_deflection(map, &camera, bolt.position, bolt.velocity)
+                {
+                    bolt.velocity = velocity;
+                    bolt.seeking = None;
+                }
+            }
+        }
+        let (start, delta, wall) = super::hammer_trace(map, &camera, alternate);
+        if let Some((victim, at)) = nearest_hit(&self.fighters, id, start, delta, [0.0; 2]) {
+            let offset = start + delta * at - camera.position;
+            let damage = super::hammer_damage(alternate, offset.dot(offset).sqrt(), charge);
+            hits.push(Hit {
+                bypass_armor: false,
+                victim,
+                owner: Some(id),
+                damage: damage * scale,
+                impulse: forward * (f32::from(damage) * 3.4),
+            });
+        } else if let Some((point, normal)) = wall {
+            let offset = point - camera.position;
+            let (damage, momentum) =
+                super::hammer_wall_hit(alternate, offset.dot(offset).sqrt(), forward, charge);
+            self.fighters[id]
+                .walker
+                .apply_self_damage_momentum(momentum, map.collision.profile);
+            hits.push(Hit {
+                bypass_armor: false,
+                victim: id,
+                owner: Some(id),
+                damage: damage * scale,
+                impulse: Vec3::default(),
+            });
+            let spark = point + normal * 2.0;
+            self.hammer_effects.push(super::Effect {
+                origin: spark,
+                end: spark,
+                color: 0xffbd78,
+                expires: self.time + 0.16,
+            });
+        }
+    }
+
+    #[cfg(test)]
     fn fire(
         &mut self,
         map: &Map,
@@ -1453,14 +1687,21 @@ impl Match {
         hits: &mut Vec<Hit>,
         sounds: &mut SoundEvents,
     ) {
+        self.fire_step(map, id, input, 1.0 / 120.0, hits, sounds);
+    }
+
+    fn fire_step(
+        &mut self,
+        map: &Map,
+        id: usize,
+        input: Command,
+        dt: f32,
+        hits: &mut Vec<Hit>,
+        sounds: &mut SoundEvents,
+    ) {
         let fighter = &mut self.fighters[id];
         if fighter.health == 0 {
             return;
-        }
-        let pressed_alt = input.alternate && !fighter.alt_held;
-        fighter.alt_held = input.alternate;
-        if fighter.weapon != Weapon::Enforcer || !input.alternate || input.primary {
-            fighter.enforcer_accuracy = 0.4;
         }
         let requested = input.preferred.or_else(|| {
             fighter
@@ -1480,6 +1721,41 @@ impl Match {
         let weapon = fighter.weapon;
         let held_alt = input.alternate && !input.primary;
         let holding = input.primary || input.alternate;
+        fighter.zoom.update(held_alt, dt, weapon == Weapon::Sniper);
+        if weapon == Weapon::Hammer {
+            self.fire_hammer(map, id, input, hits, sounds);
+            return;
+        }
+        let mut forced_alt = false;
+        if weapon == Weapon::Enforcer {
+            let art = map.arsenal.get(&weapon);
+            if fighter.enforcer_windup.is_some() {
+                if self.time < fighter.ready_at {
+                    return;
+                }
+                fighter.enforcer_windup = None;
+                forced_alt = true;
+            } else if self.time >= fighter.ready_at {
+                let repeating = fighter.last_alt
+                    && fighter.enforcer_recover.is_none()
+                    && fighter.fired_at.is_finite();
+                if repeating && (!held_alt || fighter.inventory.ammo(weapon) == 0) {
+                    fighter.enforcer_recover = Some(self.time);
+                    fighter.enforcer_accuracy = 0.4;
+                    fighter.ready_at = self.time + art.map_or(0.0, |art| art.attack_end.duration());
+                    return;
+                }
+                if held_alt && !repeating && fighter.inventory.ammo(weapon) > 0 {
+                    let duration = art.map_or(0.0, |art| art.attack_start.duration());
+                    fighter.enforcer_recover = None;
+                    if duration > 0.0 {
+                        fighter.enforcer_windup = Some(self.time);
+                        fighter.ready_at = self.time + duration;
+                        return;
+                    }
+                }
+            }
+        }
         if let Some((alt, _)) = fighter.pulse
             && (!holding
                 || alt != held_alt
@@ -1562,15 +1838,12 @@ impl Match {
             fighter.charge_locked = held.then_some(alt);
             (alt, shot, units, Some(charge.profile.shape))
         } else {
-            if self.time < fighter.ready_at || !(input.primary || input.alternate) {
+            if self.time < fighter.ready_at || !(holding || forced_alt) {
                 return;
             }
-            let mut alt = input.alternate && !input.primary;
+            let mut alt = held_alt || forced_alt;
             let mut shot = arsenal::shot(weapon, alt);
             if matches!(shot.path, Path::Zoom) {
-                if pressed_alt {
-                    fighter.zoomed = !fighter.zoomed;
-                }
                 return;
             }
             if ammo < shot.ammo {
@@ -1626,6 +1899,12 @@ impl Match {
         fighter.fired_count = fighter.fired_count.wrapping_add(1);
         fighter.fired_units = units as u8;
         fighter.last_alt = alt;
+        if weapon == Weapon::Enforcer {
+            fighter.enforcer_recover = None;
+            if !alt {
+                fighter.enforcer_accuracy = 0.4;
+            }
+        }
         let pulse_alt = weapon == Weapon::Pulse && alt;
         if weapon == Weapon::Pulse {
             fighter.pulse.get_or_insert((alt, self.time));
@@ -1783,6 +2062,13 @@ impl Match {
                         next_trail: self.time + if kind.warhead() { 0.3 } else { 0.0 },
                         gel: None,
                         gel_trigger: None,
+                        seeking: (kind == ordnance::Kind::Rocket && fighter.rocket_locked)
+                            .then(|| {
+                                fighter.rocket_lock.map(|(target, deaths, _)| {
+                                    (target, deaths, aim_direction, self.time + 0.1)
+                                })
+                            })
+                            .flatten(),
                     });
                 }
             }
@@ -2010,6 +2296,7 @@ impl Match {
                         next_trail: self.time,
                         gel: None,
                         gel_trigger: None,
+                        seeking: None,
                     });
                 }
                 let touching = self.fighters.iter().any(|fighter| {
@@ -2026,7 +2313,22 @@ impl Match {
             }
             let zone = map.collision.regions.at(bolt.position);
             if payload.kind == ordnance::Kind::Rocket && self.time < bolt.expires {
-                let direction = unit(bolt.velocity);
+                let mut direction = unit(bolt.velocity);
+                if let Some((target, deaths, initial, next)) = &mut bolt.seeking
+                    && self.time >= *next
+                {
+                    *next = self.time + 0.1;
+                    let fighter = &self.fighters[*target];
+                    let offset = fighter.walker.position - bolt.position;
+                    let aim = unit(offset);
+                    if fighter.health > 0
+                        && fighter.deaths == *deaths
+                        && aim.dot(*initial) > 0.0
+                        && map.collision.ray(bolt.position, offset).is_none()
+                    {
+                        direction = unit(direction + aim * 0.5);
+                    }
+                }
                 self.rocket_trails.emit(
                     map,
                     bolt.position,
@@ -2034,8 +2336,9 @@ impl Match {
                     self.time,
                     &mut bolt.next_trail,
                 );
-                bolt.velocity =
-                    direction * (bolt.velocity.dot(bolt.velocity).sqrt() + 50.0 * dt).min(1600.0);
+                let acceleration = if bolt.seeking.is_some() { 25.0 } else { 50.0 };
+                bolt.velocity = direction
+                    * (bolt.velocity.dot(bolt.velocity).sqrt() + acceleration * dt).min(1600.0);
             }
             if payload.kind.warhead() && self.time < bolt.expires {
                 self.warhead_smoke.emit(
@@ -2189,6 +2492,7 @@ impl Match {
                         next_trail: self.time,
                         gel: None,
                         gel_trigger: None,
+                        seeking: None,
                     }));
                 }
                 let wave_offset = if payload.kind.warhead() {
@@ -2586,6 +2890,9 @@ impl Match {
             return;
         }
         victim.deaths += 1;
+        if hit.victim == 0 {
+            self.player_frags = (0, f32::NEG_INFINITY);
+        }
         self.drops
             .extend(DroppedWeapon::from_fighter(map, victim, self.time));
         victim.charge = None;
@@ -2610,6 +2917,24 @@ impl Match {
         if let Some(owner) = owner.filter(|&owner| owner != hit.victim) {
             self.fighters[owner].score += 1;
             self.message = format!("{} FRAGGED {}", Self::label(owner), Self::label(hit.victim));
+            if !self.first_frag {
+                self.first_frag = true;
+                self.announce(map, 0, "FIRST FRAG", sounds);
+            }
+            if owner == 0 {
+                let (count, last) = self.player_frags;
+                let count = if self.time - last <= 2.5 {
+                    count.saturating_add(1)
+                } else {
+                    1
+                };
+                self.player_frags = (count, self.time);
+                match count {
+                    2 => self.announce(map, 1, "DOUBLE FRAG", sounds),
+                    3 => self.announce(map, 2, "MULTI FRAG", sounds),
+                    _ => {}
+                }
+            }
         } else {
             self.fighters[hit.victim].score -= 1;
             self.message = format!("{} WENT DOWN", Self::label(hit.victim));
@@ -2707,6 +3032,32 @@ impl Match {
                             || distance < distance_squared(point, eye.position) * 0.44
                     })
             });
+        let shock_combo = target.and_then(|(_, position, _, _, _)| {
+            if self.rules.difficulty != Difficulty::Hard
+                || fighter.weapon != Weapon::Shock
+                || fighter.inventory.ammo(Weapon::Shock) < 3
+                || self.time < fighter.ready_at
+            {
+                return None;
+            }
+            let art = shock::assets(map)?;
+            let origin = art.beam_origin(&eye);
+            self.shock
+                .incoming(art.speed)
+                .filter(|(owner, _, _, _, _)| *owner == id)
+                .filter_map(|(_, ball, velocity, _, _)| {
+                    let ball = ball + velocity * dt;
+                    let distance = distance_squared(position, ball);
+                    let ray = ball - origin;
+                    (distance < 145.0_f32.powi(2)
+                        && ray.dot(ray) > 265.0_f32.powi(2)
+                        && map.collision.ray(origin, ray).is_none()
+                        && map.collision.ray(ball, position - ball).is_none())
+                    .then_some((ray, distance))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(ray, _)| ray)
+        });
         let fighter = &mut self.fighters[id];
         if let Some(command) = try_retreat(
             &self.navigation,
@@ -2730,7 +3081,8 @@ impl Match {
             }
             let range = distance.sqrt();
             let charge = fighter.charge;
-            let weapon = if charge.is_some()
+            let weapon = if shock_combo.is_some()
+                || charge.is_some()
                 || (self.time - fighter.selected_at < 1.1
                     && fighter.inventory.usable(fighter.weapon))
             {
@@ -2738,22 +3090,26 @@ impl Match {
             } else {
                 fighter.inventory.preferred(range)
             };
-            let (alt, shot) = charge.map_or_else(
-                || {
-                    let ammo = fighter.inventory.ammo(weapon);
-                    if let Some((chosen, alt, until)) = bot.weapon_mode
-                        && chosen == weapon
-                        && self.time < until
-                        && ammo >= arsenal::shot(weapon, alt).ammo
-                    {
-                        return (alt, arsenal::shot(weapon, alt));
-                    }
-                    let result = arsenal::bot_shot(weapon, ammo, range);
-                    bot.weapon_mode = Some((weapon, result.0, self.time + 0.55));
-                    result
-                },
-                |charge| (charge.alternate, arsenal::shot(weapon, charge.alternate)),
-            );
+            let (alt, shot) = if shock_combo.is_some() {
+                (false, arsenal::shot(Weapon::Shock, false))
+            } else {
+                charge.map_or_else(
+                    || {
+                        let ammo = fighter.inventory.ammo(weapon);
+                        if let Some((chosen, alt, until)) = bot.weapon_mode
+                            && chosen == weapon
+                            && self.time < until
+                            && ammo >= arsenal::shot(weapon, alt).ammo
+                        {
+                            return (alt, arsenal::shot(weapon, alt));
+                        }
+                        let result = arsenal::bot_shot(weapon, ammo, range);
+                        bot.weapon_mode = Some((weapon, result.0, self.time + 0.55));
+                        result
+                    },
+                    |charge| (charge.alternate, arsenal::shot(weapon, charge.alternate)),
+                )
+            };
             let mut clear = true;
             let attack_range = match shot.path {
                 Path::Missile {
@@ -2799,9 +3155,11 @@ impl Match {
                 *axis += (desired - *axis) * (1.0 - (-12.0 * dt).exp());
             }
             let [side_error, height_error] = *bias;
-            delta = delta
-                + eye.right() * (side_error * error)
-                + Vec3(0.0, 0.0, height_error * error * 0.55);
+            delta = shock_combo.unwrap_or(
+                delta
+                    + eye.right() * (side_error * error)
+                    + Vec3(0.0, 0.0, height_error * error * 0.55),
+            );
             let (turn, pitch) = aim_error(delta, fighter.yaw, fighter.pitch);
             let yaw = turn.clamp(-skill.turn * dt, skill.turn * dt);
             let tilt = pitch.clamp(-skill.turn * dt * 0.75, skill.turn * dt * 0.75);
@@ -3619,6 +3977,7 @@ mod tests {
             next_trail: 0.0,
             gel: None,
             gel_trigger: None,
+            seeking: None,
         });
         let dt = 1.0 / 120.0;
         let first = game.bot_command(&map, 1, dt);
@@ -3940,6 +4299,7 @@ mod tests {
                     next_trail: 0.7,
                     gel: None,
                     gel_trigger: None,
+                    seeking: None,
                 });
             }
             if cover {
@@ -4767,6 +5127,7 @@ mod tests {
                     next_trail: 0.0,
                     gel: None,
                     gel_trigger: None,
+                    seeking: None,
                 });
             }
             if cover {
@@ -5030,8 +5391,14 @@ mod tests {
                 let fighter = &mut game.fighters[1];
                 fighter.inventory.pickup(&map.arsenal, weapon);
                 fighter.inventory.grant_ammo(&map.arsenal, weapon, u16::MAX);
-                fighter.weapon = weapon;
-                fighter.alt_held = false;
+                fighter.equip(
+                    map.arsenal.get(&weapon),
+                    weapon,
+                    game.time,
+                    &mut sounds,
+                    false,
+                );
+                game.time = game.time.max(fighter.ready_at);
                 let ammo_before = fighter.inventory.ammo(weapon);
                 let bolts_before = game.bolts.len();
                 let shot = arsenal::shot(weapon, alternate);
@@ -5046,6 +5413,23 @@ mod tests {
                     &mut hits,
                     &mut sounds,
                 );
+                if weapon == Weapon::Hammer && !alternate {
+                    game.time += 1.4;
+                    game.fire(&map, 1, Command::default(), &mut hits, &mut sounds);
+                }
+                if weapon == Weapon::Enforcer && alternate {
+                    game.time = game.fighters[1].ready_at;
+                    game.fire(
+                        &map,
+                        1,
+                        Command {
+                            alternate: true,
+                            ..Command::default()
+                        },
+                        &mut hits,
+                        &mut sounds,
+                    );
+                }
                 if arsenal::charge_profile(weapon, alternate).is_some() {
                     assert_eq!(game.bolts.len(), bolts_before);
                     game.fire(
@@ -5075,7 +5459,7 @@ mod tests {
                     Path::Trace { .. } | Path::Shock => {
                         assert_eq!(game.fighters[1].fired_at, game.time)
                     }
-                    Path::Zoom => assert!(game.fighters[1].zoomed),
+                    Path::Zoom => assert!(game.fighters[1].zoomed()),
                 }
             }
         }
@@ -5084,6 +5468,147 @@ mod tests {
             game.fighters[1].inventory.ammo(Weapon::Minigun),
             game.fighters[1].inventory.ammo(Weapon::Enforcer)
         );
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY data"]
+    fn special_weapons_keep_match_charge_zoom_and_lock_state() {
+        let (map, mut game) = flight_fixture();
+        let mut sounds = SoundEvents::default();
+        let mut hits = Vec::new();
+        let primary = Command {
+            primary: true,
+            ..Command::default()
+        };
+        let alternate = Command {
+            alternate: true,
+            ..Command::default()
+        };
+        let shooter = &mut game.fighters[0];
+        shooter.inventory.pickup(&map.arsenal, Weapon::Rocket);
+        shooter.weapon = Weapon::Rocket;
+        game.fighters[1].walker.position = Vec3(520.0, 0.0, 39.2);
+        game.time = 2.0;
+        game.update_rocket_locks(&map, &mut sounds);
+        assert!(!game.fighters[0].rocket_locked);
+        game.time += super::super::ROCKET_LOCK_TIME + 0.01;
+        game.update_rocket_locks(&map, &mut sounds);
+        assert!(game.hud_state(&map, 1.0).rocket_locked);
+        game.fire(&map, 0, primary, &mut hits, &mut sounds);
+        game.time += 0.01;
+        game.fire(&map, 0, Command::default(), &mut hits, &mut sounds);
+        assert!(game.bolts[0].seeking.is_some());
+        game.fighters[1].walker.position.1 = 135.0;
+        game.time += 0.11;
+        game.move_bolts(&map, 1.0 / 120.0, &mut hits, &mut sounds);
+        assert!(game.bolts[0].velocity.1 > 20.0);
+
+        game.time += 3.0;
+        game.fighters[0].weapon = Weapon::Enforcer;
+        let before = game.fighters[0].ammo();
+        game.fire(&map, 0, alternate, &mut hits, &mut sounds);
+        assert_eq!(game.fighters[0].ammo(), before);
+        assert!(game.fighters[0].enforcer_windup.is_some());
+        game.time = game.fighters[0].ready_at;
+        game.fire(&map, 0, alternate, &mut hits, &mut sounds);
+        assert_eq!(game.fighters[0].ammo(), before.map(|ammo| ammo - 1));
+        game.time = game.fighters[0].ready_at;
+        game.fire(&map, 0, Command::default(), &mut hits, &mut sounds);
+        assert!(game.fighters[0].enforcer_recover.is_some());
+
+        let player = &mut game.fighters[0];
+        player.inventory.pickup(&map.arsenal, Weapon::Sniper);
+        player.weapon = Weapon::Sniper;
+        game.fire_step(&map, 0, alternate, 0.1, &mut hits, &mut sounds);
+        let first = game.fighters[0].field_of_view(90.0);
+        game.fire_step(&map, 0, alternate, 0.2, &mut hits, &mut sounds);
+        let held = game.fighters[0].field_of_view(90.0);
+        assert!(first < 90.0 && held < first);
+        game.fire(&map, 0, Command::default(), &mut hits, &mut sounds);
+        assert_eq!(game.fighters[0].field_of_view(90.0), held);
+        game.fire(&map, 0, alternate, &mut hits, &mut sounds);
+        assert_eq!(game.fighters[0].field_of_view(90.0), 90.0);
+
+        game.time += 3.0;
+        game.fighters[0].weapon = Weapon::Hammer;
+        game.fighters[0].pitch = -1.3;
+        game.fire(&map, 0, primary, &mut hits, &mut sounds);
+        assert!(game.fighters[0].hammer_charge.is_some());
+        game.time += 1.5;
+        game.fire(&map, 0, Command::default(), &mut hits, &mut sounds);
+        assert!(game.fighters[0].hammer_charge.is_none());
+        assert!(game.fighters[0].walker.velocity().2 > 100.0);
+        assert!(!game.hammer_effects.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY data"]
+    fn deck16_and_liandri_complete_matches_across_difficulties() {
+        for name in ["DM-Deck16][", "DM-Liandri"] {
+            let path = std::path::PathBuf::from(format!("local/goty/Maps/{name}.unr"));
+            let bytes = std::fs::read(&path).unwrap();
+            let mut map = Map::load(&Package::read(&bytes).unwrap(), Some(&path)).unwrap();
+            if path.with_file_name("../Sounds/Announcer.uax").is_file() {
+                assert!(map.match_announcer.iter().all(Option::is_some));
+            }
+            let mut game = Match::new(
+                &map,
+                0,
+                Rules {
+                    bots: 3,
+                    seconds: 45,
+                    frag_limit: 2,
+                    ..Rules::default()
+                },
+            );
+            for difficulty in [Difficulty::Easy, Difficulty::Standard, Difficulty::Hard] {
+                game.rules.difficulty = difficulty;
+                game.restart(&mut map);
+                let starts = game
+                    .fighters
+                    .iter()
+                    .map(|fighter| fighter.walker.position)
+                    .collect::<Vec<_>>();
+                let mut left_spawn = vec![false; starts.len()];
+                for _ in 0..(45 * 60 + 4) {
+                    game.step(&mut map, Command::default(), 1.0 / 60.0);
+                    for ((left_spawn, fighter), &start) in
+                        left_spawn.iter_mut().zip(&game.fighters).zip(&starts)
+                    {
+                        *left_spawn |=
+                            distance_squared(start, fighter.walker.position) > 45.0_f32.powi(2);
+                    }
+                    if game.finished {
+                        break;
+                    }
+                }
+                assert!(game.finished, "{name} {difficulty:?} did not finish");
+                assert!(
+                    left_spawn.iter().skip(1).all(|&moved| moved),
+                    "{name} {difficulty:?} had a bot stall at spawn"
+                );
+                assert!(
+                    game.fighters
+                        .iter()
+                        .skip(1)
+                        .any(|bot| bot.fired_count > 0 || bot.score > 0),
+                    "{name} {difficulty:?} had no bot combat"
+                );
+                game.step(
+                    &mut map,
+                    Command {
+                        restart: true,
+                        ..Command::default()
+                    },
+                    1.0 / 60.0,
+                );
+                assert!(
+                    !game.finished
+                        && game.time == 0.0
+                        && game.fighters.iter().all(|fighter| fighter.score == 0)
+                );
+            }
+        }
     }
 
     #[test]
@@ -5661,6 +6186,7 @@ mod tests {
             next_trail: 0.0,
             gel: None,
             gel_trigger: None,
+            seeking: None,
             payload: ProjectilePayload {
                 kind: super::super::ordnance::Kind::Rocket,
                 damage: 85,

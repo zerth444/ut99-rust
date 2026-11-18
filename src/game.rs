@@ -242,6 +242,14 @@ impl RocketAnimations {
 }
 
 impl WeaponAssets {
+    fn hammer_pose(&self, elapsed: f32) -> Option<Pose<'_>> {
+        let windup = self.load.duration();
+        if elapsed < windup {
+            self.load.sample(elapsed)
+        } else {
+            self.alternate_motion.sample_loop(elapsed - windup)
+        }
+    }
     pub fn muzzle_position(&self, pose: Pose<'_>) -> Option<Vec3> {
         pose.edge_center(self.muzzle_triangle?)
     }
@@ -527,6 +535,7 @@ fn landing_damage(speed: f32, jump_speed: f32) -> u16 {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Effect {
     pub origin: Vec3,
     pub end: Vec3,
@@ -633,6 +642,10 @@ struct SniperZoom {
 }
 
 impl SniperZoom {
+    fn fov(&self, base: f32) -> f32 {
+        base - self.level * (base - 2.0)
+    }
+
     fn update(&mut self, pressed: bool, dt: f32, ready: bool) {
         if !ready {
             *self = Self {
@@ -842,17 +855,7 @@ impl Practice {
             WeaponState::Ready => None,
         };
         transition
-            .or_else(|| {
-                let elapsed = self.time - self.hammer_since?;
-                let pull = weapon.load.duration();
-                if elapsed < pull {
-                    return weapon.load.sample(elapsed);
-                }
-                let shake = weapon.alternate_motion.duration();
-                (shake > 0.0)
-                    .then(|| (elapsed - pull).rem_euclid(shake))
-                    .and_then(|age| weapon.alternate_motion.sample(age))
-            })
+            .or_else(|| weapon.hammer_pose(self.time - self.hammer_since?))
             .or_else(|| {
                 let charge = self.charge.as_ref()?;
                 if charge.weapon == Weapon::Rocket {
@@ -980,7 +983,7 @@ impl Practice {
     }
 
     pub fn field_of_view(&self) -> f32 {
-        self.base_fov - self.zoom.level * (self.base_fov - 2.0)
+        self.zoom.fov(self.base_fov)
     }
 
     pub fn scoped(&self) -> bool {
@@ -1040,17 +1043,12 @@ impl Practice {
         let visible = ready
             && self.weapon == Weapon::Rocket
             && self.target.as_ref().is_some_and(|target| {
-                let offset = target.position - camera.position;
-                let distance = offset.dot(offset).sqrt();
-                target.health > 0
-                    && distance <= 4000.0
-                    && offset.dot(camera.look_direction()) > 0.93 * distance
-                    && map.collision.ray(camera.position, offset).is_none()
+                target.health > 0 && rocket_target_visible(map, camera, target.position).is_some()
             });
         let previous = self.rocket_locked;
         if visible {
             let since = *self.lock_since.get_or_insert(self.time);
-            self.rocket_locked = self.time - since >= 1.25;
+            self.rocket_locked = self.time - since >= ROCKET_LOCK_TIME;
         } else {
             self.lock_since = None;
             self.rocket_locked = false;
@@ -1571,22 +1569,14 @@ impl Practice {
             self.shock.deflect(map, camera);
         }
         let direction = camera.look_direction();
-        let start = camera.position + camera.right() * 6.0 - direction.cross(camera.right()) * 5.0;
-        let range = if alternate { 180.0 } else { 120.0 };
-        let delta = direction * range;
-        let wall = map.collision.ray_surface(start, delta);
-        let visible = wall.map_or(delta, |(point, _)| point - start);
+        let (start, visible, wall) = hammer_trace(map, camera, alternate);
         if let Some(target) = &mut self.target
             && let Some(fraction) = target.ray(start, visible)
         {
             let point = start + visible * fraction;
             let distance = point - camera.position;
             let distance = distance.dot(distance).sqrt();
-            if alternate {
-                target.damage((20.0 * distance / 180.0) as u16);
-            } else if distance < 90.0 {
-                target.damage((60.0 * charge.min(1.5)) as u16);
-            }
+            target.damage(hammer_damage(alternate, distance, charge));
             return None;
         }
         let (point, normal) = wall?;
@@ -1596,13 +1586,13 @@ impl Practice {
             color: 0xffbd78,
             expires: self.time + 0.16,
         });
-        if alternate {
-            let distance = point - camera.position;
-            let scale = distance.dot(distance).sqrt() / 180.0;
-            Some(((24.0 * scale) as u16, direction * (-40_000.0 * scale)))
-        } else {
-            Some((36, direction * (-69_000.0 * charge.clamp(1.0, 1.5))))
-        }
+        let distance = point - camera.position;
+        Some(hammer_wall_hit(
+            alternate,
+            distance.dot(distance).sqrt(),
+            direction,
+            charge,
+        ))
     }
 
     fn update_pulse(&mut self, map: &Map, camera: &Camera, held: bool) {
@@ -2144,6 +2134,19 @@ impl Practice {
     }
 }
 
+fn rocket_target_visible(map: &Map, camera: &Camera, position: Vec3) -> Option<f32> {
+    let offset = position - camera.position;
+    let distance = offset.dot(offset).sqrt();
+    let facing = offset.dot(camera.look_direction());
+    (distance > 0.0
+        && distance <= 4000.0
+        && facing > 0.93 * distance
+        && map.collision.ray(camera.position, offset).is_none())
+    .then_some(facing / distance)
+}
+
+const ROCKET_LOCK_TIME: f32 = 1.25;
+
 fn initial_ammo(arsenal: &HashMap<Weapon, WeaponAssets>, weapon: Weapon) -> u16 {
     arsenal
         .get(&weapon)
@@ -2164,6 +2167,34 @@ fn hammer_deflection(map: &Map, camera: &Camera, position: Vec3, velocity: Vec3)
     let sign = if velocity.dot(side) > 0.0 { 1.0 } else { -1.0 };
     let speed = velocity.dot(velocity).sqrt();
     Some(crate::mover::unit(velocity + side * ((750.0 - distance) * sign)) * speed)
+}
+
+fn hammer_trace(map: &Map, camera: &Camera, alternate: bool) -> (Vec3, Vec3, Option<(Vec3, Vec3)>) {
+    let direction = camera.look_direction();
+    let right = camera.right();
+    let start = camera.position + right * 6.0 - direction.cross(right) * 5.0;
+    let delta = direction * if alternate { 180.0 } else { 120.0 };
+    let wall = map.collision.ray_surface(start, delta);
+    (start, wall.map_or(delta, |(point, _)| point - start), wall)
+}
+
+fn hammer_damage(alternate: bool, distance: f32, charge: f32) -> u16 {
+    if alternate {
+        (20.0 * distance / 180.0) as u16
+    } else if distance < 90.0 {
+        (60.0 * charge.min(1.5)) as u16
+    } else {
+        0
+    }
+}
+
+fn hammer_wall_hit(alternate: bool, distance: f32, direction: Vec3, charge: f32) -> (u16, Vec3) {
+    if alternate {
+        let scale = distance / 180.0;
+        ((24.0 * scale) as u16, direction * (-40_000.0 * scale))
+    } else {
+        (36, direction * (-69_000.0 * charge.clamp(1.0, 1.5)))
+    }
 }
 
 fn max_ammo(arsenal: &HashMap<Weapon, WeaponAssets>, weapon: Weapon) -> u16 {
