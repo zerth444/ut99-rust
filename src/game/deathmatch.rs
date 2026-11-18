@@ -1520,11 +1520,12 @@ impl Match {
         self.ballistics
             .update(map, None, self.time, dt, &mut sounds);
         let limit_reached = self.overtime
-            || self.remaining() == 0
-            || self
-                .fighters
-                .iter()
-                .any(|fighter| fighter.score >= self.rules.frag_limit);
+            || (self.rules.seconds > 0 && self.remaining() == 0)
+            || (self.rules.frag_limit > 0
+                && self
+                    .fighters
+                    .iter()
+                    .any(|fighter| fighter.score >= self.rules.frag_limit));
         if limit_reached {
             if let Some(leader) = self.winner() {
                 self.finished = true;
@@ -6521,6 +6522,26 @@ mod tests {
                 && angle_delta(yaw_after, yaw_before).abs() < 0.001
         );
         assert!(bot.bot.goal.is_none());
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY data"]
+    fn local_game_can_run_alone_with_both_limits_disabled() {
+        let (mut map, _) = flight_fixture();
+        let mut game = Match::new(
+            &map,
+            0,
+            Rules {
+                bots: 0,
+                frag_limit: 0,
+                seconds: 0,
+                ..Rules::default()
+            },
+        );
+        assert_eq!(game.fighters.len(), 1);
+        game.step(&mut map, Command::default(), 1.0 / 60.0);
+        assert!(!game.finished && !game.overtime);
+        assert!(!game.fighters[0].walker.position.2.is_nan());
     }
 
     #[test]

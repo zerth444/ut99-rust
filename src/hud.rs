@@ -52,18 +52,22 @@ impl Hud {
             .is_some_and(|weapon| weapon.guided_hud[0].is_some());
         let scale = (game.hud_scale * frame.width as f32 / 1280.0).clamp(0.55, 1.6);
         let player = &game.fighters[0];
-        let remaining = game.remaining();
+        let seconds = if game.limits().1 == 0 {
+            game.time as u32
+        } else {
+            u32::from(game.remaining())
+        };
         let white = [0.92, 0.96, 1.0];
         let accent = [0.42, 0.87, 0.95];
         let clock = if game.overtime {
             "SUDDEN DEATH".to_owned()
         } else if has_art {
-            format!("{:02}:{:02}", remaining / 60, remaining % 60)
+            format!("{:02}:{:02}", seconds / 60, seconds % 60)
         } else {
             format!(
                 "DEATHMATCH   {:02}:{:02}   FRAGS {}   {}",
-                remaining / 60,
-                remaining % 60,
+                seconds / 60,
+                seconds % 60,
                 player.score,
                 game.difficulty().label().to_ascii_uppercase()
             )
@@ -254,11 +258,11 @@ impl Hud {
             &title,
             white,
         );
-        let (frag_limit, _) = game.limits();
+        let (frag_limit, time_limit) = game.limits();
         let details = if game.finished {
             let reason = if game.overtime {
                 "Sudden death"
-            } else if score >= frag_limit {
+            } else if frag_limit > 0 && score >= frag_limit {
                 "Frag limit"
             } else {
                 "Time limit"
@@ -268,11 +272,20 @@ impl Hud {
         } else if game.overtime {
             "Sudden death    Next clear lead wins".to_owned()
         } else {
-            let left = game.remaining();
+            let (seconds, label) = if time_limit == 0 {
+                (game.time as u32, "played")
+            } else {
+                (u32::from(game.remaining()), "remaining")
+            };
+            let frag = if frag_limit > 0 {
+                frag_limit.to_string()
+            } else {
+                "Off".into()
+            };
             format!(
-                "{:02}:{:02} remaining    Frag limit {frag_limit}",
-                left / 60,
-                left % 60
+                "{:02}:{:02} {label}    Frag limit {frag}",
+                seconds / 60,
+                seconds % 60
             )
         };
         self.text(

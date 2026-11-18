@@ -200,7 +200,6 @@ impl MenuArt {
 pub enum Action {
     None,
     Resume,
-    Practice,
     Deathmatch(usize),
     LeaveMatch,
     Quit,
@@ -252,7 +251,7 @@ impl MenuSession {
         if self.paused() {
             &["Resume", "Main Menu", "Settings", "Quit Game"]
         } else {
-            &["Play", "Match Setup", "Practice", "Settings", "Quit Game"]
+            &["New Game", "Settings", "Quit Game"]
         }
     }
 }
@@ -278,7 +277,7 @@ pub struct Menu {
 
 const MAPS_PER_PAGE: usize = 8;
 const MATCH_FIELDS: [&str; 4] = ["Difficulty", "Bot count", "Frag limit", "Time limit"];
-const MATCH_BOUNDS: [(u32, u32); 4] = [(1, 3), (1, 8), (1, 100), (1, 60)];
+const MATCH_BOUNDS: [(u32, u32); 4] = [(1, 3), (0, 8), (0, 100), (0, 60)];
 
 struct MatchSetup {
     map: usize,
@@ -313,6 +312,7 @@ impl MatchSetup {
             0 => crate::game::deathmatch::Difficulty::from_level(value)
                 .label()
                 .into(),
+            2 | 3 if value == 0 => "Off".into(),
             3 => format!("{value} min"),
             _ => value.to_string(),
         }
@@ -500,19 +500,17 @@ impl Menu {
         self.status.clear();
         match (self.session.paused(), item) {
             (true, 0) => Action::Resume,
-            (false, 0) if !self.match_names.is_empty() => Action::Deathmatch(0),
-            (false, 0 | 1) => {
+            (false, 0) => {
                 self.match_setup = Some(MatchSetup::new(settings));
                 Action::None
             }
             (true, 1) => Action::LeaveMatch,
-            (false, 2) => Action::Practice,
-            (true, 2) | (false, 3) => {
+            (true, 2) | (false, 1) => {
                 self.preferences = true;
                 self.selected = 0;
                 Action::None
             }
-            (true, 3) | (false, 4) => {
+            (true, 3) | (false, 2) => {
                 self.quit = Some(true);
                 Action::None
             }
@@ -777,9 +775,9 @@ impl Menu {
             (5, 1) => adjust(&mut settings.game_speed, 5, 50, 200),
             (5, 2) => adjust(&mut settings.view_bob, 1, 0, 8),
             (5, 3) => adjust(&mut settings.bot_difficulty, 1, 1, 3),
-            (5, 4) => adjust(&mut settings.bot_count, 1, 1, 8),
-            (5, 5) => adjust(&mut settings.frag_limit, 1, 1, 100),
-            (5, 6) => adjust(&mut settings.match_minutes, 1, 1, 60),
+            (5, 4) => adjust(&mut settings.bot_count, 1, 0, 8),
+            (5, 5) => adjust(&mut settings.frag_limit, 1, 0, 100),
+            (5, 6) => adjust(&mut settings.match_minutes, 1, 0, 60),
             _ => return Action::None,
         }
         Action::Changed
@@ -929,7 +927,7 @@ impl Menu {
                 );
             };
             let title = match self.session {
-                MenuSession::Main => "Local play",
+                MenuSession::Main => "Main Menu",
                 MenuSession::Practice => "Practice paused",
                 MenuSession::Match => "Match paused",
             };
@@ -1064,8 +1062,8 @@ impl Menu {
                     .label()
                     .into(),
                 settings.bot_count.to_string(),
-                settings.frag_limit.to_string(),
-                format!("{} min", settings.match_minutes),
+                MatchSetup::new(settings).value(2),
+                MatchSetup::new(settings).value(3),
             ],
         };
         for (index, (caption, value)) in self.rows().iter().zip(values).enumerate() {
@@ -1199,7 +1197,7 @@ struct Layout {
 impl Layout {
     fn nav_rect(&self, size: [i32; 2], session: MenuSession) -> [i32; 4] {
         let [w, h] = self.local(size[0], size[1]);
-        let height = if session.paused() { 204 } else { 212 };
+        let height = if session.paused() { 204 } else { 148 };
         [(w - 272) / 2, (h - height) / 2, 272, height]
     }
 
@@ -1361,7 +1359,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn home_play_and_practice_are_distinct_and_pause_has_a_direct_return_to_menu() {
+    fn new_game_opens_setup_and_pause_has_a_direct_return_to_menu() {
         let mut settings = Settings::default();
         let mut menu = Menu::default();
         menu.match_names = vec!["DM-Deck16][".into()];
@@ -1377,14 +1375,16 @@ mod tests {
             )
         };
 
-        assert!(menu.key(VK_RETURN, &mut settings) == Action::Deathmatch(0));
-        assert!(click(&mut menu, 1, &mut settings) == Action::None);
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::None);
+        assert!(menu.match_setup.is_some());
+        assert!(menu.key(VK_ESCAPE, &mut settings) == Action::None);
+        assert!(menu.match_setup.is_none());
+        assert!(click(&mut menu, 0, &mut settings) == Action::None);
         assert!(menu.match_setup.is_some());
         assert!(menu.key(VK_RETURN, &mut settings) == Action::Deathmatch(0));
         menu.key(VK_ESCAPE, &mut settings);
-        assert!(click(&mut menu, 2, &mut settings) == Action::Practice);
 
-        assert!(click(&mut menu, 3, &mut settings) == Action::None);
+        assert!(click(&mut menu, 1, &mut settings) == Action::None);
         assert!(menu.preferences);
         menu.key(VK_TAB, &mut settings);
         assert!(menu.key(VK_LEFT, &mut settings) == Action::Changed);
@@ -1412,7 +1412,7 @@ mod tests {
         let mut menu = Menu::default();
         let size = [900, 600];
         let [x, y] = Layout::new(size, menu.dpi).panel;
-        assert!(menu.activate(3, &settings) == Action::None);
+        assert!(menu.activate(1, &settings) == Action::None);
         let resolution_y = y + 16 + row_y(1);
         let combo_x = x + CHOICE_LEFT + 10;
         menu.click(size, combo_x, resolution_y + 8, VK_LBUTTON, &mut settings);
@@ -1431,8 +1431,7 @@ mod tests {
         let mut settings = Settings::default();
         let mut menu = Menu::default();
         menu.match_names = vec!["DM-Deck16][".into(), "DM-Liandri".into()];
-        assert!(menu.key(VK_RETURN, &mut settings) == Action::Deathmatch(0));
-        assert!(menu.activate(1, &settings) == Action::None);
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::None);
         assert!(menu.match_setup.is_some());
         menu.key(VK_DOWN, &mut settings);
         menu.key(VK_TAB, &mut settings);
@@ -1443,7 +1442,7 @@ mod tests {
         assert!(menu.match_setup.is_none());
         assert_eq!(settings.bot_difficulty, 2);
 
-        menu.activate(1, &settings);
+        menu.activate(0, &settings);
         let size = [900, 600];
         let [x, y, ..] = Layout::new(size, menu.dpi).match_rect(size);
         assert!(menu.click(size, x + 25, y + 74, VK_LBUTTON, &mut settings) == Action::None);
@@ -1455,6 +1454,18 @@ mod tests {
         assert!(menu.commit_match_settings(&mut settings));
         assert_eq!(settings.match_rules().bots, 4);
         assert!(menu.match_setup.is_none());
+
+        menu.activate(0, &settings);
+        let setup = menu.match_setup.as_mut().unwrap();
+        for field in 1..=3 {
+            setup.change(field, -100);
+        }
+        assert_eq!(setup.value(1), "0");
+        assert_eq!(setup.value(2), "Off");
+        assert_eq!(setup.value(3), "Off");
+        assert!(menu.commit_match_settings(&mut settings));
+        let rules = settings.match_rules();
+        assert_eq!((rules.bots, rules.frag_limit, rules.seconds), (0, 0, 0));
     }
 
     #[test]

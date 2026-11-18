@@ -1114,7 +1114,7 @@ fn run_frontend(
                                 menu.status = "COULD NOT LOAD MAP".into();
                             }
                         },
-                        Action::Resume | Action::Practice | Action::LeaveMatch => {
+                        Action::Resume | Action::LeaveMatch => {
                             return Ok(action);
                         }
                         Action::Quit => {
