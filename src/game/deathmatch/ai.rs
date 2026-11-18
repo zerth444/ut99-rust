@@ -34,6 +34,8 @@ impl Difficulty {
                 lead: 0.25,
                 strafe: 0.3,
                 rush_health: 23,
+                evade_window: 0.22,
+                dodge: false,
             },
             Self::Standard => Combat {
                 reaction: 0.25,
@@ -42,6 +44,8 @@ impl Difficulty {
                 lead: 0.72,
                 strafe: 0.53,
                 rush_health: 36,
+                evade_window: 0.36,
+                dodge: true,
             },
             Self::Hard => Combat {
                 reaction: 0.13,
@@ -50,6 +54,8 @@ impl Difficulty {
                 lead: 1.0,
                 strafe: 0.72,
                 rush_health: 48,
+                evade_window: 0.52,
+                dodge: true,
             },
         }
     }
@@ -62,6 +68,8 @@ pub(super) struct Combat {
     pub lead: f32,
     pub strafe: f32,
     pub rush_health: u16,
+    pub evade_window: f32,
+    pub dodge: bool,
 }
 
 pub(super) fn intercept(delta: Vec3, velocity: Vec3, speed: f32) -> Vec3 {

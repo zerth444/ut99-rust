@@ -8,6 +8,7 @@ use crate::sound::{CONTACT_SOUND_RADIUS, SoundEvents, Wave};
 pub mod ballistics;
 pub mod deathmatch;
 pub mod decals;
+mod liquid;
 pub mod ordnance;
 pub mod shock;
 
@@ -543,10 +544,7 @@ pub struct Practice {
     pub shield_flash_until: f32,
     shield_hit_pending: bool,
     last_pain: f32,
-    zone_pain_at: Option<f32>,
-    drown_at: Option<f32>,
-    last_foot_zone: Option<crate::movement::Zone>,
-    splash_at: f32,
+    liquid: liquid::LiquidState,
     hammer_since: Option<f32>,
     was_guiding: bool,
     guide_trigger_held: bool,
@@ -609,10 +607,7 @@ impl Practice {
             shield_flash_until: 0.0,
             shield_hit_pending: false,
             last_pain: -1.0,
-            zone_pain_at: None,
-            drown_at: None,
-            last_foot_zone: None,
-            splash_at: f32::NEG_INFINITY,
+            liquid: liquid::LiquidState::default(),
             hammer_since: None,
             was_guiding: false,
             guide_trigger_held: false,
@@ -638,8 +633,7 @@ impl Practice {
         self.armor.fill(0);
         self.weapon = Weapon::Enforcer;
         self.clear_powerups();
-        self.last_foot_zone = None;
-        self.splash_at = f32::NEG_INFINITY;
+        self.liquid = liquid::LiquidState::default();
         self.owned.fill(false);
         self.ammo.fill(0);
         self.owned[Weapon::Hammer as usize] = true;
@@ -667,8 +661,6 @@ impl Practice {
         self.shield_flash_until = self.time;
         self.shield_hit_pending = false;
         self.last_pain = self.time - 1.0;
-        self.zone_pain_at = None;
-        self.drown_at = None;
         self.hammer_since = None;
         self.was_guiding = false;
         self.guide_trigger_held = false;
@@ -1866,71 +1858,13 @@ impl Practice {
         if self.health == 0 {
             return;
         }
-        let regions = &map.collision.regions;
-        let foot = center - Vec3(0.0, 0.0, crate::collision::PLAYER_HEIGHT);
-        let feet = regions.at(foot);
-        let head = regions.at(eye);
-        if let Some(previous) = self.last_foot_zone.replace(feet)
-            && previous.water != feet.water
-            && self.time - self.splash_at >= 0.25
-        {
-            self.splash_at = self.time;
-            let zone = if feet.water { feet } else { previous };
-            if let Some([entry, exit]) = zone.liquid_audio.and_then(|id| map.liquid_audio.get(id)) {
-                let sound = if !feet.water {
-                    exit.as_ref()
-                } else if entry.is_some()
-                    && map
-                        .collision
-                        .ray(foot + Vec3(0.0, 0.0, 8.0), Vec3(0.0, 0.0, -32.0))
-                        .is_some()
-                {
-                    map.player_audio.water_step.as_ref().or(entry.as_ref())
-                } else {
-                    entry.as_ref()
-                };
-                sounds.extend_at(sound.cloned(), foot, CONTACT_SOUND_RADIUS, 1.0);
+        match self.liquid.step(map, center, eye, self.time, true, sounds) {
+            Some(liquid::Impact::Splash(damage)) => self.splash_damage(damage),
+            Some(liquid::Impact::Drown(damage)) => self.health_damage(damage),
+            Some(liquid::Impact::Heal(amount)) if self.health < 100 => {
+                self.health = self.health.saturating_add(amount).min(100);
             }
-        }
-        if !head.water
-            && let Some(deadline) = self.drown_at.take()
-        {
-            let remaining = deadline - self.time;
-            if remaining < 8.0 {
-                sounds.extend(
-                    map.player_audio.gasp[usize::from(remaining >= 2.0)]
-                        .iter()
-                        .cloned(),
-                );
-            }
-        }
-        if feet.pain {
-            self.drown_at = None;
-            let next = self.zone_pain_at.get_or_insert(self.time + 0.01);
-            if self.time >= *next {
-                *next += 1.0;
-                let depth =
-                    0.4 + 0.4 * f32::from(regions.at(center).pain) + 0.2 * f32::from(head.pain);
-                let damage = (feet.damage_per_second as f32 * depth) as i32;
-                if damage > 0 {
-                    self.splash_damage(damage.min(i32::from(u16::MAX)) as u16);
-                } else if damage < 0 && self.health < 100 {
-                    self.health = i32::from(self.health).saturating_sub(damage).min(100) as u16;
-                }
-            }
-        } else {
-            self.zone_pain_at = None;
-            if head.water {
-                let next = self
-                    .drown_at
-                    .get_or_insert(self.time + map.collision.profile.underwater_time);
-                if self.time >= *next {
-                    *next += 2.0;
-                    self.health_damage(5);
-                }
-            } else {
-                self.drown_at = None;
-            }
+            _ => {}
         }
     }
 

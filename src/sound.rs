@@ -46,6 +46,10 @@ impl SoundSource {
 }
 
 impl SoundEvents {
+    pub(crate) fn append(&mut self, mut more: Self) {
+        self.0.append(&mut more.0);
+    }
+
     pub fn push(&mut self, wave: Arc<Wave>) {
         self.0.push(SoundEvent {
             wave,

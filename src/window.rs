@@ -212,6 +212,7 @@ unsafe fn message_loop(
     let mut stats = FrameStats::new(started);
     let mut deathmatch = match_rules.map(|rules| deathmatch::Match::new(map, start, rules));
     let mut restart_match = false;
+    let mut match_clock = deathmatch::Timestep::default();
 
     unsafe {
         loop {
@@ -247,7 +248,10 @@ unsafe fn message_loop(
                             };
                         }
                         WM_KEYDOWN if message.lParam & (1 << 30) == 0 => {
-                            match message.wParam as u16 {
+                            let pressed = message.wParam as u16;
+                            primary |= pressed == settings.bindings[6];
+                            alternate |= pressed == settings.bindings[7];
+                            match pressed {
                                 VK_RETURN => restart_match = true,
                                 VK_ESCAPE if let Some(frontend) = frontend.as_deref_mut() => {
                                     mouse.release();
@@ -273,6 +277,11 @@ unsafe fn message_loop(
                                     alternate = false;
                                     slot = None;
                                     cycle = 0;
+                                    jump = false;
+                                    dodge = None;
+                                    last_direction = None;
+                                    match_clock.clear();
+                                    stats = FrameStats::new(tick);
                                     if GetForegroundWindow() == window {
                                         mouse.capture();
                                     }
@@ -286,6 +295,28 @@ unsafe fn message_loop(
                                     toggle_borderless(window, &mut windowed);
                                     settings.fullscreen = windowed.is_some();
                                     save_settings(settings, settings_path);
+                                }
+                                VK_F3 => {
+                                    settings.show_fps = !settings.show_fps;
+                                    save_settings(settings, settings_path);
+                                }
+                                key if key == settings.bindings[4] => jump = true,
+                                key if settings.dodging
+                                    && settings.bindings[..4].contains(&key) =>
+                                {
+                                    if direction_tapped(&mut last_direction, key) {
+                                        dodge = Some(key);
+                                    }
+                                }
+                                key if key == u16::from(b'M')
+                                    && !settings.bindings.contains(&key) =>
+                                {
+                                    muted = !muted
+                                }
+                                key if key == u16::from(b'N')
+                                    && !settings.bindings.contains(&key) =>
+                                {
+                                    music_muted = !music_muted
                                 }
                                 key if (u16::from(b'0')..=u16::from(b'9')).contains(&key) => {
                                     slot = Some((key - u16::from(b'0')) as u8);
@@ -385,15 +416,8 @@ unsafe fn message_loop(
                         }
                         key if key == settings.bindings[4] => jump = true,
                         key if settings.dodging && settings.bindings[..4].contains(&key) => {
-                            let pressed = Instant::now();
-                            if last_direction.is_some_and(|(previous, time)| {
-                                key == previous
-                                    && pressed.duration_since(time) <= Duration::from_millis(250)
-                            }) {
+                            if direction_tapped(&mut last_direction, key) {
                                 dodge = Some(key);
-                                last_direction = None;
-                            } else {
-                                last_direction = Some((key, pressed));
                             }
                         }
                         VK_LEFT => camera.yaw -= 0.06,
@@ -440,17 +464,21 @@ unsafe fn message_loop(
             }
 
             let now = Instant::now();
-            let input_dt = (now - tick).as_secs_f32().min(0.06);
+            let frame_dt = (now - tick).as_secs_f64();
+            let input_dt = (frame_dt as f32).min(0.06);
             let dt = input_dt * settings.game_speed as f32 / 100.0;
             tick = now;
             if let Some(game) = &mut deathmatch {
                 let active = GetForegroundWindow() == window && IsIconic(window) == 0;
-                let [forward, back, left, right, jump, _, fire, alt_fire] = settings.bindings;
+                let [forward, back, left, right, jump_key, walk, fire, alt_fire] =
+                    settings.bindings;
                 let restart = std::mem::take(&mut restart_match);
                 let shoot = std::mem::take(&mut primary);
                 let secondary = std::mem::take(&mut alternate);
                 let weapon_slot = slot.take();
                 let weapon_cycle = std::mem::take(&mut cycle);
+                let jump_pressed = std::mem::take(&mut jump);
+                let dodge_key = dodge.take();
                 if active {
                     let (dx, dy) = if mouse.captured {
                         mouse.motion(raw)
@@ -462,9 +490,21 @@ unsafe fn message_loop(
                     let pitch_sign = if settings.invert_mouse { 1.0 } else { -1.0 };
                     let command = deathmatch::Command {
                         movement: [axis(forward, back), axis(right, left)],
-                        jump: key(jump),
-                        primary: shoot || ((mouse.captured || fire > 6) && key(fire)),
-                        alternate: secondary || ((mouse.captured || alt_fire > 6) && key(alt_fire)),
+                        walk: key(walk),
+                        dodge: dodge_key.map(|key| {
+                            if key == forward {
+                                [1.0, 0.0]
+                            } else if key == back {
+                                [-1.0, 0.0]
+                            } else if key == left {
+                                [0.0, -1.0]
+                            } else {
+                                [0.0, 1.0]
+                            }
+                        }),
+                        jump: key(jump_key),
+                        primary: (mouse.captured || fire > 6) && key(fire),
+                        alternate: (mouse.captured || alt_fire > 6) && key(alt_fire),
                         restart,
                         slot: weapon_slot,
                         cycle: weapon_cycle,
@@ -475,10 +515,20 @@ unsafe fn message_loop(
                         ],
                         ..deathmatch::Command::default()
                     };
-                    let events = game.step(map, command, dt);
+                    let events = match_clock.advance(
+                        game,
+                        map,
+                        command,
+                        [shoot, secondary],
+                        jump_pressed,
+                        frame_dt * f64::from(settings.game_speed) / 100.0,
+                    );
                     if let Some(audio) = &mut audio {
                         audio.play_events(events);
                     }
+                } else {
+                    match_clock.clear();
+                    last_direction = None;
                 }
                 let view = game.player_view(map);
                 if let Some(audio) = &mut audio {
@@ -490,7 +540,13 @@ unsafe fn message_loop(
                     });
                     audio.set_weapon_loop(flight_sound);
                     audio.set_volume(settings.effects_volume, settings.music_volume);
-                    audio.update(&map.ambient, view.position, view.right(), !active, false);
+                    audio.update(
+                        &map.ambient,
+                        view.position,
+                        view.right(),
+                        !active || muted,
+                        music_muted,
+                    );
                 }
                 let mut client = RECT::default();
                 if IsIconic(window) == 0
@@ -510,7 +566,11 @@ unsafe fn message_loop(
                     (frame.width, frame.height) = (size.0 as usize, size.1 as usize);
                     frame.draw_deathmatch(map, &view, game, settings.field_of_view as f32);
                     hud.draw_deathmatch(&mut frame, game, active && key(VK_TAB), mouse.captured);
-                    if !presenter
+                    if settings.show_fps {
+                        let label = stats.label(window, size, presenter.software);
+                        hud.text(&mut frame, 16, 35, 0.8, &label, [0.72, 0.95, 0.78]);
+                    }
+                    if presenter
                         .draw(
                             size,
                             frame.commands.as_mut().expect("GPU frame"),
@@ -518,6 +578,12 @@ unsafe fn message_loop(
                         )
                         .map_err(|error| io::Error::other(format!("Presenting match: {error}")))?
                     {
+                        if obs && !obs_announced {
+                            println!("OBS capture mode: {}x{}", size.0, size.1);
+                            obs_announced = true;
+                        }
+                        stats.presented(Instant::now());
+                    } else {
                         std::thread::sleep(Duration::from_millis(10));
                     }
                 } else {
@@ -1300,4 +1366,13 @@ fn update_view(camera: &mut Camera, dt: f32) {
     camera.yaw =
         (camera.yaw + axis(VK_RIGHT, VK_LEFT) * dt * 2.2).rem_euclid(std::f32::consts::TAU);
     camera.pitch = (camera.pitch + axis(VK_UP, VK_DOWN) * dt * 1.8).clamp(-1.5, 1.5);
+}
+
+fn direction_tapped(last: &mut Option<(u16, Instant)>, key: u16) -> bool {
+    let pressed = Instant::now();
+    let twice = last.is_some_and(|(previous, at)| {
+        previous == key && pressed.duration_since(at) <= Duration::from_millis(250)
+    });
+    *last = (!twice).then_some((key, pressed));
+    twice
 }
