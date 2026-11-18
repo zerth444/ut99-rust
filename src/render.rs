@@ -365,6 +365,23 @@ impl Frame {
     ) {
         let player = &game.fighters[0];
         let piloting = game.guidance_left().is_some();
+        let (roll, height) = game.warhead_shake(camera.position);
+        let shaken = Camera {
+            position: camera.position + Vec3(0.0, 0.0, height),
+            ..*camera
+        };
+        let camera = if piloting || game.finished {
+            camera
+        } else {
+            &shaken
+        };
+        self.roll = if piloting {
+            game.guided_roll()
+        } else if game.finished {
+            0.0
+        } else {
+            roll
+        };
         let fov = if player.zoomed && !piloting {
             fov.min(35.0)
         } else {
@@ -396,6 +413,10 @@ impl Frame {
         }
         self.layer(Layer::Effects);
         game.rocket_trails
+            .visuals(&map.ordnance, game.time, |visual| {
+                self.draw_world_effect(&view, game.time, visual);
+            });
+        game.warhead_smoke
             .visuals(&map.ordnance, game.time, |visual| {
                 self.draw_world_effect(&view, game.time, visual);
             });
@@ -450,7 +471,14 @@ impl Frame {
         for trace in &game.traces {
             let art = &map.ordnance[trace.explosion as usize];
             let age = game.time - trace.born;
-            if trace.explosion.bio()
+            if trace.draws_wave() {
+                art.warhead_wave_visuals(trace.start, age, |visual| {
+                    self.draw_world_effect(&view, game.time, visual);
+                });
+                continue;
+            }
+            if trace.explosion.warhead()
+                || trace.explosion.bio()
                 || matches!(
                     trace.explosion,
                     crate::game::ordnance::Kind::FlakShell
@@ -510,6 +538,7 @@ impl Frame {
             );
         }
         self.zoom = 1.0;
+        self.roll = 0.0;
         if player.health > 0 && !game.finished {
             if !player.zoomed
                 && !piloting

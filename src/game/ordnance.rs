@@ -96,7 +96,7 @@ impl Kind {
         matches!(self, Self::Gel | Self::Glob | Self::Splash)
     }
 
-    fn warhead(self) -> bool {
+    pub(crate) fn warhead(self) -> bool {
         matches!(self, Self::Warhead | Self::GuidedWarhead)
     }
 }
@@ -125,6 +125,45 @@ pub(super) fn flak_fragments(normal: Vec3) -> [Vec3; 5] {
 
 pub(super) fn ricochet(velocity: Vec3, normal: Vec3, retain: f32) -> Vec3 {
     (velocity - normal * (2.0 * velocity.dot(normal))) * retain
+}
+
+pub(super) struct FlightSegment {
+    pub kind: Kind,
+    pub start: Vec3,
+    pub velocity: Vec3,
+}
+
+pub(super) fn intercept_fraction(
+    map: &Map,
+    source: FlightSegment,
+    target: FlightSegment,
+    dt: f32,
+) -> Option<f32> {
+    let art = &map.ordnance[target.kind as usize];
+    let source_art = &map.ordnance[source.kind as usize];
+    let fraction = super::shock::cylinder_hit(
+        source.start - target.start,
+        (source.velocity - target.velocity) * dt,
+        art.collision_radius + source_art.collision_radius,
+        art.collision_height + source_art.collision_height,
+    )?;
+    if map
+        .collision
+        .ray(source.start, source.velocity * (dt * fraction))
+        .is_some()
+        || map
+            .collision
+            .projectile_surface(
+                target.start,
+                target.velocity * (dt * fraction),
+                art.collision_radius,
+                art.collision_height,
+            )
+            .is_some()
+    {
+        return None;
+    }
+    Some(fraction)
 }
 
 #[derive(Default)]
@@ -199,7 +238,140 @@ impl RocketTrails {
     }
 }
 
+#[derive(Default)]
+pub struct WarheadSmoke(Vec<WarheadPuff>);
+
+struct WarheadPuff {
+    kind: Kind,
+    position: Vec3,
+    born: f32,
+    duration: f32,
+}
+
+impl WarheadSmoke {
+    pub(super) fn emit(
+        &mut self,
+        map: &Map,
+        kind: Kind,
+        position: Vec3,
+        direction: Vec3,
+        time: f32,
+        next: &mut f32,
+    ) {
+        if time < *next {
+            return;
+        }
+        let art = &map.ordnance[kind as usize];
+        *next = time
+            + if kind == Kind::Warhead {
+                152.0 / art.speed.unwrap_or(600.0).max(1.0)
+            } else {
+                0.02
+            };
+        if !map.collision.regions.at(position).water {
+            let count = if kind == Kind::Warhead {
+                art.smoke_offsets.len()
+            } else {
+                1
+            };
+            let (right, up) = super::shock::axes(direction);
+            for i in 0..count {
+                let offset = art.smoke_offsets.get(i).copied().unwrap_or_default();
+                let particle = if kind == Kind::Warhead {
+                    position + direction * offset.0 + right * offset.1 + up * offset.2
+                } else {
+                    position
+                };
+                if map.collision.ray(position, particle - position).is_some() {
+                    break;
+                }
+                self.0.push(WarheadPuff {
+                    kind,
+                    position: particle,
+                    born: time,
+                    duration: if kind == Kind::Warhead {
+                        1.4 + i as f32 * 0.025
+                    } else {
+                        1.5
+                    },
+                });
+            }
+        }
+    }
+
+    pub(super) fn expire(&mut self, time: f32) {
+        self.0.retain(|effect| time - effect.born < effect.duration);
+    }
+
+    pub fn visuals<'a>(&self, assets: &'a Arsenal, time: f32, mut draw: impl FnMut(Visual<'a>)) {
+        for effect in &self.0 {
+            let art = &assets[effect.kind as usize];
+            let age = (time - effect.born) / effect.duration;
+            let seed = (effect.position.0.to_bits() ^ effect.position.1.to_bits()).rotate_left(9);
+            let index = ((effect.born * 1000.0) as usize ^ seed as usize) % art.smoke.len();
+            if let Some(texture) = &art.smoke[index] {
+                draw(Visual::Sprite(
+                    effect.position + Vec3(0.0, 0.0, 50.0 * (time - effect.born)),
+                    texture.image_once(if effect.kind == Kind::Warhead {
+                        (seed % 1000) as f32 / 1000.0
+                    } else {
+                        age
+                    }),
+                    2.0,
+                    if effect.kind == Kind::Warhead {
+                        0.8
+                    } else {
+                        0.4
+                    },
+                ));
+            }
+        }
+    }
+}
+
 impl Art {
+    pub fn warhead_wave_visuals<'a>(
+        &'a self,
+        position: Vec3,
+        elapsed: f32,
+        mut draw: impl FnMut(Visual<'a>),
+    ) {
+        if !self.wavefront.is_empty() {
+            let pose = Pose {
+                current: &self.wavefront,
+                next: &self.wavefront,
+                fraction: 0.0,
+            };
+            draw(Visual::Mesh(
+                position,
+                Vec3(1.0, 0.0, 0.0),
+                pose,
+                shock_size(elapsed),
+                Some((WARHEAD_WAVE_LIFETIME - elapsed).clamp(0.0, 1.0)),
+            ));
+        }
+        if elapsed < 1.0
+            && let Some(texture) = &self.explosion
+        {
+            draw(Visual::Sprite(
+                position,
+                texture.image_once(elapsed),
+                2.8,
+                1.0,
+            ));
+        }
+        if (0.5..WARHEAD_WAVE_LIFETIME).contains(&elapsed)
+            && let Some(texture) = &self.second_explosion
+        {
+            draw(Visual::Sprite(
+                position,
+                texture.image_once(elapsed - 0.5),
+                3.2,
+                1.0,
+            ));
+        }
+    }
+
     pub fn impact_sprite(&self, position: Vec3, progress: f32, scale: f32) -> Option<Visual<'_>> {
         Some(Visual::Sprite(
             position,
@@ -280,6 +452,7 @@ pub struct Shots {
     self_hits: Vec<(u16, Vec3)>,
     marks: Vec<(Kind, Vec3, Vec3, Option<usize>)>,
     rocket_trails: RocketTrails,
+    warhead_smoke: WarheadSmoke,
     pub guided_roll: f32,
 }
 
@@ -447,29 +620,24 @@ impl Shots {
                 .enumerate()
                 .filter(|(_, shot)| shot.kind.warhead() && shot.expires > time)
             {
-                let art = &map.ordnance[target.kind as usize];
-                let source_art = &map.ordnance[source.kind as usize];
-                let Some(fraction) = super::shock::cylinder_hit(
-                    source.position - target.position,
-                    (source.velocity - target.velocity) * dt,
-                    art.collision_radius + source_art.collision_radius,
-                    art.collision_height + source_art.collision_height,
+                let Some(fraction) = intercept_fraction(
+                    map,
+                    FlightSegment {
+                        kind: source.kind,
+                        start: source.position,
+                        velocity: source.velocity,
+                    },
+                    FlightSegment {
+                        kind: target.kind,
+                        start: target.position,
+                        velocity: target.velocity,
+                    },
+                    dt,
                 ) else {
                     continue;
                 };
                 let travel = source.velocity * (dt * fraction);
-                if map.collision.ray(source.position, travel).is_some()
-                    || pawn.is_some_and(|pawn| pawn.ray(source.position, travel).is_some())
-                    || map
-                        .collision
-                        .projectile_surface(
-                            target.position,
-                            target.velocity * (dt * fraction),
-                            art.collision_radius,
-                            art.collision_height,
-                        )
-                        .is_some()
-                {
+                if pawn.is_some_and(|pawn| pawn.ray(source.position, travel).is_some()) {
                     continue;
                 }
                 impacts.push((source_index, target_index, fraction));
@@ -534,25 +702,14 @@ impl Shots {
     }
 
     pub fn nuclear_shake(&self, eye: Vec3, time: f32) -> (f32, f32) {
-        self.effects
-            .iter()
-            .filter(|effect| effect.nuclear)
-            .filter_map(|effect| {
-                let age = time - effect.born;
-                let offset = eye - effect.position;
-                let distance = offset.dot(offset).sqrt();
-                (age < 0.5 && distance < 3000.0).then_some((distance, age))
-            })
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map_or((0.0, 0.0), |(distance, age)| {
-                let fade = 1.0 - 2.0 * age;
-                let roll =
-                    (600_000.0 / distance.max(1.0)).min(4096.0) * std::f32::consts::TAU / 65_536.0;
-                (
-                    roll * fade * (46.0 * age).sin(),
-                    10.0 * fade * (32.0 * age).sin(),
-                )
-            })
+        nuclear_shake(
+            eye,
+            time,
+            self.effects
+                .iter()
+                .filter(|effect| effect.nuclear)
+                .map(|effect| (effect.position, effect.born)),
+        )
     }
 
     pub(super) fn nuclear_wave(
@@ -623,7 +780,7 @@ impl Shots {
             .iter()
             .position(|shot| shot.kind == Kind::GuidedWarhead)?;
         let shot = &mut self.projectiles[index];
-        if !owner_alive || (detonate && time - shot.born >= 1.0) {
+        if !owner_alive || (detonate && time - shot.born >= WARHEAD_ARM_TIME) {
             let shot = self.projectiles.remove(index);
             return explode(
                 &shot,
@@ -633,15 +790,8 @@ impl Shots {
                 time,
             );
         }
-        let velocity = unit(shot.velocity + aim * (1500.0 * dt)) * 550.0;
+        let velocity = guided_velocity(shot.velocity, aim, dt, &mut self.guided_roll);
         shot.direction = unit(velocity);
-        if dt > 0.0 {
-            let (right, _) = super::shock::axes(shot.direction);
-            let roll = (10.0 * right.dot(velocity - shot.velocity) / dt).clamp(-12000.0, 12000.0)
-                * std::f32::consts::TAU
-                / 65_536.0;
-            self.guided_roll += (roll - self.guided_roll) * (5.0 * dt).min(1.0);
-        }
         shot.velocity = velocity;
         None
     }
@@ -771,6 +921,7 @@ impl Shots {
         blasts: &mut Vec<Blast>,
     ) {
         self.rocket_trails.expire(time);
+        self.warhead_smoke.expire(time);
         self.effects
             .retain(|effect| time - effect.born < effect.duration);
         self.ripples.retain(|ripple| {
@@ -851,52 +1002,14 @@ impl Shots {
                 }
                 if time >= shot.next_trail {
                     if kind.warhead() {
-                        shot.next_trail = time
-                            + if kind == Kind::Warhead {
-                                152.0 / art.speed.unwrap_or(600.0).max(1.0)
-                            } else {
-                                0.02
-                            };
-                        if !map.collision.regions.at(shot.position).water {
-                            let count = if kind == Kind::Warhead {
-                                art.smoke_offsets.len()
-                            } else {
-                                1
-                            };
-                            let (right, up) = super::shock::axes(shot.direction);
-                            for i in 0..count {
-                                let offset = art.smoke_offsets.get(i).copied().unwrap_or_default();
-                                let position = if kind == Kind::Warhead {
-                                    shot.position
-                                        + shot.direction * offset.0
-                                        + right * offset.1
-                                        + up * offset.2
-                                } else {
-                                    shot.position
-                                };
-                                if map
-                                    .collision
-                                    .ray(shot.position, position - shot.position)
-                                    .is_some()
-                                {
-                                    break;
-                                }
-                                self.effects.push(Effect {
-                                    kind,
-                                    position,
-                                    born: time,
-                                    duration: if kind == Kind::Warhead {
-                                        1.4 + i as f32 * 0.025
-                                    } else {
-                                        1.5
-                                    },
-                                    scale: 2.0,
-                                    trail: true,
-                                    nuclear: false,
-                                    struck: [false; 2],
-                                });
-                            }
-                        }
+                        self.warhead_smoke.emit(
+                            map,
+                            kind,
+                            shot.position,
+                            shot.direction,
+                            time,
+                            &mut shot.next_trail,
+                        );
                     } else {
                         self.rocket_trails.emit(
                             map,
@@ -1088,6 +1201,7 @@ impl Shots {
 
     pub fn visuals<'a>(&self, assets: &'a Arsenal, time: f32, mut draw: impl FnMut(Visual<'a>)) {
         self.rocket_trails.visuals(assets, time, &mut draw);
+        self.warhead_smoke.visuals(assets, time, &mut draw);
         for ripple in &self.ripples {
             let art = &assets[ripple.kind as usize];
             let age = time - ripple.born;
@@ -1127,64 +1241,8 @@ impl Shots {
         for effect in &self.effects {
             let art = &assets[effect.kind as usize];
             let age = (time - effect.born) / effect.duration;
-            if effect.kind.warhead() && effect.trail {
-                let seed =
-                    (effect.position.0.to_bits() ^ effect.position.1.to_bits()).rotate_left(9);
-                let index = ((effect.born * 1000.0) as usize ^ seed as usize) % art.smoke.len();
-                if let Some(texture) = &art.smoke[index] {
-                    draw(Visual::Sprite(
-                        effect.position + Vec3(0.0, 0.0, 50.0 * (time - effect.born)),
-                        texture.image_once(if effect.kind == Kind::Warhead {
-                            (seed % 1000) as f32 / 1000.0
-                        } else {
-                            age
-                        }),
-                        effect.scale,
-                        if effect.kind == Kind::Warhead {
-                            0.8
-                        } else {
-                            0.4
-                        },
-                    ));
-                }
-                continue;
-            }
             if effect.nuclear {
-                let elapsed = time - effect.born;
-                if !art.wavefront.is_empty() {
-                    let pose = Pose {
-                        current: &art.wavefront,
-                        next: &art.wavefront,
-                        fraction: 0.0,
-                    };
-                    draw(Visual::Mesh(
-                        effect.position,
-                        Vec3(1.0, 0.0, 0.0),
-                        pose,
-                        shock_size(elapsed),
-                        Some((1.5 - elapsed).clamp(0.0, 1.0)),
-                    ));
-                }
-                if elapsed < 1.0
-                    && let Some(texture) = &art.explosion
-                {
-                    draw(Visual::Sprite(
-                        effect.position,
-                        texture.image_once(elapsed),
-                        2.8,
-                        1.0,
-                    ));
-                }
-                if (0.5..1.5).contains(&elapsed)
-                    && let Some(texture) = &art.second_explosion
-                {
-                    draw(Visual::Sprite(
-                        effect.position,
-                        texture.image_once(elapsed - 0.5),
-                        3.2,
-                        1.0,
-                    ));
-                }
+                art.warhead_wave_visuals(effect.position, time - effect.born, &mut draw);
                 continue;
             }
             if !effect.trail {
@@ -1206,6 +1264,18 @@ impl Shots {
     pub(super) fn active_count(&self) -> usize {
         self.projectiles.len()
     }
+}
+
+pub(super) fn guided_velocity(previous: Vec3, aim: Vec3, dt: f32, roll: &mut f32) -> Vec3 {
+    let velocity = unit(previous + aim * (1500.0 * dt)) * 550.0;
+    if dt > 0.0 {
+        let (right, _) = super::shock::axes(unit(velocity));
+        let bank = (10.0 * right.dot(velocity - previous) / dt).clamp(-12000.0, 12000.0)
+            * std::f32::consts::TAU
+            / 65_536.0;
+        *roll += (bank - *roll) * (5.0 * dt).min(1.0);
+    }
+    velocity
 }
 
 pub(super) const FLAK_SHELL_IMPACT: (f32, f32) = (0.5, 2.0);
@@ -1363,12 +1433,7 @@ fn shoot_down(
         BLAST_SOUND_RADIUS,
         1.0,
     );
-    Blast::radial(
-        shot.position,
-        350.0,
-        art.damage.unwrap_or(1000.0),
-        art.momentum.unwrap_or(100_000.0),
-    )
+    warhead_blast(art, shot.position, WARHEAD_INTERCEPT_RADIUS)
 }
 
 fn explode(
@@ -1431,7 +1496,9 @@ fn explode_at(
         Kind::Grenade => (200.0, 80.0, 50_000.0),
         Kind::FlakShell => FLAK_SHELL_BLAST,
         Kind::RazorAlt => (180.0, 34.0, 87_000.0),
-        Kind::Warhead | Kind::GuidedWarhead => (300.0, 1000.0, 100_000.0),
+        Kind::Warhead | Kind::GuidedWarhead => {
+            return Some(warhead_blast(art, shot.position, WARHEAD_INITIAL_RADIUS));
+        }
         Kind::Glob => ((150.0 * shot.scale).min(250.0), 75.0, 30_000.0),
         _ => ((150.0 * shot.scale).min(250.0), 20.0, 20_000.0),
     };
@@ -1444,12 +1511,51 @@ fn explode_at(
     ))
 }
 
+pub(super) const WARHEAD_WAVE_LIFETIME: f32 = 1.5;
+pub(super) const WARHEAD_PHASE_TWO: f32 = 0.5;
+pub(super) const WARHEAD_ARM_TIME: f32 = 1.0;
+pub(super) const WARHEAD_INITIAL_RADIUS: f32 = 300.0;
+pub(super) const WARHEAD_INTERCEPT_RADIUS: f32 = 350.0;
+
+pub(super) fn warhead_blast(art: &Art, position: Vec3, radius: f32) -> Blast {
+    Blast::radial(
+        position,
+        radius,
+        art.damage.unwrap_or(1000.0),
+        art.momentum.unwrap_or(100_000.0),
+    )
+}
+
+pub(super) fn nuclear_shake(
+    eye: Vec3,
+    time: f32,
+    waves: impl Iterator<Item = (Vec3, f32)>,
+) -> (f32, f32) {
+    waves
+        .filter_map(|(origin, born)| {
+            let age = time - born;
+            let offset = eye - origin;
+            let distance = offset.dot(offset).sqrt();
+            (age < 0.5 && distance < 3000.0).then_some((distance, age))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map_or((0.0, 0.0), |(distance, age)| {
+            let fade = 1.0 - 2.0 * age;
+            let roll =
+                (600_000.0 / distance.max(1.0)).min(4096.0) * std::f32::consts::TAU / 65_536.0;
+            (
+                roll * fade * (46.0 * age).sin(),
+                10.0 * fade * (32.0 * age).sin(),
+            )
+        })
+}
+
 fn shock_size(age: f32) -> f32 {
     let age = age.clamp(0.0, 1.5);
     13.0 * age + 3.5 / ((1.5 - age) / 1.5 + 0.05)
 }
 
-fn wave_hit(map: &Map, origin: Vec3, center: Vec3, age: f32) -> Option<(u16, Vec3)> {
+pub(super) fn wave_hit(map: &Map, origin: Vec3, center: Vec3, age: f32) -> Option<(u16, Vec3)> {
     if !(0.1..=1.5).contains(&age) {
         return None;
     }
@@ -2386,7 +2492,7 @@ mod tests {
         assert!(shots.projectiles.is_empty());
         let effect = shots.effects.iter().find(|effect| !effect.trail).unwrap();
         assert!((effect.position.0 - 769.0).abs() < 0.01);
-        assert!(shots.effects.iter().any(|effect| effect.trail));
+        assert!(!shots.warhead_smoke.0.is_empty());
         assert_eq!(shots.marks.len(), 1);
         assert!((shots.marks[0].1.0 - 800.0).abs() < 0.01);
         assert!(
