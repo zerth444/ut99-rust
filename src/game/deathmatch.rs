@@ -7,6 +7,7 @@ mod guidance;
 mod navigation;
 mod objectives;
 mod timestep;
+mod turrets;
 
 use super::{
     Item, Pose, Powerup, PulseBeam, RocketAnimations, Weapon, WeaponAssets, ballistics, decals,
@@ -910,6 +911,86 @@ impl Match {
     pub fn mode(&self) -> Mode {
         self.rules.mode
     }
+
+    pub(crate) fn turret_models<'a>(
+        &'a self,
+        map: &'a Map,
+    ) -> impl Iterator<
+        Item = (
+            Vec3,
+            Vec3,
+            &'a [crate::map::Face],
+            Option<super::Pose<'a>>,
+            f32,
+        ),
+    > + 'a {
+        self.assault
+            .as_ref()
+            .zip(map.assault.as_ref())
+            .into_iter()
+            .flat_map(move |(round, data)| {
+                data.turrets
+                    .iter()
+                    .zip(&round.defenses.guns)
+                    .map(move |(turret, gun)| {
+                        let direction = Vec3(gun.yaw.cos(), gun.yaw.sin(), 0.0);
+                        let rise = if turret.minigun && gun.deployed(turret, self.time) {
+                            40.0
+                        } else {
+                            0.0
+                        };
+                        (
+                            turret.volume.position,
+                            direction,
+                            turret.base.as_slice(),
+                            gun.pose(turret, self.time),
+                            rise,
+                        )
+                    })
+            })
+    }
+
+    pub(crate) fn turret_projectiles<'a>(
+        &'a self,
+        map: &'a Map,
+    ) -> impl Iterator<Item = (Vec3, &'a crate::texture::TextureImage, f32)> + 'a {
+        self.assault
+            .as_ref()
+            .zip(map.assault.as_ref())
+            .into_iter()
+            .flat_map(move |(round, data)| {
+                round.defenses.shots.iter().filter_map(move |shot| {
+                    let art = data.turrets[shot.turret].projectile.as_ref()?;
+                    let age = self.time - shot.born;
+                    let count = art.sprites.len().max(1);
+                    let image = art.sprites.get((age * 20.0) as usize % count)?.image(age);
+                    Some((shot.position, image, art.scale))
+                })
+            })
+    }
+
+    pub(crate) fn turret_muzzles<'a>(
+        &'a self,
+        map: &'a Map,
+    ) -> impl Iterator<Item = (Vec3, Vec3, &'a [crate::map::Face])> + 'a {
+        self.assault
+            .as_ref()
+            .zip(map.assault.as_ref())
+            .into_iter()
+            .flat_map(move |(round, data)| {
+                data.turrets
+                    .iter()
+                    .zip(&round.defenses.guns)
+                    .filter_map(move |(turret, gun)| {
+                        let (position, direction, until) = gun.flash?;
+                        (self.time < until && !turret.muzzle.is_empty()).then_some((
+                            position,
+                            direction,
+                            turret.muzzle.as_slice(),
+                        ))
+                    })
+            })
+    }
     fn team_for(&self, fighter: usize) -> Option<usize> {
         self.rules.mode.team_based().then_some(fighter % 2)
     }
@@ -1258,7 +1339,37 @@ impl Match {
                 gain: *gain,
             })
         });
-        weapons.chain(rockets).filter(|_| !self.finished)
+        let minigun = map
+            .arsenal
+            .get(&Weapon::Minigun)
+            .and_then(|art| art.fire.as_ref());
+        let turrets = self
+            .assault
+            .as_ref()
+            .zip(map.assault.as_ref())
+            .into_iter()
+            .flat_map(move |(round, data)| {
+                data.turrets
+                    .iter()
+                    .zip(&round.defenses.guns)
+                    .enumerate()
+                    .filter_map(move |(index, (turret, gun))| {
+                        if !turret.minigun || !gun.deployed(turret, self.time) {
+                            return None;
+                        }
+                        Some(WorldLoop {
+                            id: LoopId::Turret(index),
+                            wave: minigun?,
+                            position: turret.volume.position,
+                            radius: 2425.0,
+                            gain: 0.9,
+                        })
+                    })
+            });
+        weapons
+            .chain(rockets)
+            .chain(turrets)
+            .filter(|_| !self.finished)
     }
 
     pub(crate) fn pulse_beams<'a>(&'a self, map: &'a Map) -> impl Iterator<Item = PulseBeam> + 'a {
@@ -1727,6 +1838,27 @@ impl Match {
         self.decals.follow_movers(&map.movers);
         self.ballistics
             .update(map, None, self.time, dt, &mut sounds);
+        if let Some(round) = &mut self.assault {
+            let cannon_hits = round.defenses.tick(
+                map,
+                &self.fighters,
+                round.attack_team,
+                self.time,
+                dt,
+                if self.rules.difficulty == Difficulty::Easy {
+                    0.55
+                } else {
+                    1.0
+                },
+                &mut self.shock,
+                &mut self.ballistics,
+                &mut self.decals,
+                &mut sounds,
+            );
+            for hit in cannon_hits {
+                self.apply_hit_from(map, hit, &mut sounds, true);
+            }
+        }
         if let Some(round) = &mut self.assault {
             round.tick(map, &self.fighters, self.time, &mut sounds);
             let conquered = round.completed_at.filter(|&at| at <= round.limit);
@@ -3514,6 +3646,10 @@ impl Match {
     }
 
     fn apply_hit(&mut self, map: &Map, hit: Hit, sounds: &mut SoundEvents) {
+        self.apply_hit_from(map, hit, sounds, false);
+    }
+
+    fn apply_hit_from(&mut self, map: &Map, hit: Hit, sounds: &mut SoundEvents, cannon: bool) {
         if hit.owner.is_some_and(|owner| {
             owner != hit.victim && allied(self.fighters[owner].team, self.fighters[hit.victim].team)
         }) {
@@ -3522,7 +3658,7 @@ impl Match {
         let victim = &mut self.fighters[hit.victim];
         if victim.health == 0
             || hit.damage == 0
-            || (hit.owner.is_some() && self.time < victim.protected_until)
+            || ((hit.owner.is_some() || cannon) && self.time < victim.protected_until)
         {
             return;
         }
@@ -3603,6 +3739,9 @@ impl Match {
             CONTACT_SOUND_RADIUS,
             1.0,
         );
+        if cannon {
+            return;
+        }
         let owner = hit.owner.or_else(|| {
             victim
                 .last_hostile_impulse
@@ -3708,6 +3847,13 @@ impl Match {
                     self.time,
                     attacker,
                 );
+            }
+        }
+        for (index, turret) in data.turrets.iter().enumerate() {
+            if let Some((damage, _)) = blast.hit_player(&map.collision, turret.volume.position) {
+                round
+                    .defenses
+                    .damage(index, damage.saturating_mul(scale), self.time);
             }
         }
     }
@@ -4720,6 +4866,7 @@ mod tests {
                 },
             ],
             triggers: Vec::new(),
+            turrets: Vec::new(),
         });
         let mut game = Match::new(
             &map,
@@ -4785,6 +4932,112 @@ mod tests {
         );
         assert_eq!(game.assault_status(&map).unwrap().half, 1);
         assert!(!game.finished);
+    }
+
+    #[test]
+    #[ignore = "requires the local reference-client map installation"]
+    fn assault_turrets_obey_cover_team_changes_and_map_shutdown_events() {
+        for name in ["AS-Frigate.unr", "AS-Guardia.unr", "AS-Mazon.unr"] {
+            let path = std::path::Path::new("local/reference-client/Maps").join(name);
+            let bytes = std::fs::read(&path).unwrap();
+            let mut map_data = Map::load(&Package::read(&bytes).unwrap(), Some(&path))
+                .unwrap()
+                .assault
+                .unwrap();
+            map_data.turrets.truncate(1);
+            map_data.forts.clear();
+            map_data.relays.clear();
+            map_data.triggers.clear();
+            let turret = &mut map_data.turrets[0];
+            turret.volume.position = Vec3(0.0, 0.0, if turret.minigun { 24.0 } else { 145.0 });
+            turret.tag = Some(900);
+            turret.yaw = 0.0;
+            let minigun = turret.minigun;
+            let (mut map, _) = flight_fixture();
+            map.assault = Some(map_data);
+            let mut game = Match::new(
+                &map,
+                0,
+                Rules {
+                    mode: Mode::Assault,
+                    bots: 1,
+                    ..Rules::default()
+                },
+            );
+            game.fighters[0].walker.position = Vec3(220.0, 0.0, 45.0);
+            game.fighters[1].walker.position = Vec3(220.0, 130.0, 45.0);
+            let in_cover = map
+                .collision
+                .add_box(Vec3(130.0, -55.0, 0.0), Vec3(150.0, 55.0, 200.0));
+            let mut observed = [false; 2];
+            let mut sound = SoundEvents::default();
+            let mut tick = |round: &mut assault::Round,
+                            map: &Map,
+                            fighters: &[Fighter],
+                            from: u32,
+                            to: u32| {
+                let mut effects = ballistics::Effects::default();
+                let mut marks = decals::Marks::default();
+                let mut shock = shock::Shots::default();
+                let mut totals = [0u16; 2];
+                for tick in from..to {
+                    let hits = round.defenses.tick(
+                        map,
+                        fighters,
+                        round.attack_team,
+                        tick as f32 / 120.0,
+                        1.0 / 120.0,
+                        1.0,
+                        &mut shock,
+                        &mut effects,
+                        &mut marks,
+                        &mut sound,
+                    );
+                    for hit in hits {
+                        totals[hit.victim] = totals[hit.victim].saturating_add(hit.damage);
+                    }
+                    observed[0] |= !round.defenses.shots.is_empty();
+                    observed[1] |= minigun
+                        && round.defenses.guns[0].deployed(
+                            &map.assault.as_ref().unwrap().turrets[0],
+                            tick as f32 / 120.0,
+                        );
+                }
+                totals
+            };
+            let round = game.assault.as_mut().unwrap();
+            assert_eq!(
+                tick(round, &map, &game.fighters, 120, 600),
+                [0, 0],
+                "{name} fired through a wall"
+            );
+            map.collision.set_box(
+                in_cover,
+                Vec3(-200.0, -120.0, 0.0),
+                Vec3(-180.0, -100.0, 200.0),
+            );
+            let totals = tick(round, &map, &game.fighters, 600, 1200);
+            assert!(totals[0] > 0 && totals[1] == 0, "{name} damage {totals:?}");
+            round.defenses.damage(0, 1000, 10.0);
+            assert!(!round.defenses.guns[0].targetable());
+            tick(round, &map, &game.fighters, 3200, 3210);
+            assert!(round.defenses.guns[0].targetable());
+            round.emit(27.0, 900, true);
+            round.tick(&mut map, &game.fighters, 27.0, &mut SoundEvents::default());
+            tick(round, &map, &game.fighters, 6000, 6010);
+            assert!(
+                !round.defenses.guns[0].targetable(),
+                "{name} reactivated after scripted shutdown"
+            );
+            let mut second = assault::Round::new(map.assault.as_ref().unwrap(), 1, Some(None));
+            let totals = tick(&mut second, &map, &game.fighters, 120, 720);
+            assert!(
+                totals[0] == 0 && totals[1] > 0,
+                "{name} did not change its target after role swap: {totals:?}"
+            );
+            assert!(if minigun { observed[1] } else { observed[0] });
+            assert!(sound.len() > 0);
+        }
     }
 
     #[test]

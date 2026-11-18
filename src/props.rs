@@ -424,7 +424,7 @@ pub fn load(
     path: &Path,
     zone_actors: &[i32],
     level: crate::movement::Zone,
-    assault: Option<&mut crate::assault::AssaultMap>,
+    mut assault: Option<&mut crate::assault::AssaultMap>,
 ) -> io::Result<Scene> {
     let Some(folder) = path.parent() else {
         return Ok(Scene::default());
@@ -485,7 +485,7 @@ pub fn load(
     let mut meshes = HashMap::new();
     let mut textures = HashMap::<Object, Option<Arc<Texture>>>::new();
     let mut waves = HashMap::new();
-    if let Some(assault) = assault {
+    if let Some(assault) = assault.as_deref_mut() {
         for relay in &mut assault.relays {
             if let crate::assault::RelayAction::Sound {
                 reference, wave, ..
@@ -503,6 +503,23 @@ pub fn load(
         let defaults = appearance(&mut assets, &mut class_cache, class);
         let placement = VisualProperties::read(map.properties(actor)?)?;
         let visual = placement.apply(&mut assets, 0, defaults);
+        if let Some(assault) = assault.as_deref_mut()
+            && let Some(kind @ ("TeamCannon" | "MinigunCannon")) = map.object_name(actor.class)
+            && let Some(class) = class
+        {
+            assault.turrets.push(read_turret(
+                &mut assets,
+                &mut class_cache,
+                &mut textures,
+                &mut waves,
+                map.properties(actor)?,
+                &placement,
+                visual,
+                class,
+                kind == "MinigunCannon",
+            )?);
+            continue;
+        }
         let Some(object) = visual
             .mesh
             .filter(|_| !visual.hidden && visual.draw_type == 2 && visual.scale > 0.0)
@@ -1517,6 +1534,230 @@ fn read_shock(
         })();
     }
     art
+}
+
+fn read_turret(
+    assets: &mut Assets<'_>,
+    classes: &mut HashMap<Object, Appearance>,
+    textures: &mut HashMap<Object, Option<Arc<Texture>>>,
+    waves: &mut HashMap<Object, Option<Arc<Wave>>>,
+    instance: Properties<'_, '_>,
+    placement: &VisualProperties,
+    visual: Appearance,
+    class: Object,
+    minigun: bool,
+) -> io::Result<crate::assault::Turret> {
+    use crate::assault::{CannonProjectile, Turret, Volume};
+
+    let team_class = find_export(assets, "botpack", "TeamCannon", "Class");
+    let mut tag = None;
+    let mut health = 220;
+    let mut sight = 3000.0;
+    let mut fov = 90.0;
+    let mut sample = if minigun { 0.1 } else { 0.33 };
+    let mut tracking = 25000.0;
+    let mut lead = false;
+    let mut projectile = None;
+    let mut audio = [None; 3];
+    let mut read = |mut properties: Properties<'_, '_>, package| -> io::Result<()> {
+        while let Some(property) = properties.next_tag()? {
+            let mut value = property.value;
+            match property.name {
+                "Tag" if package == 0 => tag = Some(value.index()?),
+                "Health" => health = value.u32()? as i32,
+                "SightRadius" => sight = value.f32()?,
+                "FovAngle" => fov = value.f32()?,
+                "SampleTime" => sample = value.f32()?,
+                "TrackingRate" => tracking = (value.u32()? as i32) as f32,
+                "bLeadTarget" => lead = property.boolean.unwrap_or(false),
+                "ProjectileType" => projectile = Some((package, value.compact()?)),
+                "FireSound" => audio[0] = Some((package, value.compact()?)),
+                "ActivateSound" => audio[1] = Some((package, value.compact()?)),
+                "DeActivateSound" => audio[2] = Some((package, value.compact()?)),
+                _ => {}
+            }
+        }
+        Ok(())
+    };
+    for object in team_class
+        .into_iter()
+        .chain((Some(class) != team_class).then_some(class))
+    {
+        let (package, export) = assets.object(object);
+        if let Ok(defaults) = class_properties(package, export) {
+            read(defaults, object.package)?;
+        }
+    }
+    read(instance, 0)?;
+    let audio = audio.map(|reference| {
+        let object = reference.and_then(|(package, reference)| assets.resolve(package, reference));
+        cached_wave(assets, waves, object)
+    });
+    let projectile = (!minigun)
+        .then(|| {
+            projectile
+                .and_then(|(package, reference)| assets.resolve(package, reference))
+                .or_else(|| find_export(assets, "botpack", "CannonShot", "Class"))
+                .and_then(|class| {
+                    let appearance = appearance(assets, classes, Some(class));
+                    let mut speed = None;
+                    let mut damage = None;
+                    let mut impact = None;
+                    let mut frames = [None; 8];
+                    let mut current = Some(class);
+                    let mut visited = HashSet::new();
+                    while let Some(object) = current.filter(|object| visited.insert(*object)) {
+                        let (package, export) = assets.object(object);
+                        let superclass = export.superclass;
+                        if let Ok(mut defaults) = class_properties(package, export) {
+                            while let Ok(Some(prop)) = defaults.next_tag() {
+                                let mut value = prop.value;
+                                match prop.name {
+                                    name if name.eq_ignore_ascii_case("Speed")
+                                        && speed.is_none() =>
+                                    {
+                                        speed = value.f32().ok()
+                                    }
+                                    "Damage" if damage.is_none() => damage = value.f32().ok(),
+                                    "ImpactSound" if impact.is_none() => {
+                                        impact = value
+                                            .compact()
+                                            .ok()
+                                            .map(|reference| (object.package, reference))
+                                    }
+                                    "SpriteAnim"
+                                        if prop.array_index < frames.len()
+                                            && frames[prop.array_index].is_none() =>
+                                    {
+                                        frames[prop.array_index] = value
+                                            .compact()
+                                            .ok()
+                                            .map(|reference| (object.package, reference));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        current = assets.resolve(object.package, superclass);
+                    }
+                    let (speed, damage) = (speed?, damage?);
+                    let shock = {
+                        let (package, export) = assets.object(class);
+                        package
+                            .name(export.name)
+                            .is_ok_and(|name| name.eq_ignore_ascii_case("ShockProj"))
+                    };
+                    let impact =
+                        impact.and_then(|(package, reference)| assets.resolve(package, reference));
+                    let impact_audio = cached_wave(assets, waves, impact);
+                    let mut sprites: Vec<_> = frames
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|(package, reference)| {
+                            let object = assets.resolve(package, reference)?;
+                            cached_texture(assets, textures, object)
+                        })
+                        .collect();
+                    if sprites.is_empty()
+                        && let Some(texture) = appearance
+                            .texture
+                            .and_then(|object| cached_texture(assets, textures, object))
+                    {
+                        sprites.push(texture);
+                    }
+                    (speed > 0.0 && damage > 0.0).then_some(CannonProjectile {
+                        speed,
+                        damage: damage.round() as u16,
+                        radius: appearance.collision_radius.unwrap_or(0.0),
+                        height: appearance.collision_height.unwrap_or(0.0),
+                        lifetime: appearance.lifetime.unwrap_or(5.0),
+                        scale: appearance.scale,
+                        sprites,
+                        shock,
+                        impact_audio,
+                    })
+                })
+        })
+        .flatten();
+    let active = if minigun {
+        find_export(assets, "botpack", "grfinalgunM", "LodMesh")
+    } else {
+        visual.mesh
+    };
+    let base_class = find_export(
+        assets,
+        "botpack",
+        if minigun { "GrBase" } else { "CeilingGunBase" },
+        "Class",
+    );
+    let base_style = appearance(assets, classes, base_class);
+    let flash_class = minigun
+        .then(|| find_export(assets, "botpack", "CannonMuzzle", "Class"))
+        .flatten();
+    let flash_style = appearance(assets, classes, flash_class);
+    let mut motion = |object: Option<Object>, clip: &str, style: Appearance| -> Motion {
+        let Some(object) = object else {
+            return Motion::default();
+        };
+        let (package, export) = assets.object(object);
+        let Ok(mesh) = Mesh::read(package, export) else {
+            return Motion::default();
+        };
+        let seq = mesh.sequence(&[clip]);
+        let (start, end, rate) =
+            seq.map_or((0, 1, 1.0), |seq| (seq.start, seq.end, seq.rate.max(1.0)));
+        Motion {
+            frames: (start..end)
+                .filter_map(|i| {
+                    let vertices = effect_vertices(&mesh, mesh.frame(i)?, style.scale);
+                    Some(mesh_faces(
+                        assets, textures, object, style, &mesh, &vertices,
+                    ))
+                })
+                .collect(),
+            rate,
+        }
+    };
+    let active = active.or(visual.mesh);
+    let base = motion(base_style.mesh, "", base_style)
+        .frames
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let muzzle = motion(flash_style.mesh, "", flash_style)
+        .frames
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let activate = motion(visual.mesh, "Activate", visual);
+    let names = if minigun {
+        ["Fire1", "Fire3", "Fire5", "Fire7", "Fire9", "Fire10"]
+    } else {
+        ["Fire1", "Fire2", "Fire3", "Fire4", "Fire5", "Fire6"]
+    };
+    let fire = names.map(|name| motion(active, name, visual));
+    Ok(Turret {
+        volume: Volume {
+            position: placement.location,
+            radius: visual.collision_radius.unwrap_or(28.0),
+            height: visual.collision_height.unwrap_or(39.0),
+        },
+        yaw: placement.rotation.1,
+        tag,
+        health,
+        sight,
+        fov: (fov.clamp(0.0, 360.0).to_radians() * 0.5).cos(),
+        sample: sample.max(0.02),
+        tracking: tracking.abs() * std::f32::consts::TAU / 65_536.0,
+        lead,
+        minigun,
+        projectile,
+        activate,
+        fire,
+        base,
+        muzzle,
+        audio,
+    })
 }
 
 fn effect_vertices(mesh: &Mesh, frame: &[Vec3], scale: f32) -> Vec<Vec3> {

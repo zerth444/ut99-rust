@@ -1643,6 +1643,36 @@ mod tests {
             let mut map = Map::load(&package, Some(path))
                 .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
             let data = map.assault.as_ref().unwrap();
+            for turret in &data.turrets {
+                assert!(
+                    !turret.activate.frames.is_empty() && turret.activate.duration() < 3.0,
+                    "{} activation {:?}",
+                    path.display(),
+                    turret.activate.duration()
+                );
+                assert!(
+                    turret.fire.iter().all(|motion| !motion.frames.is_empty()),
+                    "{} firing frames",
+                    path.display()
+                );
+                assert!(
+                    turret.base.iter().any(|face| face.texture.is_some())
+                        && turret.audio[0].is_some()
+                        && turret.audio[1].is_some(),
+                    "{} mesh and sounds",
+                    path.display()
+                );
+                if !turret.minigun {
+                    assert!(
+                        turret
+                            .projectile
+                            .as_ref()
+                            .is_some_and(|shot| shot.speed > 0.0 && !shot.sprites.is_empty()),
+                        "{} projectile",
+                        path.display()
+                    );
+                }
+            }
             assert!(
                 data.forts.len() >= 3 && data.seconds >= 240,
                 "{}",

@@ -367,6 +367,7 @@ struct MovingEmitter {
 pub(crate) enum LoopId {
     Fighter(usize),
     Rocket(u64),
+    Turret(usize),
 }
 
 pub(crate) struct WorldLoop<'a> {

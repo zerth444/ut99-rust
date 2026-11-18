@@ -10,6 +10,38 @@ pub(crate) struct AssaultMap {
     pub triggers: Vec<Trigger>,
     pub relays: Vec<Relay>,
     pub seconds: u16,
+    pub turrets: Vec<Turret>,
+}
+
+pub(crate) struct Turret {
+    pub volume: Volume,
+    pub yaw: f32,
+    pub tag: Option<usize>,
+    pub health: i32,
+    pub sight: f32,
+    pub fov: f32,
+    pub sample: f32,
+    pub tracking: f32,
+    pub lead: bool,
+    pub minigun: bool,
+    pub projectile: Option<CannonProjectile>,
+    pub activate: crate::game::Motion,
+    pub fire: [crate::game::Motion; 6],
+    pub base: Vec<crate::map::Face>,
+    pub muzzle: Vec<crate::map::Face>,
+    pub audio: [Option<Arc<crate::sound::Wave>>; 3],
+}
+
+pub(crate) struct CannonProjectile {
+    pub speed: f32,
+    pub damage: u16,
+    pub radius: f32,
+    pub height: f32,
+    pub lifetime: f32,
+    pub scale: f32,
+    pub sprites: Vec<Arc<crate::texture::Texture>>,
+    pub shock: bool,
+    pub impact_audio: Option<Arc<crate::sound::Wave>>,
 }
 
 #[derive(Default)]
@@ -112,6 +144,7 @@ pub(crate) enum RelayAction {
 pub(crate) enum Target {
     Fort(usize),
     Trigger(usize),
+    Turret(usize),
 }
 
 impl AssaultMap {
@@ -128,6 +161,7 @@ impl AssaultMap {
             triggers: Vec::new(),
             relays: Vec::new(),
             seconds: 60,
+            turrets: Vec::new(),
         };
         let mut paths = std::collections::HashMap::new();
         let mut destinations = Vec::new();

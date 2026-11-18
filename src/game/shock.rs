@@ -470,7 +470,7 @@ impl Shots {
         (blast, combo.is_some())
     }
 
-    fn bolt_impact(
+    pub(super) fn bolt_impact(
         &mut self,
         assets: &Assets,
         position: Vec3,

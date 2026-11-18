@@ -20,6 +20,7 @@ struct TriggerStatus {
 }
 
 pub(super) struct Round {
+    pub defenses: super::turrets::Defenses,
     pub attack_team: usize,
     pub limit: f32,
     pub first_attack: Option<Option<f32>>,
@@ -35,6 +36,7 @@ pub(super) struct Round {
 impl Round {
     pub fn new(map: &AssaultMap, attack_team: usize, first_attack: Option<Option<f32>>) -> Self {
         Self {
+            defenses: super::turrets::Defenses::new(map),
             attack_team,
             limit: first_attack.flatten().unwrap_or(f32::from(map.seconds)),
             first_attack,
@@ -243,6 +245,7 @@ impl Round {
             for mover in &mut map.movers {
                 mover.signal(event, attacker);
             }
+            self.defenses.signal(data, event, due, sounds);
         }
     }
 
@@ -285,7 +288,21 @@ impl Round {
                 }
                 Some((trigger.volume.trace(start, delta)?, Target::Trigger(index)))
             });
-        forts.chain(triggers).min_by(|a, b| a.0.total_cmp(&b.0))
+        let turrets = data
+            .turrets
+            .iter()
+            .zip(&self.defenses.guns)
+            .enumerate()
+            .filter_map(|(index, (turret, gun))| {
+                if !gun.targetable() {
+                    return None;
+                }
+                Some((turret.volume.trace(start, delta)?, Target::Turret(index)))
+            });
+        forts
+            .chain(triggers)
+            .chain(turrets)
+            .min_by(|a, b| a.0.total_cmp(&b.0))
     }
 
     pub fn damage(
@@ -300,6 +317,7 @@ impl Round {
             return;
         }
         match target {
+            Target::Turret(index) => self.defenses.damage(index, damage, time),
             Target::Trigger(index) => {
                 let state = &self.triggers[index];
                 if state.enabled

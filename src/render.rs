@@ -247,6 +247,10 @@ impl Frame {
     }
 
     pub fn draw(&mut self, map: &Map, camera: &Camera, time: f32) {
+        self.draw_scene(map, camera, time, true);
+    }
+
+    fn draw_scene(&mut self, map: &Map, camera: &Camera, time: f32, static_turrets: bool) {
         if let Some(commands) = &mut self.commands {
             commands.clear();
         }
@@ -311,8 +315,22 @@ impl Frame {
                 );
             }
         }
-        self.layer(Layer::Effects);
         let view = self.camera_view(camera);
+        if static_turrets && let Some(assault) = &map.assault {
+            for turret in &assault.turrets {
+                self.draw_turret(
+                    map,
+                    &view,
+                    time,
+                    turret.volume.position,
+                    Vec3(turret.yaw.cos(), turret.yaw.sin(), 0.0),
+                    &turret.base,
+                    turret.activate.sample(0.0),
+                    0.0,
+                );
+            }
+        }
+        self.layer(Layer::Effects);
         #[cfg(windows)]
         for (position, image, scale, glow) in
             map.smoke.sprites(time, &map.movers, &map.ballistics.smoke)
@@ -425,9 +443,17 @@ impl Frame {
             fov
         };
         self.zoom = (0.5 * fov.to_radians()).tan().recip();
-        self.draw(map, camera, game.time);
+        self.draw_scene(
+            map,
+            camera,
+            game.time,
+            game.mode() != crate::game::deathmatch::Mode::Assault,
+        );
         self.layer(Layer::World);
         let view = self.camera_view(camera);
+        for (origin, direction, base, pose, rise) in game.turret_models(map) {
+            self.draw_turret(map, &view, game.time, origin, direction, base, pose, rise);
+        }
         for drop in &game.drops {
             let template = &map.props[drop.prop];
             let model = View {
@@ -449,6 +475,13 @@ impl Frame {
             }
         }
         self.layer(Layer::Effects);
+        for (position, image, scale) in game.turret_projectiles(map) {
+            self.world_sprite(&view, position, image, scale, 1.0);
+        }
+        for (position, direction, faces) in game.turret_muzzles(map) {
+            let model = view.in_model(position, direction, 1.0);
+            self.draw_faces_in_view(faces, &model, game.time, false, None, Some(1.0));
+        }
         game.rocket_trails
             .visuals(&map.ordnance, game.time, |visual| {
                 self.draw_world_effect(&view, game.time, visual);
@@ -1032,6 +1065,45 @@ impl Frame {
             [0.0, 0.0, w, h],
             [1.0; 3],
         );
+    }
+
+    fn draw_turret(
+        &mut self,
+        map: &Map,
+        view: &View,
+        time: f32,
+        origin: Vec3,
+        direction: Vec3,
+        base: &[Face],
+        pose: Option<crate::game::Pose<'_>>,
+        rise: f32,
+    ) {
+        let model = view.in_model(origin, direction, 1.0);
+        self.draw_lit_faces(
+            base,
+            &model,
+            time,
+            false,
+            None,
+            None,
+            &map.scene_lights,
+            None,
+            None,
+        );
+        if let Some(pose) = pose {
+            let model = view.in_model(origin + Vec3(0.0, 0.0, rise), direction, 1.0);
+            self.draw_lit_faces(
+                pose.current,
+                &model,
+                time,
+                false,
+                Some(pose),
+                None,
+                &map.scene_lights,
+                None,
+                None,
+            );
+        }
     }
 
     fn draw_world_effect(
