@@ -177,6 +177,8 @@ pub struct Art {
     pub trail: Option<Arc<Texture>>,
     pub sound: Option<Arc<Wave>>,
     pub contact: Option<Arc<Wave>>,
+    pub ambience: Option<(Arc<Wave>, f32, f32)>,
+    pub lifetime: Option<f32>,
     pub speed: Option<f32>,
     pub damage: Option<f32>,
     pub momentum: Option<f32>,
@@ -200,10 +202,16 @@ pub enum Visual<'a> {
 }
 
 #[derive(Default)]
-pub struct RocketTrails(Vec<(Vec3, f32)>);
+pub struct RocketTrails {
+    flares: Vec<(Vec3, f32)>,
+    smoke: Vec<(Vec3, f32)>,
+}
 
 impl RocketTrails {
     const LIFETIME: f32 = 0.22;
+    const FLARE_INTERVAL: f32 = 0.035;
+    const SMOKE_INTERVAL: f32 = 0.16;
+    const SMOKE_LIFETIME: f32 = 1.5;
 
     pub(super) fn emit(
         &mut self,
@@ -211,21 +219,45 @@ impl RocketTrails {
         position: Vec3,
         direction: Vec3,
         time: f32,
+        born: f32,
         next: &mut f32,
     ) {
         if time >= *next && !map.collision.regions.at(position).water {
-            *next = time + 0.035;
-            self.0.push((position - direction * 10.0, time));
+            let position = position - direction * 10.0;
+            let smoke_step = |at: f32| ((at - born).max(0.0) / Self::SMOKE_INTERVAL) as u32;
+            if smoke_step(time) > smoke_step(*next - Self::FLARE_INTERVAL) {
+                self.smoke.push((position, time));
+            }
+            self.flares.push((position, time));
+            *next = time + Self::FLARE_INTERVAL;
         }
     }
 
     pub(super) fn expire(&mut self, time: f32) {
-        self.0.retain(|&(_, born)| time - born < Self::LIFETIME);
+        self.flares
+            .retain(|&(_, born)| time - born < Self::LIFETIME);
+        self.smoke
+            .retain(|&(_, born)| time - born < Self::SMOKE_LIFETIME);
     }
 
     pub fn visuals<'a>(&self, assets: &'a Arsenal, time: f32, mut draw: impl FnMut(Visual<'a>)) {
-        if let Some(texture) = &assets[Kind::Rocket as usize].trail {
-            for &(position, born) in &self.0 {
+        let art = &assets[Kind::Rocket as usize];
+        for &(position, born) in &self.smoke {
+            let age = time - born;
+            let index = ((position.0.to_bits() ^ position.1.to_bits()).rotate_left(9)
+                ^ born.to_bits()) as usize
+                % art.smoke.len();
+            if let Some(texture) = &art.smoke[index] {
+                draw(Visual::Sprite(
+                    position + Vec3(0.0, 0.0, 50.0 * age),
+                    texture.image_once((age / 0.4).min(1.0)),
+                    2.0,
+                    0.4 * (1.0 - age / Self::SMOKE_LIFETIME),
+                ));
+            }
+        }
+        if let Some(texture) = &art.trail {
+            for &(position, born) in &self.flares {
                 let age = ((time - born) / Self::LIFETIME).clamp(0.0, 1.0);
                 draw(Visual::Sprite(
                     position,
@@ -1016,6 +1048,7 @@ impl Shots {
                             shot.position,
                             shot.direction,
                             time,
+                            shot.born,
                             &mut shot.next_trail,
                         );
                     }

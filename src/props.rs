@@ -1108,7 +1108,11 @@ fn projectile_art(
     };
     let visual = appearance(assets, classes, Some(class));
     art.scale = Some(visual.scale);
+    art.lifetime = visual.lifetime.filter(|lifetime| *lifetime > 0.0);
     let (package, export) = assets.object(class);
+    let mut ambient = None;
+    let mut radius = 32;
+    let mut volume = 128;
     if let Ok(mut properties) = class_properties(package, export) {
         while let Ok(Some((name, mut value))) = properties.next() {
             match name {
@@ -1117,10 +1121,23 @@ fn projectile_art(
                 "MomentumTransfer" => {
                     art.momentum = value.u32().ok().map(|value| value as i32 as f32)
                 }
+                "AmbientSound" => ambient = value.compact().ok(),
+                "SoundRadius" => radius = value.byte().unwrap_or(radius),
+                "SoundVolume" => volume = value.byte().unwrap_or(volume),
                 _ => {}
             }
         }
     }
+    art.ambience = ambient
+        .and_then(|reference| assets.resolve(class.package, reference))
+        .and_then(|object| cached_wave(assets, waves, Some(object)))
+        .map(|wave| {
+            (
+                wave,
+                (f32::from(radius) + 1.0) * 25.0,
+                f32::from(volume) / 255.0,
+            )
+        });
     let (texture, package, sound, contact) = match kind {
         Kind::Pulse => ("pblst_a00", "botpack", "PulseExp", None),
         Kind::Rocket | Kind::Grenade => (
@@ -1193,6 +1210,12 @@ fn projectile_art(
         art.trail = find_export(assets, "botpack", "JRFlare", "Texture")
             .and_then(|id| cached_texture(assets, textures, id));
     }
+    if kind == Kind::Rocket || kind.warhead() {
+        art.smoke = ["us1_a00", "us2_a00", "us3_a00", "us8_a00"].map(|name| {
+            find_export(assets, "botpack", name, "Texture")
+                .and_then(|id| cached_texture(assets, textures, id))
+        });
+    }
     if matches!(
         kind,
         Kind::Rocket
@@ -1250,10 +1273,6 @@ fn projectile_art(
                 art.smoke_offsets = effect_vertices(&mesh, frame, smoke.scale);
             }
         }
-        art.smoke = ["us1_a00", "us2_a00", "us3_a00", "us8_a00"].map(|name| {
-            find_export(assets, "botpack", name, "Texture")
-                .and_then(|id| cached_texture(assets, textures, id))
-        });
         art.contact = cached_wave(
             assets,
             waves,

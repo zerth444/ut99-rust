@@ -275,7 +275,8 @@ impl WeaponAssets {
         }
         let windup = self.attack_start.duration();
         if age < windup {
-            self.attack_start.sample(age)
+            let next = self.alternate_motion.frames.first().map(Vec::as_slice);
+            self.attack_start.sample_toward(age, next)
         } else {
             self.alternate_motion.sample_loop(age - windup)
         }
@@ -293,9 +294,13 @@ impl WeaponAssets {
         let rocket = self.rocket.as_ref()?;
         let fire = &rocket.fires[usize::from(loaded.checked_sub(1)?)];
         if age < fire.duration() {
-            fire.sample(age)
+            let next = has_ammo
+                .then(|| rocket.loads[0].frames.first().map(Vec::as_slice))
+                .flatten()
+                .unwrap_or(&self.view);
+            fire.sample_toward(age, Some(next))
         } else if has_ammo {
-            rocket.loads[0].sample(age - fire.duration())
+            rocket.loads[0].sample_toward(age - fire.duration(), Some(&self.view))
         } else {
             None
         }
@@ -390,6 +395,16 @@ impl Motion {
         let mut pose = self.sample(time)?;
         if time * self.rate >= (self.frames.len() - 1) as f32 {
             pose.next = &self.frames[0];
+        }
+        Some(pose)
+    }
+
+    fn sample_toward<'a>(&'a self, elapsed: f32, next: Option<&'a [Face]>) -> Option<Pose<'a>> {
+        let mut pose = self.sample(elapsed)?;
+        if (elapsed * self.rate) as usize + 1 == self.frames.len()
+            && let Some(next) = next.filter(|next| !next.is_empty())
+        {
+            pose.next = next;
         }
         Some(pose)
     }
@@ -851,7 +866,9 @@ impl Practice {
         };
         let transition = match self.weapon_state {
             WeaponState::Lowering { since, .. } => weapon.down_motion.sample(self.time - since),
-            WeaponState::Raising { since } => weapon.select_motion.sample(self.time - since),
+            WeaponState::Raising { since } => weapon
+                .select_motion
+                .sample_toward(self.time - since, Some(&weapon.view)),
             WeaponState::Ready => None,
         };
         transition
@@ -899,7 +916,7 @@ impl Practice {
                 } else {
                     &weapon.attack_end
                 };
-                motion.sample(self.time - started)
+                motion.sample_toward(self.time - started, Some(&weapon.view))
             })
             .or_else(|| {
                 let (_, alternate, at) = self.last_fire.filter(|(id, _, _)| *id == self.weapon)?;

@@ -17,7 +17,7 @@ use crate::{
     map::{Map, Vec3},
     mover::{LiftStop, unit},
     render::Camera,
-    sound::{BLAST_SOUND_RADIUS, CONTACT_SOUND_RADIUS, SoundEvents},
+    sound::{BLAST_SOUND_RADIUS, CONTACT_SOUND_RADIUS, LoopId, SoundEvents, WorldLoop},
 };
 pub use ai::Difficulty;
 use arsenal::{ChargeProfile, ChargeShape, Inventory, Path};
@@ -221,7 +221,7 @@ impl Fighter {
             })
             .or_else(|| {
                 self.enforcer_recover
-                    .and_then(|since| art.attack_end.sample(time - since))
+                    .and_then(|since| art.attack_end.sample_toward(time - since, Some(&art.view)))
             })
             .or_else(|| {
                 self.charge.and_then(|charge| {
@@ -246,7 +246,8 @@ impl Fighter {
             })
             .or_else(|| {
                 let (alternate, start) = self.pulse_ended?;
-                art.pulse_end(alternate).sample(time - start)
+                art.pulse_end(alternate)
+                    .sample_toward(time - start, Some(&art.view))
             })
             .or_else(|| {
                 if self.weapon == Weapon::Rocket {
@@ -257,12 +258,19 @@ impl Fighter {
                     )
                 } else if self.weapon == Weapon::Pulse && self.pulse_ended.is_some() {
                     None
+                } else if self.weapon == Weapon::Enforcer && self.last_alt {
+                    (self.fired_at.is_finite() && self.enforcer_recover.is_none())
+                        .then(|| art.alternate_motion.hold_pose(time - self.fired_at))
+                        .flatten()
                 } else {
                     art.fire_motion(self.weapon, self.last_alt)
                         .sample(time - self.fired_at)
                 }
             })
-            .or_else(|| art.select_motion.sample(time - self.selected_at))
+            .or_else(|| {
+                art.select_motion
+                    .sample_toward(time - self.selected_at, Some(&art.view))
+            })
             .or_else(|| {
                 (self.weapon == Weapon::Bio && self.gait != Gait::Idle)
                     .then(|| art.walking.sample_loop(self.stride_time))
@@ -459,6 +467,9 @@ struct Bot {
     react_at: f32,
     combat_move: Vec3,
     aim_bias: Option<[f32; 2]>,
+    observation: Option<(Vec3, Vec3, f32)>,
+    maneuver: Option<(f32, f32)>,
+    hidden_since: Option<f32>,
     weapon_mode: Option<(Weapon, bool, f32)>,
     goal: Option<Step>,
     rethink_at: f32,
@@ -508,6 +519,7 @@ struct Bolt {
     gel: Option<GelSurface>,
     gel_trigger: Option<f32>,
     seeking: Option<(usize, u16, Vec3, f32)>,
+    flight_audio: Option<u64>,
 }
 
 struct GelSurface {
@@ -694,6 +706,7 @@ pub struct Match {
     pub time: f32,
     pub fighters: Vec<Fighter>,
     pub finished: bool,
+    pub overtime: bool,
     pub(crate) guidance_lost_until: f32,
     pub hud_scale: f32,
     pub show_decals: bool,
@@ -707,6 +720,7 @@ pub struct Match {
     pub(crate) drops: Vec<DroppedWeapon>,
     outgoing_damage: Option<DamageReadout>,
     bolts: Vec<Bolt>,
+    projectile_sequence: u64,
     initial_props: Vec<bool>,
     pickups: Vec<Option<f32>>,
     kill_z: f32,
@@ -728,6 +742,7 @@ impl Match {
             time: 0.0,
             fighters: Vec::with_capacity(rules.bots + 1),
             finished: false,
+            overtime: false,
             guidance_lost_until: 0.0,
             hud_scale: 1.0,
             show_decals: true,
@@ -741,6 +756,7 @@ impl Match {
             drops: Vec::new(),
             outgoing_damage: None,
             bolts: Vec::new(),
+            projectile_sequence: 0,
             initial_props: map.props.iter().map(|prop| prop.visible).collect(),
             pickups: vec![None; map.props.len()],
             kill_z: map
@@ -784,6 +800,7 @@ impl Match {
     fn restart(&mut self, map: &mut Map) {
         self.time = 0.0;
         self.finished = false;
+        self.overtime = false;
         self.guidance_lost_until = 0.0;
         self.traces.clear();
         self.rocket_trails = ordnance::RocketTrails::default();
@@ -900,6 +917,15 @@ impl Match {
         ids
     }
 
+    pub fn winner(&self) -> Option<usize> {
+        let standings = self.standings();
+        let first = standings[0];
+        standings
+            .get(1)
+            .is_none_or(|&second| self.fighters[first].score > self.fighters[second].score)
+            .then_some(first)
+    }
+
     pub fn label(id: usize) -> String {
         if id == 0 {
             "PLAYER".into()
@@ -954,14 +980,37 @@ impl Match {
         if self.pilot_index().is_some() {
             return map.arsenal.get(&Weapon::Redeemer)?.charge_loop.as_ref();
         }
-        let art = map.arsenal.get(&player.weapon)?;
-        match player.pulse {
-            Some((true, _)) => art.alternate.as_ref(),
-            Some((false, _)) => art.fire.as_ref(),
-            None if player.minigun_firing => art.fire.as_ref(),
-            None if player.hammer_charge.is_some() => art.charge_loop.as_ref(),
-            None => None,
-        }
+        fighter_loop(player, map)
+    }
+
+    pub(crate) fn world_loops<'a>(&'a self, map: &'a Map) -> impl Iterator<Item = WorldLoop<'a>> {
+        let weapons = self
+            .fighters
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter_map(|(id, fighter)| {
+                Some(WorldLoop {
+                    id: LoopId::Fighter(id),
+                    wave: fighter_loop(fighter, map)?,
+                    position: fighter.walker.position,
+                    radius: CONTACT_SOUND_RADIUS,
+                    gain: 0.9,
+                })
+            });
+        let rockets = self.bolts.iter().filter_map(|bolt| {
+            let id = bolt.flight_audio?;
+            let (wave, radius, gain) =
+                map.ordnance[bolt.payload.kind as usize].ambience.as_ref()?;
+            Some(WorldLoop {
+                id: LoopId::Rocket(id),
+                wave,
+                position: bolt.position,
+                radius: *radius,
+                gain: *gain,
+            })
+        });
+        weapons.chain(rockets).filter(|_| !self.finished)
     }
 
     pub(crate) fn pulse_beams<'a>(&'a self, map: &'a Map) -> impl Iterator<Item = PulseBeam> + 'a {
@@ -990,6 +1039,9 @@ impl Match {
     }
 
     pub fn player_view(&self, map: &Map) -> Camera {
+        if let Some(camera) = self.result_camera(map) {
+            return camera;
+        }
         if let Some(index) = self.pilot_index() {
             let bolt = &self.bolts[index];
             return bolt
@@ -999,6 +1051,37 @@ impl Match {
                 .view(bolt.position, bolt.velocity);
         }
         self.fighters[0].camera(map)
+    }
+
+    pub(crate) fn result_camera(&self, map: &Map) -> Option<Camera> {
+        if !self.finished {
+            return None;
+        }
+        let winner = &self.fighters[self.winner()?];
+        let subject = winner.walker.position + Vec3(0.0, 0.0, 14.0);
+        let view = winner.camera(map);
+        for offset in [
+            view.forward() * -1.0,
+            view.right(),
+            view.right() * -1.0,
+            view.forward(),
+        ] {
+            let delta = offset * 158.0 + Vec3(0.0, 0.0, 58.0);
+            let position = map
+                .collision
+                .ray_surface(subject, delta)
+                .map_or(subject + delta, |(point, _)| point - unit(delta) * 14.0);
+            let look = subject - position;
+            if look.dot(look) >= 72.0_f32.powi(2) {
+                let (yaw, pitch) = aim_error(look, 0.0, 0.0);
+                return Some(Camera {
+                    position,
+                    yaw,
+                    pitch,
+                });
+            }
+        }
+        None
     }
 
     pub(crate) fn guided_roll(&self) -> f32 {
@@ -1347,26 +1430,24 @@ impl Match {
         self.decals.follow_movers(&map.movers);
         self.ballistics
             .update(map, None, self.time, dt, &mut sounds);
-        self.finished = self.remaining() == 0
+        let limit_reached = self.overtime
+            || self.remaining() == 0
             || self
                 .fighters
                 .iter()
                 .any(|fighter| fighter.score >= self.rules.frag_limit);
-        if self.finished {
-            let standings = self.standings();
-            let leader = standings[0];
-            let tied = standings
-                .get(1)
-                .is_some_and(|&id| self.fighters[id].score == self.fighters[leader].score);
-            if !tied {
+        if limit_reached {
+            if let Some(leader) = self.winner() {
+                self.finished = true;
                 let (index, text) = if leader == 0 {
                     (3, "MATCH WON")
                 } else {
                     (4, "MATCH LOST")
                 };
                 self.announce(map, index, text, &mut sounds);
-            } else {
-                self.announcement = None;
+            } else if !self.overtime {
+                self.overtime = true;
+                self.announcement = Some(("SUDDEN DEATH", self.time + 3.0));
             }
         }
         if flight.is_some() && self.pilot_index().is_none() {
@@ -1965,7 +2046,9 @@ impl Match {
         };
         let base_damage = damage;
         let damage = base_damage.saturating_mul(if boosted { 3 } else { 1 });
-        super::emit_shot_sound(map, weapon, alt, (id != 0).then_some(start), sounds);
+        if !matches!(weapon, Weapon::Pulse | Weapon::Minigun) {
+            super::emit_shot_sound(map, weapon, alt, (id != 0).then_some(start), sounds);
+        }
         if boosted {
             let warning = usize::from(fighter.amp_left(self.time) < 5.0);
             sounds.extend_at(
@@ -2022,6 +2105,10 @@ impl Match {
                         .collision
                         .ray_surface(start, offset)
                         .map_or(start + offset, |(point, normal)| point + normal * 0.5);
+                    let flight_audio = (kind == ordnance::Kind::Rocket).then(|| {
+                        self.projectile_sequence += 1;
+                        self.projectile_sequence
+                    });
                     self.bolts.push(Bolt {
                         owner: id,
                         position,
@@ -2039,6 +2126,8 @@ impl Match {
                         expires: self.time
                             + if guided {
                                 guidance::FLIGHT_TIME
+                            } else if kind == ordnance::Kind::Rocket {
+                                art.lifetime.unwrap_or(6.0)
                             } else if kind == ordnance::Kind::Chunk {
                                 ordnance::FLAK_CHUNK_LIFETIME
                             } else if rebounds > 0 && gravity > 0.0 {
@@ -2062,6 +2151,7 @@ impl Match {
                         next_trail: self.time + if kind.warhead() { 0.3 } else { 0.0 },
                         gel: None,
                         gel_trigger: None,
+                        flight_audio,
                         seeking: (kind == ordnance::Kind::Rocket && fighter.rocket_locked)
                             .then(|| {
                                 fighter.rocket_lock.map(|(target, deaths, _)| {
@@ -2296,6 +2386,7 @@ impl Match {
                         next_trail: self.time,
                         gel: None,
                         gel_trigger: None,
+                        flight_audio: None,
                         seeking: None,
                     });
                 }
@@ -2334,6 +2425,7 @@ impl Match {
                     bolt.position,
                     direction,
                     self.time,
+                    bolt.born,
                     &mut bolt.next_trail,
                 );
                 let acceleration = if bolt.seeking.is_some() { 25.0 } else { 50.0 };
@@ -2492,6 +2584,7 @@ impl Match {
                         next_trail: self.time,
                         gel: None,
                         gel_trigger: None,
+                        flight_audio: None,
                         seeking: None,
                     }));
                 }
@@ -3071,14 +3164,30 @@ impl Match {
             return command;
         }
         let bot = &mut fighter.bot;
-        if let Some((other, target_position, mut delta, distance, velocity)) = target {
+        if let Some((other, target_position, delta, distance, velocity)) = target {
+            let reacquired = bot.target == Some(other)
+                && bot
+                    .hidden_since
+                    .is_some_and(|since| self.time - since > 0.12);
+            bot.hidden_since = None;
             bot.last_seen = Some((target_position, self.time));
             bot.plan_origin = None;
-            if bot.target != Some(other) {
+            if bot.target != Some(other) || reacquired {
                 bot.target = Some(other);
                 bot.react_at = self.time + skill.reaction + (id % 3) as f32 * 0.07;
                 bot.weapon_mode = None;
+                bot.observation = None;
+                bot.maneuver = None;
             }
+            let observed =
+                bot.observation
+                    .get_or_insert((eye.position + delta, velocity, self.time));
+            if self.time - observed.2 >= skill.tracking_interval {
+                *observed = (eye.position + delta, velocity, self.time);
+            }
+            let (observed_position, velocity, sampled_at) = *observed;
+            let mut delta = observed_position - eye.position
+                + velocity * ((self.time - sampled_at) * skill.lead * 0.55);
             let range = distance.sqrt();
             let charge = fighter.charge;
             let weapon = if shock_combo.is_some()
@@ -3147,7 +3256,19 @@ impl Match {
                 Path::Shock => 10_000.0,
                 Path::Zoom => 0.0,
             };
-            let strafe = (self.time * 1.75 + id as f32 * 1.7).sin();
+            let step = || {
+                let [side, pace] = ai::shot_bias(id, (self.time * 9.0) as u32);
+                let direction = if side.abs() < 0.24 {
+                    0.0
+                } else {
+                    side.signum()
+                };
+                (direction, self.time + 1.1 + (pace + 1.0) * 0.8)
+            };
+            let maneuver = bot.maneuver.get_or_insert_with(step);
+            if self.time >= maneuver.1 {
+                *maneuver = step();
+            }
             let error = range.max(370.0) * skill.error;
             let desired_bias = ai::shot_bias(id, fighter.fired_count);
             let bias = bot.aim_bias.get_or_insert(desired_bias);
@@ -3187,9 +3308,9 @@ impl Match {
             let offset = target_position - fighter.walker.position;
             let forward = unit(Vec3(offset.0, offset.1, 0.0));
             let right = Vec3(-forward.1, forward.0, 0.0);
-            let desired = forward * advance + right * (strafe * skill.strafe);
+            let desired = forward * advance + right * (maneuver.0 * skill.strafe);
             bot.combat_move =
-                bot.combat_move + (desired - bot.combat_move) * (1.0 - (-8.0 * dt).exp());
+                bot.combat_move + (desired - bot.combat_move) * (1.0 - (-5.0 * dt).exp());
             let movement = safe_combat_move(map, &fighter.walker, bot.combat_move);
             return Command {
                 movement: movement_input(movement, fighter.yaw + yaw),
@@ -3205,6 +3326,7 @@ impl Match {
             && tracked_alive
             && self.time - seen < 0.28
         {
+            bot.hidden_since.get_or_insert(self.time);
             let (turn, pitch) = aim_error(point - eye.position, fighter.yaw, fighter.pitch);
             let yaw = turn.clamp(-skill.turn * dt, skill.turn * dt);
             bot.combat_move = bot.combat_move * (-7.0 * dt).exp();
@@ -3218,6 +3340,7 @@ impl Match {
         if bot.target.take().is_some() {
             bot.goal = None;
             bot.rethink_at = self.time;
+            bot.hidden_since = None;
         }
         bot.combat_move = Vec3::default();
         let position = fighter.walker.position;
@@ -3559,6 +3682,23 @@ fn follow_transfer(map: &Map, fighter: &mut Fighter, time: f32, dt: f32) -> Opti
         jump,
         ..steer(fighter, target, dt)
     })
+}
+
+fn fighter_loop<'a>(
+    fighter: &Fighter,
+    map: &'a Map,
+) -> Option<&'a std::sync::Arc<crate::sound::Wave>> {
+    if fighter.health == 0 {
+        return None;
+    }
+    let art = map.arsenal.get(&fighter.weapon)?;
+    match fighter.pulse {
+        Some((true, _)) => art.alternate.as_ref(),
+        Some((false, _)) => art.fire.as_ref(),
+        None if fighter.minigun_firing => art.fire.as_ref(),
+        None if fighter.hammer_charge.is_some() => art.charge_loop.as_ref(),
+        None => None,
+    }
 }
 
 fn near_waypoint(waypoint: Vec3, position: Vec3) -> bool {
@@ -3977,6 +4117,7 @@ mod tests {
             next_trail: 0.0,
             gel: None,
             gel_trigger: None,
+            flight_audio: None,
             seeking: None,
         });
         let dt = 1.0 / 120.0;
@@ -4299,6 +4440,7 @@ mod tests {
                     next_trail: 0.7,
                     gel: None,
                     gel_trigger: None,
+                    flight_audio: None,
                     seeking: None,
                 });
             }
@@ -4623,14 +4765,36 @@ mod tests {
                 count += 1;
             });
         assert_eq!(count, 1);
+        let flight = game
+            .world_loops(&map)
+            .next()
+            .expect("loaded rocket flight loop");
+        assert!(matches!(flight.id, LoopId::Rocket(_)) && flight.radius > 0.0);
+        let first_audio_position = flight.position;
+        game.time += 0.18;
+        game.move_bolts(&map, 0.02, &mut hits, &mut sounds);
+        assert!(
+            distance_squared(
+                first_audio_position,
+                game.world_loops(&map).next().unwrap().position
+            ) > 1.0
+        );
+        let mut smoke = 0;
+        game.rocket_trails
+            .visuals(&map.ordnance, game.time, |visual| {
+                if let ordnance::Visual::Sprite(_, _, 2.0, _) = visual {
+                    smoke += 1;
+                }
+            });
+        assert_eq!(smoke, 1);
         map.collision.regions.level.water = true;
         game.time += 0.06;
         game.move_bolts(&map, 0.02, &mut hits, &mut sounds);
         let mut visible = 0;
         game.rocket_trails
             .visuals(&map.ordnance, game.time, |_| visible += 1);
-        assert_eq!(visible, 1, "only the existing particle remains");
-        game.time += 0.22;
+        assert_eq!(visible, 2, "only the existing flare and smoke remain");
+        game.time += 1.5;
         game.move_bolts(&map, 0.02, &mut hits, &mut sounds);
         game.rocket_trails
             .visuals(&map.ordnance, game.time, |_| panic!("expired rocket smoke"));
@@ -5127,6 +5291,7 @@ mod tests {
                     next_trail: 0.0,
                     gel: None,
                     gel_trigger: None,
+                    flight_audio: None,
                     seeking: None,
                 });
             }
@@ -5570,7 +5735,7 @@ mod tests {
                     .map(|fighter| fighter.walker.position)
                     .collect::<Vec<_>>();
                 let mut left_spawn = vec![false; starts.len()];
-                for _ in 0..(45 * 60 + 4) {
+                for _ in 0..(120 * 60 + 4) {
                     game.step(&mut map, Command::default(), 1.0 / 60.0);
                     for ((left_spawn, fighter), &start) in
                         left_spawn.iter_mut().zip(&game.fighters).zip(&starts)
@@ -5733,6 +5898,16 @@ mod tests {
         game.bot_command(&map, 1, 1.0 / 120.0);
         assert_eq!(game.fighters[1].bot.target, Some(0));
         assert_eq!(game.fighters[1].bot.react_at, reaction);
+
+        game.fighters[0].walker.position = Vec3(400.0, 0.0, 39.2);
+        game.time = 3.24;
+        game.bot_command(&map, 1, 1.0 / 120.0);
+        game.fighters[0].walker.position = Vec3(400.0, -120.0, 39.2);
+        game.time = 3.39;
+        let reacquired = game.bot_command(&map, 1, 1.0 / 120.0);
+        assert_eq!(game.fighters[1].bot.target, Some(0));
+        assert!(game.fighters[1].bot.react_at > game.time + 0.35);
+        assert!(!reacquired.primary && !reacquired.alternate);
     }
 
     #[test]
@@ -6112,15 +6287,20 @@ mod tests {
         );
         #[cfg(windows)]
         {
-            let camera = game.fighters[0].camera(&map);
+            let camera = game.player_view(&map);
             let mut frame = crate::render::Frame::new();
             frame.draw_deathmatch(&map, &camera, &game, 90.0, 1.0);
             let scene = frame.pixels.clone();
             crate::hud::Hud::new().draw_deathmatch(&mut frame, &game, &map, false, false);
             let center = frame.width * (frame.height / 2) + frame.width / 2;
+            let panel = frame.width * (frame.height / 2) + frame.width / 6;
             assert_ne!(
-                frame.pixels[center], scene[center],
+                frame.pixels[panel], scene[panel],
                 "the results panel covers the scene"
+            );
+            assert_eq!(
+                frame.pixels[center], scene[center],
+                "results leave the winner visible"
             );
         }
         let old_time = game.time;
@@ -6186,6 +6366,7 @@ mod tests {
             next_trail: 0.0,
             gel: None,
             gel_trigger: None,
+            flight_audio: None,
             seeking: None,
             payload: ProjectilePayload {
                 kind: super::super::ordnance::Kind::Rocket,
@@ -6209,7 +6390,16 @@ mod tests {
         for _ in 0..130 {
             game.step(&mut map, Command::default(), 1.0 / 60.0);
         }
+        assert!(!game.finished && game.overtime);
+        assert_eq!(game.remaining(), 0);
+        assert!(game.result_camera(&map).is_none());
+        let before_score = game.fighters[0].score;
+        game.fighters[1].protected_until = 0.0;
+        game.apply_hit(&map, hit(1, 0), &mut sounds);
+        assert_eq!(game.fighters[0].score, before_score + 1);
+        game.step(&mut map, Command::default(), 1.0 / 60.0);
         assert!(game.finished);
+        assert_eq!(game.winner(), Some(0));
         assert_eq!(game.remaining(), 0);
     }
 }

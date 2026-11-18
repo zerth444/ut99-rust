@@ -29,6 +29,7 @@ impl Difficulty {
         match self {
             Self::Easy => Combat {
                 reaction: 0.68,
+                tracking_interval: 0.24,
                 turn: 2.65,
                 error: 0.14,
                 fire_pause: 0.34,
@@ -42,6 +43,7 @@ impl Difficulty {
             },
             Self::Standard => Combat {
                 reaction: 0.40,
+                tracking_interval: 0.16,
                 turn: 3.2,
                 error: 0.087,
                 fire_pause: 0.20,
@@ -55,6 +57,7 @@ impl Difficulty {
             },
             Self::Hard => Combat {
                 reaction: 0.13,
+                tracking_interval: 0.08,
                 turn: 5.4,
                 error: 0.032,
                 fire_pause: 0.08,
@@ -72,6 +75,7 @@ impl Difficulty {
 
 pub(super) struct Combat {
     pub reaction: f32,
+    pub tracking_interval: f32,
     pub turn: f32,
     pub error: f32,
     pub fire_pause: f32,

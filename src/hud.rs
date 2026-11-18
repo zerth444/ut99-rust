@@ -47,7 +47,9 @@ impl Hud {
         let remaining = game.remaining();
         let white = [0.92, 0.96, 1.0];
         let accent = [0.42, 0.87, 0.95];
-        let clock = if has_art {
+        let clock = if game.overtime {
+            "SUDDEN DEATH".to_owned()
+        } else if has_art {
             format!("{:02}:{:02}", remaining / 60, remaining % 60)
         } else {
             format!(
@@ -180,25 +182,25 @@ impl Hud {
             .min(frame.height as f32 / (168.0 + standings.len() as f32 * 30.0))
             .min(1.5);
         let px = |value: f32| (value * scale).round() as i32;
-        let width = px(640.0);
+        let width = px(if game.finished { 365.0 } else { 640.0 });
         let height = px(144.0 + standings.len() as f32 * 30.0);
-        let left = (frame.width as i32 - width) / 2;
+        let left = if game.finished {
+            px(16.0)
+        } else {
+            (frame.width as i32 - width) / 2
+        };
         let top = (frame.height as i32 - height) / 2;
         let white = [0.94, 0.96, 0.98];
         let dim = [0.67, 0.72, 0.78];
         let accent = [0.81, 0.88, 0.98];
         frame.solid([left, top, width, height], [0.075, 0.09, 0.12]);
         frame.solid([left, top, width, px(76.0)], [0.11, 0.15, 0.21]);
-        let leader = standings[0];
-        let score = game.fighters[leader].score;
-        let tied = standings
-            .get(1)
-            .is_some_and(|&id| game.fighters[id].score == score);
+        let score = game.fighters[standings[0]].score;
         let title = if game.finished {
-            if tied {
-                "Match drawn".to_owned()
-            } else {
-                format!("{} wins", Match::label(leader))
+            match game.winner() {
+                Some(0) => "You won".to_owned(),
+                Some(winner) => format!("{} wins", Match::label(winner)),
+                None => "Match drawn".to_owned(),
             }
         } else {
             "Deathmatch".to_owned()
@@ -211,15 +213,19 @@ impl Hud {
             &title,
             white,
         );
-        let (frag_limit, seconds) = game.limits();
+        let (frag_limit, _) = game.limits();
         let details = if game.finished {
-            let reason = if score >= frag_limit {
-                "Frag limit reached"
+            let reason = if game.overtime {
+                "Sudden death"
+            } else if score >= frag_limit {
+                "Frag limit"
             } else {
-                "Time limit reached"
+                "Time limit"
             };
-            let elapsed = game.time.min(f32::from(seconds)) as u16;
+            let elapsed = game.time as u32;
             format!("{reason}    {:02}:{:02} played", elapsed / 60, elapsed % 60)
+        } else if game.overtime {
+            "Sudden death    Next clear lead wins".to_owned()
         } else {
             let left = game.remaining();
             format!(
@@ -236,12 +242,15 @@ impl Hud {
             &details,
             dim,
         );
-        for (x, title) in [
-            (22.0, "Rank"),
-            (100.0, "Fighter"),
-            (427.0, "Frags"),
-            (528.0, "Deaths"),
-        ] {
+        let columns = if game.finished {
+            [19.0, 78.0, 234.0, 289.0]
+        } else {
+            [22.0, 100.0, 427.0, 528.0]
+        };
+        for (x, title) in columns
+            .into_iter()
+            .zip(["Rank", "Fighter", "Frags", "Deaths"])
+        {
             self.text(
                 frame,
                 left + px(x),
@@ -271,28 +280,26 @@ impl Hud {
             if id == 0 {
                 frame.solid([left, y, px(3.0).max(1), px(30.0)], accent);
             }
-            for (x, value) in [
-                (22.0, rank.to_string()),
-                (
-                    100.0,
-                    if id == 0 {
-                        "PLAYER (YOU)".into()
-                    } else {
-                        Match::label(id)
-                    },
-                ),
-                (427.0, fighter.score.to_string()),
-                (528.0, fighter.deaths.to_string()),
-            ] {
+            for (x, value) in columns.into_iter().zip([
+                rank.to_string(),
+                if id == 0 {
+                    "PLAYER (YOU)".into()
+                } else {
+                    Match::label(id)
+                },
+                fighter.score.to_string(),
+                fighter.deaths.to_string(),
+            ]) {
                 self.text(frame, left + px(x), y + px(5.0), scale, &value, white);
             }
         }
         if game.finished {
-            self.centered(
+            self.text(
                 frame,
-                top + height + px(4.0),
-                scale * 0.85,
-                "Enter to play again",
+                left + px(19.0),
+                top + height - px(27.0),
+                scale * 0.8,
+                "Enter for rematch    Esc to leave",
                 white,
             );
         }

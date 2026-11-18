@@ -600,6 +600,7 @@ unsafe fn message_loop(
                 let view = game.player_view(map);
                 if let Some(audio) = &mut audio {
                     audio.set_weapon_loop(game.weapon_loop(map));
+                    audio.set_world_loops(game.world_loops(map));
                     audio.set_volume(settings.effects_volume, settings.music_volume);
                     audio.update(
                         &map.ambient,
@@ -964,6 +965,7 @@ fn run_frontend(
     let mut time = 0.0;
     if let Some(audio) = audio {
         audio.set_weapon_loop(None);
+        audio.set_world_loops(std::iter::empty());
         if !resume {
             audio.set_track(
                 intro

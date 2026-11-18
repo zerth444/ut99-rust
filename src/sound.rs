@@ -111,6 +111,36 @@ pub struct Emitter {
     wave: Arc<Wave>,
 }
 
+impl Emitter {
+    fn mix(
+        &self,
+        output: &mut [[f32; 2]],
+        cursor: &mut f64,
+        listener: Vec3,
+        right: Vec3,
+        muted: bool,
+    ) {
+        let [left, right] = SoundSource {
+            position: self.position,
+            radius: self.radius,
+        }
+        .gains(listener, right, self.volume * 0.45);
+        let step = f64::from(self.wave.rate) * f64::from(self.speed) / f64::from(MIX_RATE);
+        let count = self.wave.frames();
+        if muted || (left == 0.0 && right == 0.0) {
+            *cursor = (*cursor + step * output.len() as f64) % count as f64;
+            return;
+        }
+        for frame in output {
+            let [a, b] = self.wave.sample(*cursor, count, true);
+            let sample = (a + b) * 0.5;
+            frame[0] += sample * left;
+            frame[1] += sample * right;
+            *cursor = (*cursor + step) % count as f64;
+        }
+    }
+}
+
 pub fn load(
     package: &Package<'_>,
     actors: &[&Export],
@@ -302,6 +332,27 @@ pub struct Mixer {
     mix: Vec<[f32; 2]>,
     voices: Vec<Voice>,
     weapon_loop: Option<(Arc<Wave>, f64)>,
+    world_loops: HashMap<LoopId, MovingEmitter>,
+}
+
+struct MovingEmitter {
+    emitter: Emitter,
+    cursor: f64,
+    active: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum LoopId {
+    Fighter(usize),
+    Rocket(u64),
+}
+
+pub(crate) struct WorldLoop<'a> {
+    pub id: LoopId,
+    pub wave: &'a Arc<Wave>,
+    pub position: Vec3,
+    pub radius: f32,
+    pub gain: f32,
 }
 
 struct Voice {
@@ -316,7 +367,39 @@ impl Mixer {
             mix: Vec::new(),
             voices: Vec::new(),
             weapon_loop: None,
+            world_loops: HashMap::new(),
         }
+    }
+
+    fn set_world_loops<'a>(&mut self, loops: impl IntoIterator<Item = WorldLoop<'a>>) {
+        for voice in self.world_loops.values_mut() {
+            voice.active = false;
+        }
+        for sound in loops {
+            let voice = self
+                .world_loops
+                .entry(sound.id)
+                .or_insert_with(|| MovingEmitter {
+                    emitter: Emitter {
+                        wave: Arc::clone(sound.wave),
+                        position: sound.position,
+                        radius: sound.radius,
+                        volume: sound.gain,
+                        speed: 1.0,
+                    },
+                    cursor: 0.0,
+                    active: true,
+                });
+            if !Arc::ptr_eq(&voice.emitter.wave, sound.wave) {
+                voice.emitter.wave = Arc::clone(sound.wave);
+                voice.cursor = 0.0;
+            }
+            voice.emitter.volume = sound.gain;
+            voice.emitter.position = sound.position;
+            voice.emitter.radius = sound.radius;
+            voice.active = true;
+        }
+        self.world_loops.retain(|_, voice| voice.active);
     }
 
     fn play(&mut self, event: SoundEvent) {
@@ -351,25 +434,7 @@ impl Mixer {
         self.mix.resize(frames, [0.0; 2]);
         self.mix.fill([0.0; 2]);
         for (emitter, cursor) in emitters.iter().zip(&mut self.cursors) {
-            let [left, right] = SoundSource {
-                position: emitter.position,
-                radius: emitter.radius,
-            }
-            .gains(listener, right, emitter.volume * 0.45);
-            let step =
-                f64::from(emitter.wave.rate) * f64::from(emitter.speed) / f64::from(MIX_RATE);
-            let count = emitter.wave.frames();
-            if muted || (left == 0.0 && right == 0.0) {
-                *cursor = (*cursor + step * self.mix.len() as f64) % count as f64;
-                continue;
-            }
-            for frame in &mut self.mix {
-                let [a, b] = emitter.wave.sample(*cursor, count, true);
-                let sample = (a + b) * 0.5;
-                frame[0] += sample * left;
-                frame[1] += sample * right;
-                *cursor = (*cursor + step) % count as f64;
-            }
+            emitter.mix(&mut self.mix, cursor, listener, right, muted);
         }
         if let Some((wave, cursor)) = &mut self.weapon_loop {
             let step = f64::from(wave.rate) / f64::from(MIX_RATE);
@@ -384,6 +449,11 @@ impl Mixer {
                     *cursor = (*cursor + step) % count as f64;
                 }
             }
+        }
+        for voice in self.world_loops.values_mut() {
+            voice
+                .emitter
+                .mix(&mut self.mix, &mut voice.cursor, listener, right, muted);
         }
         self.voices.retain_mut(|Voice { event, cursor }| {
             let wave = &event.wave;
@@ -501,6 +571,34 @@ mod tests {
         mixer.mix_effects(1, &[], Vec3(-30.0, 0.0, 0.0), right, false);
         assert_eq!(mixer.mix[0], [0.0; 2]);
         assert!(mixer.voices.is_empty());
+    }
+
+    #[test]
+    fn moving_loop_preserves_phase_across_pan_updates_and_stops_when_removed() {
+        let mut mixer = Mixer::new();
+        let wave = Arc::new(Wave {
+            samples: vec![1.0, -0.5],
+            channels: 1,
+            rate: MIX_RATE,
+        });
+        let id = LoopId::Rocket(1);
+        let sound = |x| WorldLoop {
+            id,
+            wave: &wave,
+            position: Vec3(x, 0.0, 0.0),
+            radius: 20.0,
+            gain: 1.0,
+        };
+        let right = Vec3(1.0, 0.0, 0.0);
+        mixer.set_world_loops([sound(10.0)]);
+        mixer.mix_effects(1, &[], Vec3::default(), right, false);
+        assert_eq!(mixer.mix[0], [0.0, 0.1125]);
+        mixer.set_world_loops([sound(-10.0)]);
+        mixer.mix_effects(1, &[], Vec3::default(), right, false);
+        assert_eq!(mixer.mix[0], [-0.05625, 0.0]);
+        mixer.set_world_loops(std::iter::empty());
+        mixer.mix_effects(2, &[], Vec3::default(), right, false);
+        assert_eq!(mixer.mix, [[0.0, 0.0]; 2]);
     }
 
     #[test]
@@ -685,6 +783,13 @@ pub mod device {
             {
                 self.mixer.weapon_loop = wave.map(|wave| (Arc::clone(wave), 0.0));
             }
+        }
+
+        pub(crate) fn set_world_loops<'a>(
+            &mut self,
+            loops: impl IntoIterator<Item = WorldLoop<'a>>,
+        ) {
+            self.mixer.set_world_loops(loops);
         }
 
         pub fn update(

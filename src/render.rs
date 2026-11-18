@@ -382,7 +382,7 @@ impl Frame {
         } else {
             roll
         };
-        let fov = if player.zoomed() && !piloting {
+        let fov = if player.zoomed() && !piloting && !game.finished {
             player.field_of_view(fov)
         } else {
             fov
@@ -440,7 +440,7 @@ impl Frame {
             .fighters
             .iter()
             .enumerate()
-            .skip(usize::from(!piloting))
+            .skip(usize::from(!piloting && game.result_camera(map).is_none()))
         {
             if let Some(pose) = fighter.pose(map, id, game.time) {
                 let cloak = fighter.health > 0
