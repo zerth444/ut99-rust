@@ -53,8 +53,13 @@ impl Hud {
             frame.height as i32 - (36.0 * scale) as i32,
             scale,
             &format!(
-                "HEALTH {}   ARMOR {}   AMMO {}",
-                player.health, player.armor, player.ammo
+                "HEALTH {}   ARMOR {}   {}   {}",
+                player.health,
+                player.armor,
+                player.weapon.label(),
+                player
+                    .ammo()
+                    .map_or_else(|| "MELEE".to_owned(), |ammo| format!("AMMO {ammo}"))
             ),
             white,
         );

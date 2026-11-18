@@ -362,6 +362,8 @@ impl Frame {
         game: &crate::game::deathmatch::Match,
         fov: f32,
     ) {
+        let player = &game.fighters[0];
+        let fov = if player.zoomed { fov.min(35.0) } else { fov };
         self.zoom = (0.5 * fov.to_radians()).tan().recip();
         self.draw(map, camera, game.time);
         self.layer(Layer::Effects);
@@ -377,17 +379,46 @@ impl Frame {
             }
         }
         for trace in &game.traces {
+            if let Some(kind) = trace.explosion
+                && let Some(sprite) = &map.ordnance[kind as usize].explosion
+            {
+                let age = game.time - trace.born;
+                self.world_sprite(&view, trace.start, sprite.image(age), 0.8 + age, 1.0 - age);
+                continue;
+            }
             self.effect(
                 camera,
                 crate::game::Effect {
                     origin: trace.start,
                     end: trace.end,
-                    color: if trace.blast { 0xf07130 } else { 0xffdf84 },
+                    color: if trace.explosion.is_some() {
+                        0xf07130
+                    } else {
+                        0xffdf84
+                    },
                     expires: game.time,
                 },
             );
         }
-        for position in game.bolts() {
+        for (kind, position, direction, age) in game.bolts() {
+            let art = &map.ordnance[kind as usize];
+            if let Some(sprite) = &art.sprite {
+                self.world_sprite(&view, position, sprite.image(age), 0.68, 0.8);
+                continue;
+            }
+            let duration = art.flight.duration();
+            if duration > 0.0
+                && let Some(pose) = art.flight.sample(age.rem_euclid(duration))
+            {
+                let direction = if direction.dot(direction) > 0.01 {
+                    direction
+                } else {
+                    Vec3(1.0, 0.0, 0.0)
+                };
+                let model = view.in_model(position, direction, 1.0);
+                self.draw_faces_in_view(pose.current, &model, game.time, false, Some(pose), None);
+                continue;
+            }
             self.effect(
                 camera,
                 crate::game::Effect {
@@ -399,10 +430,18 @@ impl Frame {
             );
         }
         self.zoom = 1.0;
-        let player = &game.fighters[0];
         if player.health > 0 && !game.finished {
-            if let Some(weapon) = map.arsenal.get(&crate::game::Weapon::Enforcer) {
-                let pose = weapon.primary_motion.sample(game.time - player.fired_at);
+            if !player.zoomed
+                && let Some(weapon) = map.arsenal.get(&player.weapon)
+            {
+                let fire = if player.last_alt && !weapon.alternate_motion.frames.is_empty() {
+                    &weapon.alternate_motion
+                } else {
+                    &weapon.primary_motion
+                };
+                let pose = fire
+                    .sample(game.time - player.fired_at)
+                    .or_else(|| weapon.select_motion.sample(game.time - player.selected_at));
                 let faces = pose
                     .as_ref()
                     .map_or(weapon.view.as_slice(), |pose| pose.current);

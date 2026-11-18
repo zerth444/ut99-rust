@@ -239,6 +239,13 @@ unsafe fn message_loop(
                             }
                         }
                         WM_LBUTTONDOWN if !mouse.captured => mouse.capture(),
+                        WM_MOUSEWHEEL if mouse.captured => {
+                            cycle = if (message.wParam >> 16) as i16 > 0 {
+                                -1
+                            } else {
+                                1
+                            };
+                        }
                         WM_KEYDOWN if message.lParam & (1 << 30) == 0 => {
                             match message.wParam as u16 {
                                 VK_RETURN => restart_match = true,
@@ -264,6 +271,8 @@ unsafe fn message_loop(
                                     raw = (0, 0);
                                     primary = false;
                                     alternate = false;
+                                    slot = None;
+                                    cycle = 0;
                                     if GetForegroundWindow() == window {
                                         mouse.capture();
                                     }
@@ -277,6 +286,9 @@ unsafe fn message_loop(
                                     toggle_borderless(window, &mut windowed);
                                     settings.fullscreen = windowed.is_some();
                                     save_settings(settings, settings_path);
+                                }
+                                key if (u16::from(b'0')..=u16::from(b'9')).contains(&key) => {
+                                    slot = Some((key - u16::from(b'0')) as u8);
                                 }
                                 _ => {}
                             }
@@ -437,13 +449,16 @@ unsafe fn message_loop(
                 let restart = std::mem::take(&mut restart_match);
                 let shoot = std::mem::take(&mut primary);
                 let secondary = std::mem::take(&mut alternate);
+                let weapon_slot = slot.take();
+                let weapon_cycle = std::mem::take(&mut cycle);
                 if active {
                     let (dx, dy) = if mouse.captured {
                         mouse.motion(raw)
                     } else {
                         (0, 0)
                     };
-                    let sensitivity = 0.0027 * settings.sensitivity as f32 / 100.0;
+                    let sensitivity = 0.0027 * settings.sensitivity as f32 / 100.0
+                        * if game.fighters[0].zoomed { 0.43 } else { 1.0 };
                     let pitch_sign = if settings.invert_mouse { 1.0 } else { -1.0 };
                     let command = deathmatch::Command {
                         movement: [axis(forward, back), axis(right, left)],
@@ -451,11 +466,14 @@ unsafe fn message_loop(
                         primary: shoot || ((mouse.captured || fire > 6) && key(fire)),
                         alternate: secondary || ((mouse.captured || alt_fire > 6) && key(alt_fire)),
                         restart,
+                        slot: weapon_slot,
+                        cycle: weapon_cycle,
                         look: [
                             dx as f32 * sensitivity + axis(VK_RIGHT, VK_LEFT) * input_dt * 2.2,
                             dy as f32 * sensitivity * pitch_sign
                                 + axis(VK_UP, VK_DOWN) * input_dt * 1.8,
                         ],
+                        ..deathmatch::Command::default()
                     };
                     let events = game.step(map, command, dt);
                     if let Some(audio) = &mut audio {
