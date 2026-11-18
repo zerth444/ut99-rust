@@ -367,18 +367,7 @@ impl Frame {
         self.layer(Layer::Effects);
         let view = self.camera_view(camera);
         for (id, fighter) in game.fighters.iter().enumerate().skip(1) {
-            let motion = fighter
-                .fell_at
-                .map_or(&map.player_idle, |_| &map.player_deaths[id % 3]);
-            let duration = motion.duration();
-            if duration <= 0.0 {
-                continue;
-            }
-            let age = fighter.fell_at.map_or_else(
-                || game.time.rem_euclid(duration),
-                |death| (game.time - death).min((duration - 0.001).max(0.0)),
-            );
-            if let Some(pose) = motion.sample(age) {
+            if let Some(pose) = fighter.pose(map, id, game.time) {
                 let model = view.in_model(
                     fighter.walker.position,
                     Vec3(fighter.yaw.cos(), fighter.yaw.sin(), 0.0),

@@ -292,7 +292,7 @@ const CONTROLS: [&str; 8] = [
 ];
 const INPUT: [&str; 2] = ["Mouse Sensitivity", "Invert Mouse"];
 const HUD: [&str; 1] = ["HUD Scale"];
-const GAME: [&str; 3] = ["Dodging", "Game Speed", "View Bob"];
+const GAME: [&str; 4] = ["Dodging", "Game Speed", "View Bob", "Bot Difficulty"];
 const TOP_ITEMS: [i32; 5] = [0, 56, 103, 159, 201];
 const MENU_ROW: i32 = 18;
 
@@ -705,6 +705,7 @@ impl Menu {
             (5, 0) => settings.dodging = !settings.dodging,
             (5, 1) => adjust(&mut settings.game_speed, 5, 50, 200),
             (5, 2) => adjust(&mut settings.view_bob, 1, 0, 8),
+            (5, 3) => adjust(&mut settings.bot_difficulty, 1, 1, 3),
             _ => return Action::None,
         }
         Action::Changed
@@ -966,6 +967,9 @@ impl Menu {
                 enabled(settings.dodging),
                 format!("{}%", settings.game_speed),
                 settings.view_bob.to_string(),
+                crate::game::deathmatch::Difficulty::from_level(settings.bot_difficulty)
+                    .label()
+                    .into(),
             ],
         };
         for (index, (caption, value)) in self.rows().iter().zip(values).enumerate() {
@@ -1318,6 +1322,9 @@ mod tests {
             ) == Action::Changed
         );
         assert_eq!(settings.view_bob, 0);
+        menu.key(VK_DOWN, &mut settings);
+        assert!(menu.key(VK_RIGHT, &mut settings) == Action::Changed);
+        assert_eq!(settings.bot_difficulty, 3);
         menu.key(VK_ESCAPE, &mut settings);
         assert!(menu.click([900, 600], 40, 13, VK_LBUTTON, &mut settings) == Action::Play);
 

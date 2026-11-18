@@ -218,6 +218,20 @@ pub struct Motion {
     pub rate: f32,
 }
 
+#[derive(Default)]
+pub struct ActorClips {
+    pub walk: Motion,
+    pub run: Motion,
+    pub fire_run: Motion,
+    pub strafe: [Motion; 2],
+    pub backpedal: Motion,
+    pub fire: Motion,
+    pub air: Motion,
+    pub land: Motion,
+    pub hurt: Motion,
+    pub swim: Motion,
+}
+
 #[derive(Clone, Copy)]
 pub struct Pose<'a> {
     pub current: &'a [Face],

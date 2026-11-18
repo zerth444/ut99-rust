@@ -7,7 +7,7 @@ use std::{
 
 use crate::game::ordnance::{self, Kind};
 use crate::game::shock;
-use crate::game::{Flash, Item, Motion, RocketAnimations, Weapon, WeaponAssets};
+use crate::game::{ActorClips, Flash, Item, Motion, RocketAnimations, Weapon, WeaponAssets};
 use crate::map::{Face, Vec3, material_color, native_data};
 use crate::mover::{product, read_rotation, rotate, unit};
 use crate::package::{Export, Package, Properties, Reader, invalid};
@@ -409,6 +409,7 @@ pub struct Scene {
     pub player_audio: crate::movement::PlayerAudio,
     pub player_deaths: [Motion; 3],
     pub player_idle: Motion,
+    pub player_clips: ActorClips,
     pub ordnance: ordnance::Arsenal,
     pub ballistics: crate::game::ballistics::Art,
     pub zones: Vec<crate::movement::Zone>,
@@ -922,7 +923,8 @@ pub fn load(
             find_export(&assets, "botpack", name, "Sound"),
         )
     });
-    let (player_deaths, player_idle) = player_models(&mut assets, &mut class_cache, &mut textures);
+    let (player_deaths, player_idle, player_clips) =
+        player_models(&mut assets, &mut class_cache, &mut textures);
     let ordnance = Kind::ALL.map(|kind| {
         projectile_art(
             &mut assets,
@@ -982,6 +984,7 @@ pub fn load(
         player_audio,
         player_deaths,
         player_idle,
+        player_clips,
         ordnance,
         ballistics,
         zones,
@@ -1041,7 +1044,7 @@ fn player_models(
     assets: &mut Assets<'_>,
     classes: &mut HashMap<Object, Appearance>,
     textures: &mut HashMap<Object, Option<Arc<Texture>>>,
-) -> ([Motion; 3], Motion) {
+) -> ([Motion; 3], Motion, ActorClips) {
     let class = find_export(assets, "botpack", "TMale2", "Class");
     let mut visual = appearance(assets, classes, class);
     let Some(object) = visual.mesh else {
@@ -1057,11 +1060,22 @@ fn player_models(
     {
         visual.multiskins[slot] = find_export(assets, "soldierskins", name, "Texture");
     }
-    (
-        ["Dead1", "Dead3", "Dead8"]
-            .map(|name| effect_motion(assets, textures, object, visual, &mesh, &[name])),
-        effect_motion(assets, textures, object, visual, &mesh, &["Breath1"]),
-    )
+    let mut clip = |name| effect_motion(assets, textures, object, visual, &mesh, &[name]);
+    let deaths = ["Dead1", "Dead3", "Dead8"].map(&mut clip);
+    let idle = clip("Breath1");
+    let clips = ActorClips {
+        walk: clip("WalkSm"),
+        run: clip("RunSm"),
+        fire_run: clip("RunSmFr"),
+        strafe: ["StrafeL", "StrafeR"].map(&mut clip),
+        backpedal: clip("BackRun"),
+        fire: clip("StillSmFr"),
+        air: clip("JumpSmFr"),
+        land: clip("LandSmFr"),
+        hurt: clip("GutHit"),
+        swim: clip("SwimSm"),
+    };
+    (deaths, idle, clips)
 }
 
 fn projectile_art(

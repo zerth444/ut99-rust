@@ -191,7 +191,12 @@ unsafe fn message_loop(
             obs,
             false,
         )? {
-            Action::Deathmatch => match_rules = Some(deathmatch::Rules::default()),
+            Action::Deathmatch => {
+                match_rules = Some(deathmatch::Rules {
+                    difficulty: deathmatch::Difficulty::from_level(settings.bot_difficulty),
+                    ..deathmatch::Rules::default()
+                })
+            }
             Action::Quit => return Ok(()),
             _ => {}
         }

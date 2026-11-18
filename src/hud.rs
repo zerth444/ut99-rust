@@ -39,10 +39,11 @@ impl Hud {
             12,
             scale,
             &format!(
-                "DEATHMATCH   {:02}:{:02}   FRAGS {}",
+                "DEATHMATCH   {:02}:{:02}   FRAGS {}   {}",
                 remaining / 60,
                 remaining % 60,
-                player.score
+                player.score,
+                game.difficulty().label().to_ascii_uppercase()
             ),
             accent,
         );

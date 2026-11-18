@@ -136,6 +136,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             bots: usize::from(option("Bot count", defaults.bots as u16, 8)?),
             frag_limit: option("Frag limit", defaults.frag_limit as u16, 100)? as i16,
             seconds: option("Time limit in seconds", defaults.seconds, 3600)?,
+            difficulty: game::deathmatch::Difficulty::from_level(u32::from(option(
+                "Bot difficulty",
+                defaults.difficulty as u16,
+                3,
+            )?)),
         })
     } else {
         None
@@ -262,7 +267,7 @@ fn print_usage() {
     println!("ut99-rust [--obs] [--nosound] view <map.unr> [player-start]");
     println!("ut99-rust [--obs] [--nosound] play <map.unr> [player-start]");
     println!(
-        "ut99-rust [--obs] [--nosound] deathmatch <map.unr> [player-start] [bots] [frag-limit] [seconds]"
+        "ut99-rust [--obs] [--nosound] deathmatch <map.unr> [player-start] [bots] [frag-limit] [seconds] [difficulty: 1-3]"
     );
     println!("ut99-rust capture <map.unr> <output.bmp> [player-start]");
     println!("ut99-rust capture-practice <map.unr> <output.bmp> [player-start]");
