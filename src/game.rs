@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use crate::collision::Walker;
 use crate::map::{Face, Map, Vec3};
 use crate::render::Camera;
-use crate::sound::Wave;
+use crate::sound::{CONTACT_SOUND_RADIUS, SoundEvents, Wave};
 
 pub mod ballistics;
 pub mod decals;
@@ -864,7 +864,7 @@ impl Practice {
         map: &Map,
         camera: &Camera,
         ready: bool,
-        sounds: &mut Vec<Arc<Wave>>,
+        sounds: &mut SoundEvents,
     ) {
         let visible = ready
             && self.weapon == Weapon::Rocket
@@ -1099,7 +1099,7 @@ impl Practice {
         input: Input,
         collect: bool,
         player: Option<&mut Walker>,
-    ) -> Vec<Arc<Wave>> {
+    ) -> SoundEvents {
         self.time += dt;
         if self.weapon == Weapon::Bio
             && player
@@ -1114,7 +1114,7 @@ impl Practice {
         self.decals.update(self.time);
         self.decals.follow_movers(&map.movers);
         self.ordnance.follow_movers(&map.movers);
-        let mut sounds = Vec::new();
+        let mut sounds = SoundEvents::default();
         if self.damage_amp_active() && self.time >= self.amp_warning {
             self.amp_warning += 1.0;
             sounds.extend(map.powerups.amp_out.iter().cloned());
@@ -1367,7 +1367,7 @@ impl Practice {
         camera: &Camera,
         input: &Input,
         ready: bool,
-        sounds: &mut Vec<Arc<Wave>>,
+        sounds: &mut SoundEvents,
     ) -> Option<(u16, Vec3)> {
         if !ready || self.weapon != Weapon::Hammer {
             self.hammer_since = None;
@@ -1506,7 +1506,7 @@ impl Practice {
         &mut self,
         map: &Map,
         dt: f32,
-        sounds: &mut Vec<Arc<Wave>>,
+        sounds: &mut SoundEvents,
     ) -> Option<shock::Blast> {
         let Some(beam) = &mut self.pulse_beam else {
             self.pulse_contact_time = 0.0;
@@ -1566,7 +1566,7 @@ impl Practice {
         None
     }
 
-    fn update_pulse_primary(&mut self, map: &Map, held: bool, sounds: &mut Vec<Arc<Wave>>) {
+    fn update_pulse_primary(&mut self, map: &Map, held: bool, sounds: &mut SoundEvents) {
         if held && self.weapon == Weapon::Pulse && self.ammo().is_some_and(|ammo| ammo > 0) {
             if self.pulse_primary_since.is_none() && self.time >= self.next_shot {
                 self.pulse_primary_since = Some(self.time);
@@ -1630,7 +1630,7 @@ impl Practice {
         camera: &Camera,
         input: &Input,
         ready: bool,
-        sounds: &mut Vec<Arc<Wave>>,
+        sounds: &mut SoundEvents,
         blasts: &mut Vec<shock::Blast>,
     ) -> bool {
         let weapon = self.weapon;
@@ -1823,7 +1823,7 @@ impl Practice {
         }
     }
 
-    fn update_liquid(&mut self, map: &Map, center: Vec3, eye: Vec3, sounds: &mut Vec<Arc<Wave>>) {
+    fn update_liquid(&mut self, map: &Map, center: Vec3, eye: Vec3, sounds: &mut SoundEvents) {
         if self.health == 0 {
             return;
         }
@@ -1850,7 +1850,7 @@ impl Practice {
                 } else {
                     entry.as_ref()
                 };
-                sounds.extend(sound.cloned());
+                sounds.extend_at(sound.cloned(), foot, CONTACT_SOUND_RADIUS, 1.0);
             }
         }
         if !head.water
@@ -1904,7 +1904,7 @@ impl Practice {
         map: &Map,
         camera: &Camera,
         alternate: bool,
-        sounds: &mut Vec<Arc<Wave>>,
+        sounds: &mut SoundEvents,
     ) -> Option<shock::Blast> {
         let weapon = self.weapon;
         let ammo = &mut self.ammo[weapon.ammo_pool()];
@@ -2025,7 +2025,7 @@ impl Practice {
         camera: &Camera,
         weapon: Weapon,
         alternate: bool,
-        sounds: &mut Vec<Arc<Wave>>,
+        sounds: &mut SoundEvents,
     ) -> Option<shock::Blast> {
         let (cooldown, accuracy, damage, side, height) = match (weapon, alternate) {
             (Weapon::Enforcer, false) => (0.32, 0.2, 17, 5.5, -4.4),
@@ -2098,7 +2098,12 @@ impl Practice {
             let point = start + visible * fraction;
             let headshot = weapon == Weapon::Sniper && point.2 - target.position.2 > 0.62 * 39.0;
             target.damage(if headshot { 100 } else { damage as u16 });
-            sounds.extend(map.ballistics.flesh.iter().cloned());
+            sounds.extend_at(
+                map.ballistics.flesh.iter().cloned(),
+                point,
+                CONTACT_SOUND_RADIUS,
+                1.0,
+            );
             visible = point - start;
             wall = None;
         }
@@ -2164,7 +2169,7 @@ impl Practice {
             }
             let sound = (((self.jitter() + 1.0) * 2.0) as usize).min(3);
             if let Some(sound) = map.ballistics.wall_sounds.get(sound) {
-                sounds.extend(sound.iter().cloned());
+                sounds.extend_at(sound.iter().cloned(), point, CONTACT_SOUND_RADIUS, 1.0);
             }
             let origin = point + normal * if weapon == Weapon::Enforcer { 1.0 } else { 9.0 };
             let style = (((self.jitter() + 1.0) * 2.0) as usize).min(3);
@@ -2297,12 +2302,12 @@ mod tests {
                 game.weapon = Weapon::Rocket;
                 game.weapon_state = WeaponState::Ready;
                 game.ammo[Weapon::Rocket.ammo_pool()] = 20;
-                let mut sounds = Vec::new();
+                let mut sounds = SoundEvents::default();
                 let mut blasts = Vec::new();
                 let held = fire_input(!alternate, alternate);
                 game.update_charge(&map, &camera, &held, true, &mut sounds, &mut blasts);
                 assert!(Arc::ptr_eq(
-                    sounds.last().unwrap(),
+                    sounds.waves().next_back().unwrap(),
                     rocket.rotate_sound.as_ref().unwrap()
                 ));
                 while game
@@ -2323,7 +2328,7 @@ mod tests {
                             rocket.loads[usize::from(charge.loaded)].frames[0].as_slice()
                         ));
                         assert!(Arc::ptr_eq(
-                            sounds.last().unwrap(),
+                            sounds.waves().next_back().unwrap(),
                             map.arsenal[&Weapon::Rocket].load_sound.as_ref().unwrap()
                         ));
                     }
@@ -2343,7 +2348,7 @@ mod tests {
                 assert_eq!(game.shots, u32::from(count));
                 assert_eq!(game.ammo(), Some(20 - u16::from(count)));
                 assert_eq!(game.ordnance.active_count(), usize::from(count));
-                assert!(sounds.iter().any(|sound| {
+                assert!(sounds.waves().any(|sound| {
                     Arc::ptr_eq(
                         sound,
                         shot_sound(&map.arsenal, Weapon::Rocket, alternate)
@@ -2383,7 +2388,7 @@ mod tests {
         game.weapon = Weapon::Bio;
         game.weapon_state = WeaponState::Ready;
         game.ammo[Weapon::Bio.ammo_pool()] = 20;
-        let mut sounds = Vec::new();
+        let mut sounds = SoundEvents::default();
         let mut blasts = Vec::new();
         game.update_charge(
             &map,
@@ -2394,7 +2399,10 @@ mod tests {
             &mut blasts,
         );
         assert_eq!(sounds.len(), 1);
-        assert!(Arc::ptr_eq(&sounds[0], bio.load_sound.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(
+            sounds.waves().next().unwrap(),
+            bio.load_sound.as_ref().unwrap()
+        ));
         for _ in 0..10 {
             game.time += 0.51;
             sounds.clear();
@@ -2429,7 +2437,10 @@ mod tests {
         );
         assert_eq!(game.ordnance.active_count(), 1);
         assert_eq!(sounds.len(), 1);
-        assert!(Arc::ptr_eq(&sounds[0], bio.fire.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(
+            sounds.waves().next().unwrap(),
+            bio.fire.as_ref().unwrap()
+        ));
         assert!((game.next_shot - game.time - 0.75).abs() < 0.001);
 
         // The last rocket fires immediately; there is no empty reload animation or sound.
@@ -2484,7 +2495,7 @@ mod tests {
             None,
         );
         assert!(!game.charge.as_ref().unwrap().rotating);
-        assert!(sounds.iter().any(|sound| Arc::ptr_eq(
+        assert!(sounds.waves().any(|sound| Arc::ptr_eq(
             sound,
             map.arsenal[&Weapon::Rocket].load_sound.as_ref().unwrap()
         )));
@@ -2511,7 +2522,7 @@ mod tests {
             game.charge.is_none(),
             "the firing/reload sequence blocks another shot"
         );
-        assert!(sounds.iter().any(|sound| Arc::ptr_eq(
+        assert!(sounds.waves().any(|sound| Arc::ptr_eq(
             sound,
             map.arsenal[&Weapon::Rocket].load_sound.as_ref().unwrap()
         )));
@@ -2540,7 +2551,7 @@ mod tests {
             None,
         );
         assert_eq!(game.shots, 1);
-        assert!(sounds.iter().any(|sound| Arc::ptr_eq(
+        assert!(sounds.waves().any(|sound| Arc::ptr_eq(
             sound,
             map.arsenal[&Weapon::Bio].alternate.as_ref().unwrap()
         )));
@@ -2590,7 +2601,13 @@ mod tests {
         let mut game = Practice::new(&map);
         let mut camera = Camera::from_start(map.starts[11]);
         for _ in 0..8 {
-            game.trace_bullet(&map, &camera, Weapon::Enforcer, false, &mut Vec::new());
+            game.trace_bullet(
+                &map,
+                &camera,
+                Weapon::Enforcer,
+                false,
+                &mut SoundEvents::default(),
+            );
             if game.decals.visible().next().is_some() {
                 break;
             }
@@ -2643,7 +2660,7 @@ mod tests {
                 Vec3(distance + 10.0, 100.0, 100.0),
             );
             let mut game = Practice::new(&map);
-            let mut sounds = Vec::new();
+            let mut sounds = SoundEvents::default();
             for _ in 0..4 {
                 game.trace_bullet(&map, &camera, Weapon::Enforcer, false, &mut sounds);
             }
@@ -2722,7 +2739,7 @@ mod tests {
                                 .is_some_and(|(id, alt, _)| id == Weapon::Enforcer && alt)
                         );
                         assert!(Arc::ptr_eq(
-                            &sounds[0],
+                            sounds.waves().next().unwrap(),
                             map.arsenal[&Weapon::Enforcer].fire.as_ref().unwrap()
                         ));
                         game.update(

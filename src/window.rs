@@ -457,7 +457,7 @@ unsafe fn message_loop(
             if let Some(speed) = movement_audio.landing {
                 game.landed(speed, map.collision.profile.jump_speed);
             }
-            let shots = game.update(
+            let sound_events = game.update(
                 map,
                 &camera,
                 dt,
@@ -522,9 +522,7 @@ unsafe fn message_loop(
                         audio.play_with_gain(std::sync::Arc::clone(sound), intensity.min(1.0));
                     }
                 }
-                for sound in shots {
-                    audio.play(sound);
-                }
+                audio.play_events(sound_events);
                 use crate::game::Weapon;
                 let weapon_loop = if game.ordnance.guided_view().is_some() {
                     map.arsenal

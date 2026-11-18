@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
     map::{Map, Vec3},
     mover::unit,
-    sound::Wave,
+    sound::{SoundEvents, Wave},
     texture::Texture,
 };
 
@@ -48,7 +48,7 @@ impl Effects {
         target: Option<&TrainingTarget>,
         time: f32,
         dt: f32,
-        sounds: &mut Vec<Arc<Wave>>,
+        sounds: &mut SoundEvents,
     ) {
         self.tracer.retain_mut(|shot| {
             let delta = shot.velocity * dt;
@@ -83,7 +83,7 @@ impl Effects {
             if let Some((point, normal)) = map.collision.ray_surface(case.position, delta) {
                 case.position = point + normal * 0.5;
                 if case.bounces == 0 {
-                    sounds.extend(map.ballistics.shell.iter().cloned());
+                    sounds.extend_at(map.ballistics.shell.iter().cloned(), point, 480.0, 1.0);
                 }
                 if case.bounces >= 2 && normal.2 <= 0.7 {
                     return false;

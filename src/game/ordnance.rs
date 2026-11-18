@@ -5,7 +5,7 @@ use crate::{
     map::{Face, Map, Vec3},
     mover::unit,
     render::Camera,
-    sound::Wave,
+    sound::{BLAST_SOUND_RADIUS, CONTACT_SOUND_RADIUS, SoundEvents, Wave},
     texture::{Texture, TextureImage},
 };
 
@@ -166,7 +166,7 @@ impl Shots {
         map: &Map,
         blasts: &mut Vec<Blast>,
         time: f32,
-        sounds: &mut Vec<Arc<Wave>>,
+        sounds: &mut SoundEvents,
     ) {
         let fronts: Vec<_> = self
             .effects
@@ -232,7 +232,7 @@ impl Shots {
         index: usize,
         damage: u16,
         time: f32,
-        sounds: &mut Vec<Arc<Wave>>,
+        sounds: &mut SoundEvents,
     ) -> Option<Blast> {
         let shot = &mut self.projectiles[index];
         if shot.kind.bio() {
@@ -259,7 +259,7 @@ impl Shots {
         pawn: Option<&TrainingTarget>,
         time: f32,
         dt: f32,
-        sounds: &mut Vec<Arc<Wave>>,
+        sounds: &mut SoundEvents,
         blasts: &mut Vec<Blast>,
     ) {
         let mut impacts = Vec::new();
@@ -443,7 +443,7 @@ impl Shots {
         time: f32,
         detonate: bool,
         owner_alive: bool,
-        sounds: &mut Vec<Arc<Wave>>,
+        sounds: &mut SoundEvents,
     ) -> Option<Blast> {
         let index = self
             .projectiles
@@ -499,7 +499,7 @@ impl Shots {
         scale: f32,
         time: f32,
         variation: f32,
-        sounds: &mut Vec<Arc<Wave>>,
+        sounds: &mut SoundEvents,
     ) -> Option<Blast> {
         let art = &map.ordnance[kind as usize];
         if kind == Kind::GuidedWarhead {
@@ -605,7 +605,7 @@ impl Shots {
         player: Option<Vec3>,
         time: f32,
         dt: f32,
-        sounds: &mut Vec<Arc<Wave>>,
+        sounds: &mut SoundEvents,
         blasts: &mut Vec<Blast>,
     ) {
         self.update_with_target(map, player, None, time, dt, sounds, blasts);
@@ -618,7 +618,7 @@ impl Shots {
         mut target: Option<&mut TrainingTarget>,
         time: f32,
         dt: f32,
-        sounds: &mut Vec<Arc<Wave>>,
+        sounds: &mut SoundEvents,
         blasts: &mut Vec<Blast>,
     ) {
         self.effects
@@ -630,7 +630,12 @@ impl Shots {
         for effect in self.effects.iter().filter(|effect| {
             effect.nuclear && time >= effect.born + 0.5 && time - dt < effect.born + 0.5
         }) {
-            sounds.extend(map.ordnance[effect.kind as usize].sound.iter().cloned());
+            sounds.extend_at(
+                map.ordnance[effect.kind as usize].sound.iter().cloned(),
+                effect.position,
+                BLAST_SOUND_RADIUS,
+                1.0,
+            );
         }
         let mut fragments = Vec::new();
         self.intercept_projectiles(map, target.as_deref(), time, dt, sounds, blasts);
@@ -828,7 +833,12 @@ impl Shots {
             if kind == Kind::Grenade {
                 let velocity = (shot.velocity - normal * (2.0 * shot.velocity.dot(normal))) * 0.75;
                 if shot.velocity.dot(shot.velocity) > 10_000.0 {
-                    sounds.extend(art.contact.iter().cloned());
+                    sounds.extend_at(
+                        art.contact.iter().cloned(),
+                        point,
+                        CONTACT_SOUND_RADIUS,
+                        1.0,
+                    );
                 }
                 shot.velocity = if velocity.2 > 400.0 {
                     Vec3(velocity.0, velocity.1, (400.0 + velocity.2) * 0.5)
@@ -852,7 +862,12 @@ impl Shots {
                 }
                 shot.direction = unit(shot.velocity);
                 if shot.wall_hits == 1 {
-                    sounds.extend(art.contact.iter().cloned());
+                    sounds.extend_at(
+                        art.contact.iter().cloned(),
+                        point,
+                        CONTACT_SOUND_RADIUS,
+                        1.0,
+                    );
                 }
                 true
             } else if kind.bio() {
@@ -881,7 +896,12 @@ impl Shots {
                     self.marks
                         .push((kind, contact, normal, shot.base.map(|(index, _)| index)));
                 }
-                sounds.extend(art.contact.iter().cloned());
+                sounds.extend_at(
+                    art.contact.iter().cloned(),
+                    point,
+                    CONTACT_SOUND_RADIUS,
+                    1.0,
+                );
                 true
             } else {
                 if kind == Kind::FlakShell {
@@ -1203,7 +1223,7 @@ fn shoot_down(
     art: &Art,
     effects: &mut Vec<Effect>,
     time: f32,
-    sounds: &mut Vec<Arc<Wave>>,
+    sounds: &mut SoundEvents,
 ) -> Blast {
     effects.push(Effect {
         kind: shot.kind,
@@ -1215,8 +1235,12 @@ fn shoot_down(
         nuclear: false,
         struck: [false; 2],
     });
-    sounds.extend(art.contact.iter().cloned());
-    sounds.extend(art.sound.iter().cloned());
+    sounds.extend_at(
+        art.contact.iter().chain(&art.sound).cloned(),
+        shot.position,
+        BLAST_SOUND_RADIUS,
+        1.0,
+    );
     Blast::radial(
         shot.position,
         350.0,
@@ -1229,7 +1253,7 @@ fn explode(
     shot: &Projectile,
     art: &Art,
     effects: &mut Vec<Effect>,
-    sounds: &mut Vec<Arc<Wave>>,
+    sounds: &mut SoundEvents,
     time: f32,
 ) -> Option<Blast> {
     explode_at(shot, art, effects, sounds, time, Vec3(0.0, 0.0, 16.0))
@@ -1239,14 +1263,24 @@ fn explode_at(
     shot: &Projectile,
     art: &Art,
     effects: &mut Vec<Effect>,
-    sounds: &mut Vec<Arc<Wave>>,
+    sounds: &mut SoundEvents,
     time: f32,
     wave_offset: Vec3,
 ) -> Option<Blast> {
-    sounds.extend(art.sound.iter().cloned());
+    sounds.extend_at(
+        art.sound.iter().cloned(),
+        shot.position,
+        BLAST_SOUND_RADIUS,
+        1.0,
+    );
     let kind = shot.kind;
     let position = if kind.warhead() {
-        sounds.extend(art.contact.iter().cloned());
+        sounds.extend_at(
+            art.contact.iter().cloned(),
+            shot.position,
+            BLAST_SOUND_RADIUS,
+            1.0,
+        );
         shot.position + wave_offset
     } else {
         shot.position
@@ -1355,7 +1389,7 @@ mod tests {
             (Kind::Warhead, 1.0),
         ] {
             let mut shots = Shots::default();
-            let mut sounds = Vec::new();
+            let mut sounds = SoundEvents::default();
             let mut blasts = Vec::new();
             shots.fire(
                 &map,
@@ -1440,7 +1474,7 @@ mod tests {
             pitch: 0.0,
         };
         let mut shots = Shots::default();
-        let mut sounds = Vec::new();
+        let mut sounds = SoundEvents::default();
         let mut blasts = Vec::new();
         shots.fire(
             &map,
@@ -1511,7 +1545,7 @@ mod tests {
             yaw: 0.0,
             pitch: 0.0,
         };
-        let mut sounds = Vec::new();
+        let mut sounds = SoundEvents::default();
         for armed in [false, true] {
             let mut shots = Shots::default();
             let mut blasts = Vec::new();
@@ -1629,7 +1663,7 @@ mod tests {
                     .add_box(Vec3(250.0, -200.0, -200.0), Vec3(270.0, 200.0, 300.0));
             }
             let mut shots = Shots::default();
-            let mut sounds = Vec::new();
+            let mut sounds = SoundEvents::default();
             shots.fire(
                 &map,
                 &camera,
@@ -1699,7 +1733,7 @@ mod tests {
         }
         map.collision = Collision::read(&[], std::iter::empty(), &[]).unwrap();
         let mut game = Practice::new(&map);
-        let mut sounds = Vec::new();
+        let mut sounds = SoundEvents::default();
         game.ordnance.fire(
             &map,
             &camera,
@@ -1763,7 +1797,7 @@ mod tests {
                     .add_box(Vec3(155.0, -200.0, -200.0), Vec3(165.0, 200.0, 300.0));
             }
             let mut shots = Shots::default();
-            let mut sounds = Vec::new();
+            let mut sounds = SoundEvents::default();
             for x in [100.0, 210.0, 320.0] {
                 shots.fire(
                     &map,
@@ -1798,7 +1832,7 @@ mod tests {
         }
         map.collision = Collision::read(&[], std::iter::empty(), &[]).unwrap();
         let mut shots = Shots::default();
-        let mut sounds = Vec::new();
+        let mut sounds = SoundEvents::default();
         for x in [100.0, 400.0, 700.0, 1000.0] {
             shots.fire(
                 &map,
@@ -1849,7 +1883,7 @@ mod tests {
             pitch: -std::f32::consts::FRAC_PI_2,
         };
         let mut shots = Shots::default();
-        let mut sounds = Vec::new();
+        let mut sounds = SoundEvents::default();
         let mut blasts = Vec::new();
         shots.fire(
             &map,
@@ -1972,7 +2006,7 @@ mod tests {
             map.collision = Collision::read(&[], std::iter::empty(), &[]).unwrap();
             map.collision.add_box(min, max);
             let mut shots = Shots::default();
-            let mut sounds = Vec::new();
+            let mut sounds = SoundEvents::default();
             let mut blasts = Vec::new();
             shots.fire(
                 &map,
@@ -2014,7 +2048,7 @@ mod tests {
         }
         map.collision = Collision::read(&[], std::iter::empty(), &[]).unwrap();
         let mut shots = Shots::default();
-        let mut sounds = Vec::new();
+        let mut sounds = SoundEvents::default();
         let mut blasts = Vec::new();
         shots.fire(
             &map,
@@ -2061,7 +2095,7 @@ mod tests {
                 game.weapon = weapon;
                 game.weapon_state = WeaponState::Ready;
                 game.ammo[weapon.ammo_pool()] = 20;
-                let mut sounds = Vec::new();
+                let mut sounds = SoundEvents::default();
                 game.ordnance.fire(
                     &map,
                     &camera,
@@ -2115,7 +2149,7 @@ mod tests {
         map.collision = Collision::read(&[], std::iter::empty(), &[]).unwrap();
         for kind in [Kind::Rocket, Kind::Pulse, Kind::Chunk, Kind::Razor] {
             let mut shots = Shots::default();
-            let mut sounds = Vec::new();
+            let mut sounds = SoundEvents::default();
             let mut blasts = Vec::new();
             shots.fire(
                 &map,
@@ -2204,7 +2238,7 @@ mod tests {
             pitch: 0.0,
         };
         let mut shots = Shots::default();
-        let mut sounds = Vec::new();
+        let mut sounds = SoundEvents::default();
         let mut blasts = Vec::new();
         shots.fire(
             &map,
@@ -2310,7 +2344,7 @@ mod tests {
             pitch: 0.0,
         };
         let forward = camera.forward();
-        let mut sounds = Vec::new();
+        let mut sounds = SoundEvents::default();
         let mut blasts = Vec::new();
         let mut shots = Shots::default();
         shots.fire(

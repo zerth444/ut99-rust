@@ -3,7 +3,7 @@ use crate::{
     map::{Map, Vec3},
     mover::unit,
     render::Camera,
-    sound::Wave,
+    sound::{BLAST_SOUND_RADIUS, CONTACT_SOUND_RADIUS, SoundEvents, Wave},
     texture::{Texture, TextureImage},
 };
 use std::sync::Arc;
@@ -244,7 +244,7 @@ impl Shots {
         alternate: bool,
         now: f32,
         ammo: &mut u16,
-        sounds: &mut Vec<Arc<Wave>>,
+        sounds: &mut SoundEvents,
         pawn: Option<&mut super::TrainingTarget>,
         ordnance: &mut super::ordnance::Shots,
     ) -> Option<Blast> {
@@ -265,8 +265,13 @@ impl Shots {
                     direction,
                     born: now,
                 });
-                sounds.extend(assets.hit_sound.iter().cloned());
-                sounds.extend(blast_sound(assets));
+                sounds.extend_at(
+                    assets.hit_sound.iter().cloned(),
+                    point,
+                    CONTACT_SOUND_RADIUS,
+                    1.0,
+                );
+                sounds.extend_at(blast_sound(assets), point, BLAST_SOUND_RADIUS, 1.0);
                 return Some(Blast::new(point, assets, false));
             }
             self.bolts.push(Bolt {
@@ -311,7 +316,12 @@ impl Shots {
                 direction,
                 born: now,
             });
-            sounds.extend(assets.combo_sound.iter().cloned());
+            sounds.extend_at(
+                assets.combo_sound.iter().cloned(),
+                bolt.position,
+                BLAST_SOUND_RADIUS,
+                1.0,
+            );
             blast = Some(Blast::new(bolt.position, assets, true));
             start + delta * fraction
         } else if let Some((index, fraction)) = projectile
@@ -348,7 +358,7 @@ impl Shots {
         map: &Map,
         dt: f32,
         now: f32,
-        sounds: &mut Vec<Arc<Wave>>,
+        sounds: &mut SoundEvents,
         pawn: Option<&super::TrainingTarget>,
         ordnance: &mut super::ordnance::Shots,
     ) -> Vec<Blast> {
@@ -389,8 +399,13 @@ impl Shots {
                     direction: bolt.direction,
                     born: now,
                 });
-                sounds.extend(assets.hit_sound.iter().cloned());
-                sounds.extend(blast_sound(assets));
+                sounds.extend_at(
+                    assets.hit_sound.iter().cloned(),
+                    position,
+                    CONTACT_SOUND_RADIUS,
+                    1.0,
+                );
+                sounds.extend_at(blast_sound(assets), position, BLAST_SOUND_RADIUS, 1.0);
                 return false;
             }
             let hit = pawn
@@ -404,8 +419,13 @@ impl Shots {
                     direction: bolt.direction,
                     born: now,
                 });
-                sounds.extend(assets.hit_sound.iter().cloned());
-                sounds.extend(blast_sound(assets));
+                sounds.extend_at(
+                    assets.hit_sound.iter().cloned(),
+                    point,
+                    CONTACT_SOUND_RADIUS,
+                    1.0,
+                );
+                sounds.extend_at(blast_sound(assets), point, BLAST_SOUND_RADIUS, 1.0);
                 blasts.push(Blast::new(point, assets, false));
                 false
             } else {
@@ -627,10 +647,11 @@ mod tests {
         assert_ne!(bolt_frame.pixels, without_bolt.pixels);
         game.shock = effects;
         let sounds = game.update(&mut map, &camera, 0.01, input(true, false), false, None);
-        assert!(sounds.iter().any(|sound| Arc::ptr_eq(sound, &combo_sound)));
         assert!(game.shock.bolts.is_empty());
         assert_eq!(game.ammo(), Some(16));
         assert!(matches!(game.shock.rings[0].impact, Impact::Combo));
+        let sound_offset = sounds.position_of(&combo_sound).unwrap() - game.shock.rings[0].position;
+        assert!(sound_offset.dot(sound_offset) < 0.001);
         game.update(&mut map, &camera, 0.12, input(false, false), false, None);
         let mut combo_frame = Frame::new();
         combo_frame.draw_practice(&map, &camera, game.time, &game);
@@ -649,7 +670,7 @@ mod tests {
             born: game.time,
         });
         let mut ammo = 2;
-        let mut sounds = Vec::new();
+        let mut sounds = SoundEvents::default();
         assert!(
             game.shock
                 .fire(
@@ -666,7 +687,7 @@ mod tests {
         );
         assert_eq!(game.shock.bolts.len(), 1);
         assert_eq!(ammo, 2);
-        assert!(!sounds.iter().any(|sound| Arc::ptr_eq(sound, &combo_sound)));
+        assert!(!sounds.waves().any(|sound| Arc::ptr_eq(sound, &combo_sound)));
         assert!(matches!(
             game.shock.rings.last().unwrap().impact,
             Impact::Beam
