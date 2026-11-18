@@ -355,6 +355,82 @@ impl Frame {
         view
     }
 
+    pub fn draw_deathmatch(
+        &mut self,
+        map: &Map,
+        camera: &Camera,
+        game: &crate::game::deathmatch::Match,
+        fov: f32,
+    ) {
+        self.zoom = (0.5 * fov.to_radians()).tan().recip();
+        self.draw(map, camera, game.time);
+        self.layer(Layer::Effects);
+        let view = self.camera_view(camera);
+        for (id, fighter) in game.fighters.iter().enumerate().skip(1) {
+            let motion = fighter
+                .fell_at
+                .map_or(&map.player_idle, |_| &map.player_deaths[id % 3]);
+            let duration = motion.duration();
+            if duration <= 0.0 {
+                continue;
+            }
+            let age = fighter.fell_at.map_or_else(
+                || game.time.rem_euclid(duration),
+                |death| (game.time - death).min((duration - 0.001).max(0.0)),
+            );
+            if let Some(pose) = motion.sample(age) {
+                let model = view.in_model(
+                    fighter.walker.position,
+                    Vec3(fighter.yaw.cos(), fighter.yaw.sin(), 0.0),
+                    1.0,
+                );
+                self.draw_faces_in_view(pose.current, &model, game.time, false, Some(pose), None);
+            }
+        }
+        for trace in &game.traces {
+            self.effect(
+                camera,
+                crate::game::Effect {
+                    origin: trace.start,
+                    end: trace.end,
+                    color: if trace.blast { 0xf07130 } else { 0xffdf84 },
+                    expires: game.time,
+                },
+            );
+        }
+        for position in game.bolts() {
+            self.effect(
+                camera,
+                crate::game::Effect {
+                    origin: position,
+                    end: position,
+                    color: 0xff9933,
+                    expires: game.time,
+                },
+            );
+        }
+        self.zoom = 1.0;
+        let player = &game.fighters[0];
+        if player.health > 0 && !game.finished {
+            if let Some(weapon) = map.arsenal.get(&crate::game::Weapon::Enforcer) {
+                let pose = weapon.primary_motion.sample(game.time - player.fired_at);
+                let faces = pose
+                    .as_ref()
+                    .map_or(weapon.view.as_slice(), |pose| pose.current);
+                self.layer(Layer::Weapon);
+                self.depth.fill(0.0);
+                let view = View::camera(&Camera {
+                    position: Vec3::default(),
+                    yaw: 0.0,
+                    pitch: 0.0,
+                });
+                self.draw_faces_in_view(faces, &view, game.time, false, pose, None);
+            }
+            self.layer(Layer::Hud);
+            self.draw_crosshair();
+        }
+    }
+
     pub fn draw_practice(
         &mut self,
         map: &Map,

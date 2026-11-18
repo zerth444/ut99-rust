@@ -19,6 +19,107 @@ impl Hud {
         }
     }
 
+    pub fn draw_deathmatch(
+        &self,
+        frame: &mut Frame,
+        game: &crate::game::deathmatch::Match,
+        scoreboard: bool,
+        captured: bool,
+    ) {
+        use crate::game::deathmatch::Match;
+        frame.begin_ui(false);
+        let scale = (frame.width as f32 / 1280.0).clamp(0.65, 1.6);
+        let player = &game.fighters[0];
+        let remaining = game.remaining();
+        let white = [0.92, 0.96, 1.0];
+        let accent = [0.42, 0.87, 0.95];
+        self.text(
+            frame,
+            16,
+            12,
+            scale,
+            &format!(
+                "DEATHMATCH   {:02}:{:02}   FRAGS {}",
+                remaining / 60,
+                remaining % 60,
+                player.score
+            ),
+            accent,
+        );
+        self.text(
+            frame,
+            16,
+            frame.height as i32 - (36.0 * scale) as i32,
+            scale,
+            &format!(
+                "HEALTH {}   ARMOR {}   AMMO {}",
+                player.health, player.armor, player.ammo
+            ),
+            white,
+        );
+        if scoreboard || game.finished {
+            let standings = game.standings();
+            let w = (440.0 * scale) as i32;
+            let row = (25.0 * scale) as i32;
+            let h = row * (standings.len() as i32 + 4);
+            let x = (frame.width as i32 - w) / 2;
+            let y = (frame.height as i32 - h) / 2;
+            frame.solid([x, y, w, h], [0.06, 0.10, 0.15]);
+            let top = standings[0];
+            let tied = standings
+                .get(1)
+                .is_some_and(|&id| game.fighters[id].score == game.fighters[top].score);
+            let title = if game.finished {
+                if tied {
+                    "MATCH DRAWN".into()
+                } else {
+                    format!("{} WINS", Match::label(top))
+                }
+            } else {
+                "SCOREBOARD".into()
+            };
+            self.centered(frame, y + row / 2, scale, &title, accent);
+            self.centered(
+                frame,
+                y + 2 * row,
+                scale,
+                "FIGHTER       FRAGS  DEATHS",
+                white,
+            );
+            for (index, id) in standings.into_iter().enumerate() {
+                let fighter = &game.fighters[id];
+                let line = format!(
+                    "{:<12} {:>5} {:>7}",
+                    Match::label(id),
+                    fighter.score,
+                    fighter.deaths
+                );
+                self.centered(
+                    frame,
+                    y + row * (3 + index as i32),
+                    scale,
+                    &line,
+                    if id == 0 { accent } else { white },
+                );
+            }
+            if game.finished {
+                self.centered(frame, y + h + row / 2, scale, "ENTER TO PLAY AGAIN", white);
+            }
+        } else if player.health == 0 {
+            self.centered(frame, frame.height as i32 / 2, scale, "RESPAWNING", white);
+        } else if !captured {
+            self.centered(
+                frame,
+                frame.height as i32 / 2,
+                scale,
+                "CLICK TO CAPTURE MOUSE",
+                white,
+            );
+        } else if let Some(message) = game.notice() {
+            self.centered(frame, (42.0 * scale) as i32, scale, message, accent);
+        }
+    }
+
     pub fn draw(
         &self,
         frame: &mut Frame,

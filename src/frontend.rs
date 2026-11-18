@@ -159,6 +159,7 @@ impl MenuArt {
 pub enum Action {
     None,
     Play,
+    Deathmatch,
     Quit,
     Changed,
 }
@@ -332,6 +333,10 @@ impl Pulldown {
                     "Start a practice session on Deck16][.",
                 ),
                 ("Quit", "Exit Unreal Tournament."),
+                (
+                    "Deathmatch with Bots",
+                    "Start an offline match with three bots.",
+                ),
             ],
             Self::Options => &[("Preferences", "Configure settings.")],
             Self::Help => &[("Context Help", "Show help for the selected menu item.")],
@@ -454,6 +459,7 @@ impl Menu {
         self.pulldown = None;
         match section {
             Pulldown::Game if item == 0 => Action::Play,
+            Pulldown::Game if item == 2 && !self.resume => Action::Deathmatch,
             Pulldown::Game => {
                 self.quit = Some(true);
                 Action::None
@@ -1328,6 +1334,11 @@ mod tests {
         assert!(menu.key(VK_RETURN, &mut settings) == Action::Quit);
 
         menu.quit = None;
+        menu.click(size, 70, 8, VK_LBUTTON, &mut settings);
+        menu.key(VK_DOWN, &mut settings);
+        menu.key(VK_DOWN, &mut settings);
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::Deathmatch);
+
         menu.click(size, 180, 8, VK_LBUTTON, &mut settings);
         assert!(menu.click(size, 180, 25, VK_LBUTTON, &mut settings) == Action::Changed);
         assert!(!settings.context_help);

@@ -59,6 +59,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     no_sound,
                     &demo,
                     true,
+                    None,
                 )?);
             }
         }
@@ -73,7 +74,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     if !matches!(
         command.to_str(),
-        Some("inspect" | "map-info" | "view" | "play" | "capture" | "capture-practice")
+        Some(
+            "inspect"
+                | "map-info"
+                | "view"
+                | "play"
+                | "deathmatch"
+                | "capture"
+                | "capture-practice"
+        )
     ) {
         return Err(io::Error::other("Unknown command. Run with --help.").into());
     }
@@ -90,6 +99,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let start = if command == "view"
         || command == "play"
+        || command == "deathmatch"
         || command == "capture"
         || command == "capture-practice"
     {
@@ -105,6 +115,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(0)
     } else {
         0
+    };
+    let rules = if command == "deathmatch" {
+        let mut option = |label: &str, default: u16, max: u16| -> io::Result<u16> {
+            args.next()
+                .map(|value| {
+                    value
+                        .to_str()
+                        .and_then(|value| value.parse::<u16>().ok())
+                        .filter(|value| (1..=max).contains(value))
+                        .ok_or_else(|| {
+                            io::Error::other(format!("{label} must be between 1 and {max}"))
+                        })
+                })
+                .transpose()
+                .map(|value| value.unwrap_or(default))
+        };
+        let defaults = game::deathmatch::Rules::default();
+        Some(game::deathmatch::Rules {
+            bots: usize::from(option("Bot count", defaults.bots as u16, 8)?),
+            frag_limit: option("Frag limit", defaults.frag_limit as u16, 100)? as i16,
+            seconds: option("Time limit in seconds", defaults.seconds, 3600)?,
+        })
+    } else {
+        None
     };
     if args.next().is_some() {
         return Err(io::Error::other("Unexpected argument").into());
@@ -195,7 +229,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 frame.draw(&map, &camera, 0.0);
             }
             frame.save_bmp(Path::new(&output))?;
-        } else if command == "view" || command == "play" {
+        } else if command == "view" || command == "play" || command == "deathmatch" {
             #[cfg(windows)]
             window::show(
                 &mut map,
@@ -205,6 +239,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 no_sound,
                 path,
                 command == "play",
+                rules,
             )?;
             #[cfg(not(windows))]
             return Err(io::Error::other("Interactive view currently requires Windows").into());
@@ -226,6 +261,9 @@ fn print_usage() {
     println!("ut99-rust map-info <map.unr>");
     println!("ut99-rust [--obs] [--nosound] view <map.unr> [player-start]");
     println!("ut99-rust [--obs] [--nosound] play <map.unr> [player-start]");
+    println!(
+        "ut99-rust [--obs] [--nosound] deathmatch <map.unr> [player-start] [bots] [frag-limit] [seconds]"
+    );
     println!("ut99-rust capture <map.unr> <output.bmp> [player-start]");
     println!("ut99-rust capture-practice <map.unr> <output.bmp> [player-start]");
 }

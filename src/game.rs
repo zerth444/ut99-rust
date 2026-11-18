@@ -6,6 +6,7 @@ use crate::render::Camera;
 use crate::sound::{CONTACT_SOUND_RADIUS, SoundEvents, Wave};
 
 pub mod ballistics;
+pub mod deathmatch;
 pub mod decals;
 pub mod ordnance;
 pub mod shock;

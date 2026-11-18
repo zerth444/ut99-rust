@@ -18,7 +18,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::collision::{MotionEvents, Walker};
 use crate::frontend::{Action, Frontend, Menu};
-use crate::game::{Input, Practice};
+use crate::game::{Input, Practice, deathmatch};
 use crate::hud::Hud;
 use crate::map::{Map, Vec3};
 use crate::present::Presenter;
@@ -34,6 +34,7 @@ pub fn show(
     no_sound: bool,
     path: &Path,
     startup: bool,
+    match_rules: Option<deathmatch::Rules>,
 ) -> io::Result<()> {
     let settings_path = path
         .parent()
@@ -84,6 +85,7 @@ pub fn show(
             frontend.as_mut(),
             &mut settings,
             &settings_path,
+            match_rules,
         )
     }
 }
@@ -130,6 +132,7 @@ unsafe fn message_loop(
     mut frontend: Option<&mut Frontend>,
     settings: &mut Settings,
     settings_path: &Path,
+    mut match_rules: Option<deathmatch::Rules>,
 ) -> io::Result<()> {
     let mut frame = Frame::hardware(map);
     let hud = Hud::new();
@@ -175,7 +178,7 @@ unsafe fn message_loop(
         ShowWindow(window, SW_SHOW);
     }
     if let Some(frontend) = frontend.as_deref_mut() {
-        if !run_frontend(
+        match run_frontend(
             window,
             map,
             frontend,
@@ -188,7 +191,9 @@ unsafe fn message_loop(
             obs,
             false,
         )? {
-            return Ok(());
+            Action::Deathmatch => match_rules = Some(deathmatch::Rules::default()),
+            Action::Quit => return Ok(()),
+            _ => {}
         }
         if let Some(audio) = &mut audio {
             audio.set_track(map.music.as_ref());
@@ -200,6 +205,8 @@ unsafe fn message_loop(
     let started = Instant::now();
     let mut tick = started;
     let mut stats = FrameStats::new(started);
+    let mut deathmatch = match_rules.map(|rules| deathmatch::Match::new(map, start, rules));
+    let mut restart_match = false;
 
     unsafe {
         loop {
@@ -208,6 +215,72 @@ unsafe fn message_loop(
             while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
                 if message.message == WM_QUIT {
                     return Ok(());
+                }
+                if deathmatch.is_some() && message.hwnd == window {
+                    if mouse.captured
+                        && let Some(button) = mouse_button(&message, false)
+                    {
+                        primary |= button == settings.bindings[6];
+                        alternate |= button == settings.bindings[7];
+                    }
+                    match message.message {
+                        WM_KILLFOCUS => mouse.release(),
+                        WM_SIZE if message.wParam == SIZE_MINIMIZED as usize => mouse.release(),
+                        WM_SIZE | WM_MOVE if mouse.captured => mouse.clip(),
+                        WM_INPUT if mouse.captured => {
+                            if let Some((x, y)) = raw_motion(message.lParam) {
+                                raw.0 = raw.0.saturating_add(x);
+                                raw.1 = raw.1.saturating_add(y);
+                            }
+                        }
+                        WM_LBUTTONDOWN if !mouse.captured => mouse.capture(),
+                        WM_KEYDOWN if message.lParam & (1 << 30) == 0 => {
+                            match message.wParam as u16 {
+                                VK_RETURN => restart_match = true,
+                                VK_ESCAPE if let Some(frontend) = frontend.as_deref_mut() => {
+                                    mouse.release();
+                                    if run_frontend(
+                                        window,
+                                        map,
+                                        frontend,
+                                        &hud,
+                                        &mut presenter,
+                                        &mut audio,
+                                        settings,
+                                        settings_path,
+                                        &mut windowed,
+                                        obs,
+                                        true,
+                                    )? == Action::Quit
+                                    {
+                                        return Ok(());
+                                    }
+                                    tick = Instant::now();
+                                    raw = (0, 0);
+                                    primary = false;
+                                    alternate = false;
+                                    if GetForegroundWindow() == window {
+                                        mouse.capture();
+                                    }
+                                }
+                                VK_ESCAPE if mouse.captured => mouse.release(),
+                                VK_ESCAPE => {
+                                    DestroyWindow(window);
+                                    return Ok(());
+                                }
+                                VK_F11 => {
+                                    toggle_borderless(window, &mut windowed);
+                                    settings.fullscreen = windowed.is_some();
+                                    save_settings(settings, settings_path);
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                    continue;
                 }
                 if message.hwnd == window {
                     let can_fire = mouse.captured || game.death.is_some();
@@ -248,7 +321,7 @@ unsafe fn message_loop(
                     match key {
                         VK_ESCAPE if let Some(frontend) = frontend.as_deref_mut() => {
                             mouse.release();
-                            if !run_frontend(
+                            if run_frontend(
                                 window,
                                 map,
                                 frontend,
@@ -260,7 +333,8 @@ unsafe fn message_loop(
                                 &mut windowed,
                                 obs,
                                 true,
-                            )? {
+                            )? == Action::Quit
+                            {
                                 return Ok(());
                             }
                             frame = Frame::hardware(map);
@@ -352,6 +426,75 @@ unsafe fn message_loop(
             let input_dt = (now - tick).as_secs_f32().min(0.06);
             let dt = input_dt * settings.game_speed as f32 / 100.0;
             tick = now;
+            if let Some(game) = &mut deathmatch {
+                let active = GetForegroundWindow() == window && IsIconic(window) == 0;
+                let [forward, back, left, right, jump, _, fire, alt_fire] = settings.bindings;
+                let restart = std::mem::take(&mut restart_match);
+                let shoot = std::mem::take(&mut primary);
+                let secondary = std::mem::take(&mut alternate);
+                if active {
+                    let (dx, dy) = if mouse.captured {
+                        mouse.motion(raw)
+                    } else {
+                        (0, 0)
+                    };
+                    let sensitivity = 0.0027 * settings.sensitivity as f32 / 100.0;
+                    let pitch_sign = if settings.invert_mouse { 1.0 } else { -1.0 };
+                    let command = deathmatch::Command {
+                        movement: [axis(forward, back), axis(right, left)],
+                        jump: key(jump),
+                        primary: shoot || ((mouse.captured || fire > 6) && key(fire)),
+                        alternate: secondary || ((mouse.captured || alt_fire > 6) && key(alt_fire)),
+                        restart,
+                        look: [
+                            dx as f32 * sensitivity + axis(VK_RIGHT, VK_LEFT) * input_dt * 2.2,
+                            dy as f32 * sensitivity * pitch_sign
+                                + axis(VK_UP, VK_DOWN) * input_dt * 1.8,
+                        ],
+                    };
+                    let events = game.step(map, command, dt);
+                    if let Some(audio) = &mut audio {
+                        audio.play_events(events);
+                    }
+                }
+                let view = game.fighters[0].camera(map);
+                if let Some(audio) = &mut audio {
+                    audio.set_volume(settings.effects_volume, settings.music_volume);
+                    audio.update(&map.ambient, view.position, view.right(), !active, false);
+                }
+                let mut client = RECT::default();
+                if IsIconic(window) == 0
+                    && GetClientRect(window, &mut client) != 0
+                    && client.right > 0
+                    && client.bottom > 0
+                {
+                    let size = (client.right as u32, client.bottom as u32);
+                    let presenter = match &mut presenter {
+                        Some(presenter) => presenter,
+                        slot @ None => {
+                            slot.insert(Presenter::new(window, size, obs).map_err(|error| {
+                                io::Error::other(format!("Creating match swap chain: {error}"))
+                            })?)
+                        }
+                    };
+                    (frame.width, frame.height) = (size.0 as usize, size.1 as usize);
+                    frame.draw_deathmatch(map, &view, game, settings.field_of_view as f32);
+                    hud.draw_deathmatch(&mut frame, game, active && key(VK_TAB), mouse.captured);
+                    if !presenter
+                        .draw(
+                            size,
+                            frame.commands.as_mut().expect("GPU frame"),
+                            settings.vsync,
+                        )
+                        .map_err(|error| io::Error::other(format!("Presenting match: {error}")))?
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                continue;
+            }
             game.base_fov = settings.field_of_view as f32;
             game.hud_scale = settings.hud_scale as f32 / 100.0;
             game.show_decals = settings.show_decals;
@@ -631,7 +774,7 @@ fn run_frontend(
     windowed: &mut Option<WINDOWPLACEMENT>,
     obs: bool,
     resume: bool,
-) -> io::Result<bool> {
+) -> io::Result<Action> {
     let mut intro = (!resume && settings.intro)
         .then(|| frontend.intro.take())
         .flatten();
@@ -673,7 +816,7 @@ fn run_frontend(
             let mut skip = false;
             while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
                 if message.message == WM_QUIT {
-                    return Ok(false);
+                    return Ok(Action::Quit);
                 }
                 if message.hwnd == window {
                     let previous_menu = menu.state();
@@ -734,10 +877,10 @@ fn run_frontend(
                         frontend.play_menu_sound(audio, sound);
                     }
                     match action {
-                        Action::Play => return Ok(true),
+                        Action::Play | Action::Deathmatch => return Ok(action),
                         Action::Quit => {
                             DestroyWindow(window);
-                            return Ok(false);
+                            return Ok(Action::Quit);
                         }
                         Action::Changed => {
                             if previous_display.0 != settings.fullscreen

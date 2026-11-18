@@ -77,6 +77,7 @@ pub struct Map {
     pub(crate) smoke: crate::frontend::smoke::Smoke,
     pub faces: Vec<Face>,
     pub starts: Vec<Start>,
+    pub navigation_points: Vec<Vec3>,
     pub collision: Collision,
     pub sky_origin: Option<Vec3>,
     pub ambient: Vec<crate::sound::Emitter>,
@@ -169,8 +170,22 @@ impl Map {
         collision.profile = player;
         let teleporters = crate::teleport::load(package, &actors)?;
         let mut starts = Vec::new();
+        let mut navigation_points = Vec::new();
         for actor in actors {
-            if package.object_name(actor.class) != Some("PlayerStart") {
+            let class = package.object_name(actor.class);
+            if matches!(
+                class,
+                Some("PathNode" | "LiftCenter" | "LiftExit" | "InventorySpot" | "NavigationPoint")
+            ) {
+                let mut properties = package.properties(actor)?;
+                while let Some((name, mut value)) = properties.next()? {
+                    if name == "Location" {
+                        navigation_points.push(Vec3::read(&mut value)?);
+                        break;
+                    }
+                }
+            }
+            if class != Some("PlayerStart") {
                 continue;
             }
             let mut properties = package.properties(actor)?;
@@ -230,6 +245,7 @@ impl Map {
             },
             faces,
             starts,
+            navigation_points,
             collision,
             sky_origin,
             ambient,

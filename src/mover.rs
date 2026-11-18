@@ -147,13 +147,35 @@ impl Mover {
     }
 
     pub fn tick(&mut self, world: &mut Collision, walker: &mut Walker, dt: f32) {
+        self.tick_many(world, &mut [walker], dt);
+    }
+
+    pub(crate) fn reset_motion(&mut self, world: &mut Collision) {
+        self.offset = Vec3::default();
+        self.fraction = 0.0;
+        self.countdown = 0.0;
+        self.opening = false;
+        self.ready = true;
+        if let Some(hull) = self.hull {
+            world.set_box(hull, self.min, self.max);
+        }
+    }
+
+    pub fn tick_many(&mut self, world: &mut Collision, walkers: &mut [&mut Walker], dt: f32) {
         let min = self.min + self.offset;
         let max = self.max + self.offset;
-        let rider = self.hull.is_some() && walker.on_box(min, max);
+        let on_board = |walker: &Walker| self.hull.is_some() && walker.on_box(min, max);
         let requested = match self.activation {
-            Activation::Stand => rider,
-            Activation::Bump => self.hull.is_some() && walker.touches_box(min, max, 1.0),
-            Activation::Trigger => self.triggers.iter().any(|trigger| trigger.touches(walker)),
+            Activation::Stand => walkers.iter().any(|walker| on_board(walker)),
+            Activation::Bump => {
+                self.hull.is_some()
+                    && walkers
+                        .iter()
+                        .any(|walker| walker.touches_box(min, max, 1.0))
+            }
+            Activation::Trigger => walkers
+                .iter()
+                .any(|walker| self.triggers.iter().any(|trigger| trigger.touches(walker))),
             Activation::Unsupported => false,
         };
         if self.fraction == 0.0 {
@@ -184,22 +206,31 @@ impl Mover {
         if let Some(id) = self.hull {
             let new_min = self.min + offset;
             let new_max = self.max + offset;
-            if !rider && walker.touches_box(new_min, new_max, -0.5) {
+            if walkers
+                .iter()
+                .any(|walker| !on_board(walker) && walker.touches_box(new_min, new_max, -0.5))
+            {
                 self.opening = !self.opening;
                 return;
             }
-            if rider {
-                let position = walker.position;
-                world.set_box(id, new_min, new_max);
+            let riders: Vec<_> = walkers
+                .iter()
+                .enumerate()
+                .filter(|(_, walker)| on_board(walker))
+                .map(|(index, walker)| (index, walker.position))
+                .collect();
+            world.set_box(id, new_min, new_max);
+            for &(index, position) in &riders {
+                let walker = &mut walkers[index];
                 walker.carry(world, delta);
                 let displacement = walker.position - position;
                 if (displacement - delta).dot(displacement - delta) > 1.0 {
                     world.set_box(id, min, max);
-                    walker.position = position;
+                    for (index, position) in riders {
+                        walkers[index].position = position;
+                    }
                     return;
                 }
-            } else {
-                world.set_box(id, new_min, new_max);
             }
         }
         self.offset = offset;
