@@ -370,12 +370,35 @@ impl Frame {
         let view = self.camera_view(camera);
         for (id, fighter) in game.fighters.iter().enumerate().skip(1) {
             if let Some(pose) = fighter.pose(map, id, game.time) {
+                let cloak = fighter.health > 0
+                    && fighter.invis_left(game.time) > 0.0
+                    && game.time - fighter.fired_at > 0.42;
+                let skin = if cloak {
+                    let Some(skin) = map.powerups.invis_skin.as_deref() else {
+                        continue;
+                    };
+                    Some(skin)
+                } else if fighter.health > 0 && fighter.amp_left(game.time) > 0.0 {
+                    map.powerups.amp_skin.as_deref()
+                } else {
+                    None
+                };
                 let model = view.in_model(
                     fighter.walker.position,
                     Vec3(fighter.yaw.cos(), fighter.yaw.sin(), 0.0),
                     1.0,
                 );
-                self.draw_faces_in_view(pose.current, &model, game.time, false, Some(pose), None);
+                self.draw_lit_faces(
+                    pose.current,
+                    &model,
+                    game.time,
+                    false,
+                    Some(pose),
+                    skin.map(|_| 1.0),
+                    &[],
+                    None,
+                    skin,
+                );
             }
         }
         for trace in &game.traces {
@@ -452,7 +475,22 @@ impl Frame {
                     yaw: 0.0,
                     pitch: 0.0,
                 });
-                self.draw_faces_in_view(faces, &view, game.time, false, pose, None);
+                let skin = if player.amp_left(game.time) > 0.0 {
+                    map.powerups.amp_skin.as_deref()
+                } else {
+                    None
+                };
+                self.draw_lit_faces(
+                    faces,
+                    &view,
+                    game.time,
+                    false,
+                    pose,
+                    skin.map(|_| 1.0),
+                    &[],
+                    None,
+                    skin,
+                );
             }
             self.layer(Layer::Hud);
             self.draw_crosshair();

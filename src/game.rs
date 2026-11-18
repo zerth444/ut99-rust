@@ -358,6 +358,49 @@ impl ArmorKind {
             Self::Thigh => 50,
         }
     }
+
+    fn pickup_charge(self, armor: &[u16; 3]) -> u16 {
+        let available = if matches!(self, Self::Belt) {
+            150
+        } else {
+            150 - armor[Self::Belt as usize]
+        };
+        available.min(self.charge())
+    }
+
+    fn pickup(self, armor: &mut [u16; 3]) -> Option<u16> {
+        let charge = self.pickup_charge(armor);
+        let gained = charge
+            .checked_sub(armor[self as usize])
+            .filter(|&gain| gain != 0)?;
+        if matches!(self, Self::Belt) {
+            armor.fill(0);
+        }
+        armor[self as usize] = charge;
+        Some(gained)
+    }
+}
+
+fn absorb_damage(armor: &mut [u16; 3], mut damage: u16) -> (u16, bool) {
+    let mut shield = false;
+    for kind in ArmorKind::ALL {
+        let charge = &mut armor[kind as usize];
+        let absorbed = (*charge).min((u32::from(damage) * kind.absorption() / 100) as u16);
+        *charge -= absorbed;
+        damage -= absorbed;
+        shield |= matches!(kind, ArmorKind::Belt) && absorbed > 0;
+    }
+    (damage, shield)
+}
+
+fn landing_damage(speed: f32, jump_speed: f32) -> u16 {
+    if speed > 1650.0 + jump_speed {
+        1000
+    } else if speed >= 750.0 + jump_speed {
+        (0.15 * (speed - 700.0 - jump_speed)) as u16
+    } else {
+        0
+    }
 }
 
 pub struct Effect {
@@ -980,14 +1023,10 @@ impl Practice {
     }
 
     pub fn fall_damage(&mut self, speed: f32, jump_speed: f32) {
-        let damage = if speed > 1650.0 + jump_speed {
-            1000
-        } else if speed >= 750.0 + jump_speed {
-            (0.15 * (speed - 700.0 - jump_speed)) as u16
-        } else {
-            return;
-        };
-        self.splash_damage(damage);
+        let damage = landing_damage(speed, jump_speed);
+        if damage > 0 {
+            self.splash_damage(damage);
+        }
     }
 
     pub fn begin_death(&mut self, position: Vec3, yaw: f32, map: &Map) -> Option<Arc<Wave>> {
@@ -1073,20 +1112,10 @@ impl Practice {
                 format!("HEALTH +{}", self.health - previous)
             }
             Item::Armor(kind) => {
-                let current = self.armor_charge(kind);
-                let available = match kind {
-                    ArmorKind::Belt => 150,
-                    _ => 150 - self.armor_charge(ArmorKind::Belt),
-                };
-                let charge = available.min(kind.charge());
-                if charge <= current {
+                let Some(gained) = kind.pickup(&mut self.armor) else {
                     return false;
-                }
-                if matches!(kind, ArmorKind::Belt) {
-                    self.armor.fill(0);
-                }
-                self.armor[kind as usize] = charge;
-                format!("ARMOR +{}", charge - current)
+                };
+                format!("ARMOR +{gained}")
             }
             Item::Power(Powerup::Boots, charge) => {
                 self.boot_charges = self.boot_charges.max(charge);
@@ -1815,16 +1844,11 @@ impl Practice {
         true
     }
 
-    fn splash_damage(&mut self, mut damage: u16) {
-        for kind in ArmorKind::ALL {
-            let charge = &mut self.armor[kind as usize];
-            let absorbed = (*charge).min((u32::from(damage) * kind.absorption() / 100) as u16);
-            *charge -= absorbed;
-            damage -= absorbed;
-            if matches!(kind, ArmorKind::Belt) && absorbed > 0 {
-                self.shield_flash_until = self.time + 0.16;
-                self.shield_hit_pending = true;
-            }
+    fn splash_damage(&mut self, damage: u16) {
+        let (damage, shield) = absorb_damage(&mut self.armor, damage);
+        if shield {
+            self.shield_flash_until = self.time + 0.16;
+            self.shield_hit_pending = true;
         }
         self.health_damage(damage);
     }

@@ -55,7 +55,7 @@ impl Hud {
             &format!(
                 "HEALTH {}   ARMOR {}   {}   {}",
                 player.health,
-                player.armor,
+                player.armor(),
                 player.weapon.label(),
                 player
                     .ammo()
@@ -63,6 +63,26 @@ impl Hud {
             ),
             white,
         );
+        let mut active = Vec::new();
+        if player.boot_charges() > 0 {
+            active.push(format!("BOOTS {}", player.boot_charges()));
+        }
+        if player.amp_left(game.time) > 0.0 {
+            active.push(format!("AMP {:.0}S", player.amp_left(game.time).ceil()));
+        }
+        if player.invis_left(game.time) > 0.0 {
+            active.push(format!("CLOAK {:.0}S", player.invis_left(game.time).ceil()));
+        }
+        if !active.is_empty() {
+            self.text(
+                frame,
+                16,
+                frame.height as i32 - (61.0 * scale) as i32,
+                scale,
+                &active.join("   "),
+                accent,
+            );
+        }
         if scoreboard || game.finished {
             let standings = game.standings();
             let w = (440.0 * scale) as i32;
