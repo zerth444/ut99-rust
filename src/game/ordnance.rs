@@ -1314,26 +1314,40 @@ pub(super) fn guided_velocity(previous: Vec3, aim: Vec3, dt: f32, roll: &mut f32
 pub(super) const FLAK_SHELL_IMPACT: (f32, f32) = (0.5, 2.0);
 pub(super) const ROCKET_IMPACT: (f32, f32) = (0.7, 1.4);
 
-fn projectile_damage(shot: &Projectile, art: &Art, center: Vec3) -> (u16, Vec3) {
-    if shot.kind == Kind::Chunk && shot.velocity.dot(shot.velocity) <= 200.0 * 200.0 {
+pub(super) fn direct_damage(
+    kind: Kind,
+    velocity: Vec3,
+    hit: Vec3,
+    center: Vec3,
+    damage: u16,
+    momentum: f32,
+) -> (u16, Vec3) {
+    if kind == Kind::Chunk && velocity.dot(velocity) <= 200.0 * 200.0 {
         return (0, Vec3::default());
     }
+    let damage = if kind == Kind::Razor && hit.2 - center.2 > 0.62 * crate::collision::PLAYER_HEIGHT
+    {
+        (3.5 * f32::from(damage)) as u16
+    } else {
+        damage
+    };
+    (damage, unit(velocity) * momentum)
+}
+
+fn projectile_damage(shot: &Projectile, art: &Art, center: Vec3) -> (u16, Vec3) {
     let damage = art.damage.unwrap_or(match shot.kind {
         Kind::Pulse => 20.0,
         Kind::Razor => 30.0,
         Kind::Chunk => 16.0,
         _ => 0.0,
     });
-    let damage = if shot.kind == Kind::Razor
-        && shot.position.2 - center.2 > 0.62 * crate::collision::PLAYER_HEIGHT
-    {
-        damage * 3.5
-    } else {
-        damage
-    };
-    (
+    direct_damage(
+        shot.kind,
+        shot.velocity,
+        shot.position,
+        center,
         damage as u16,
-        unit(shot.velocity) * art.momentum.unwrap_or(10_000.0),
+        art.momentum.unwrap_or(10_000.0),
     )
 }
 

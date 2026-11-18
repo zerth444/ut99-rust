@@ -93,7 +93,14 @@ mod tests {
             let mut frame = Frame::hardware(map);
             (frame.width, frame.height) = (320, 200);
             if is_match {
-                frame.draw_deathmatch(map, &game.player_view(map), &game, 90.0, clock.body_blend());
+                frame.draw_deathmatch(
+                    map,
+                    &game.player_view(map),
+                    &game,
+                    90.0,
+                    clock.body_blend(),
+                    false,
+                );
             } else {
                 frame.draw(map, &Camera::from_start(map.starts[0]), 0.0);
             }

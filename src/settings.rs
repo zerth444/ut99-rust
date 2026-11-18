@@ -34,6 +34,9 @@ pub struct Settings {
     pub game_speed: u32,
     pub view_bob: u32,
     pub bot_difficulty: u32,
+    pub bot_count: u32,
+    pub frag_limit: u32,
+    pub match_minutes: u32,
     pub gui_skin: usize,
     pub field_of_view: u32,
     pub hud_scale: u32,
@@ -58,6 +61,9 @@ impl Default for Settings {
             game_speed: 100,
             view_bob: 4,
             bot_difficulty: 2,
+            bot_count: 3,
+            frag_limit: 10,
+            match_minutes: 5,
             gui_skin: 0,
             field_of_view: 90,
             hud_scale: 100,
@@ -98,6 +104,9 @@ impl Settings {
                 "game_speed" => settings.game_speed = value.clamp(50, 200),
                 "view_bob" => settings.view_bob = value.min(8),
                 "bot_difficulty" => settings.bot_difficulty = value.clamp(1, 3),
+                "bot_count" => settings.bot_count = value.clamp(1, 8),
+                "frag_limit" => settings.frag_limit = value.clamp(1, 100),
+                "match_minutes" => settings.match_minutes = value.clamp(1, 60),
                 "gui_skin" => settings.gui_skin = (value as usize).min(GUI_SKINS.len() - 1),
                 "fov" => settings.field_of_view = value.clamp(75, 120),
                 "hud_scale" => settings.hud_scale = value.clamp(50, 150),
@@ -159,13 +168,28 @@ impl Settings {
             self.sensitivity,
             u8::from(self.invert_mouse),
         );
+        use std::fmt::Write;
+        let _ = writeln!(
+            text,
+            "bot_count={}\nfrag_limit={}\nmatch_minutes={}",
+            self.bot_count, self.frag_limit, self.match_minutes
+        );
         for (index, key) in self.bindings.iter().enumerate() {
-            use std::fmt::Write;
             let _ = writeln!(text, "bind{index}={key}");
         }
         let pending = path.with_extension("ini.tmp");
         fs::write(&pending, text)?;
         fs::rename(pending, path)
+    }
+
+    pub(crate) fn match_rules(&self) -> crate::game::deathmatch::Rules {
+        use crate::game::deathmatch::{Difficulty, Rules};
+        Rules {
+            bots: self.bot_count as usize,
+            frag_limit: self.frag_limit as i16,
+            seconds: self.match_minutes as u16 * 60,
+            difficulty: Difficulty::from_level(self.bot_difficulty),
+        }
     }
 }
 
@@ -207,11 +231,16 @@ mod tests {
         settings.game_speed = 145;
         settings.view_bob = 7;
         settings.bot_difficulty = 3;
+        settings.bot_count = 5;
+        settings.frag_limit = 25;
+        settings.match_minutes = 12;
         settings.bind(0, b'I' as u16);
         settings.bind(6, 2);
         settings.save(&path).unwrap();
         let saved = Settings::load(&path).unwrap();
         fs::remove_file(path).unwrap();
         assert_eq!(settings, saved);
+        let rules = saved.match_rules();
+        assert_eq!((rules.bots, rules.frag_limit, rules.seconds), (5, 25, 720));
     }
 }

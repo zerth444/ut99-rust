@@ -307,6 +307,7 @@ pub struct Walker {
     bob_time: f32,
     landing_bob: f32,
     applied_bob: f32,
+    stair_offset: f32,
     next_step: usize,
     dodging: bool,
     dodge_recovery: f32,
@@ -326,6 +327,7 @@ impl Walker {
             bob_time: 0.0,
             landing_bob: 0.0,
             applied_bob: 0.0,
+            stair_offset: 0.0,
             next_step: 0,
             dodging: false,
             dodge_recovery: 0.0,
@@ -408,6 +410,10 @@ impl Walker {
         self.position + UP * (height + vertical) + right * lateral
     }
 
+    pub fn stair_offset(&self) -> f32 {
+        self.stair_offset
+    }
+
     pub fn advance(
         &mut self,
         world: &Collision,
@@ -450,7 +456,10 @@ impl Walker {
         };
         for _ in 0..steps {
             let zone = world.regions.at(self.position);
+            let damping = (-10.0 * step).exp();
+            self.stair_offset *= damping;
             if zone.water {
+                self.stair_offset = 0.0;
                 self.grounded = false;
                 self.dodging = false;
                 let intent = limit(swim, 1.0);
@@ -555,9 +564,12 @@ impl Walker {
                 self.velocity.1 = actual.1 - flow.1;
             }
             if self.grounded
-                && let Some(floor) = world.floor(self.position, 5.0)
+                && let Some(floor) = world.floor(self.position, profile.step_height.max(5.0))
             {
                 self.position = self.position - UP * floor;
+                let height_change = self.position.2 - origin.2;
+                self.stair_offset = (self.stair_offset - height_change * damping)
+                    .clamp(-profile.step_height, profile.step_height);
                 continue;
             }
             if self.grounded {
@@ -759,5 +771,36 @@ mod tests {
             walker.position
         );
         assert!(walker.position.1 > 120.0, "{:?}", walker.position);
+    }
+
+    #[test]
+    fn stairs_smooth_eye_height_in_both_directions_without_altering_the_hull() {
+        let mut world = Collision::test_world();
+        world.add_box(Vec3(-400.0, -200.0, -50.0), Vec3(400.0, 200.0, 0.0));
+        world.add_box(Vec3(75.0, -200.0, 0.0), Vec3(300.0, 200.0, 18.0));
+        for (start, direction) in [(0.0, 1.0), (135.0, -1.0)] {
+            let mut walker = Walker::spawn(
+                &world,
+                Vec3(start, 0.0, if start == 0.0 { 39.0 } else { 57.0 }),
+            );
+            let base = walker.position.2;
+            let mut stair = false;
+            for _ in 0..130 {
+                let before = walker.position.2;
+                let eye = before + walker.stair_offset();
+                let events =
+                    walker.advance(&world, Vec3(90.0 * direction, 0.0, 0.0), None, 1.0 / 120.0);
+                if (walker.position.2 - before).abs() > 10.0 {
+                    assert!(walker.grounded && events.landing.is_none());
+                    assert!((walker.position.2 + walker.stair_offset() - eye).abs() < 2.0);
+                    stair = true;
+                }
+            }
+            assert!(stair && (walker.position.2 - base - 18.0 * direction).abs() < 0.15);
+            for _ in 0..100 {
+                walker.advance(&world, Vec3::default(), None, 1.0 / 120.0);
+            }
+            assert!(walker.stair_offset().abs() < 0.02);
+        }
     }
 }

@@ -215,8 +215,8 @@ pub(super) fn shot(weapon: Weapon, alt: bool) -> Shot {
         (Weapon::Hammer, false) => trace(44, 0.58, 0, 96.0),
         (Weapon::Hammer, true) => trace(28, 0.34, 0, 78.0),
         (Weapon::Enforcer, _) => bullet(),
-        (Weapon::Bio, false) => missile(28, 0.36, 1, Gel, 44.0, 0.72, 0),
-        (Weapon::Bio, true) => missile(42, 0.88, 1, Glob, 76.0, 0.8, 0),
+        (Weapon::Bio, false) => missile(20, 0.36, 1, Gel, 150.0, 0.72, 0),
+        (Weapon::Bio, true) => missile(75, 0.88, 1, Glob, 75.0, 0.8, 0),
         (Weapon::Shock, _) => Shot {
             damage: 40,
             interval: super::super::shock::fallback_cooldown(alt),
@@ -224,10 +224,10 @@ pub(super) fn shot(weapon: Weapon, alt: bool) -> Shot {
             guided: false,
             path: Path::Shock,
         },
-        (Weapon::Pulse, false) => missile(16, 0.15, 1, Pulse, 0.0, 0.0, 0),
+        (Weapon::Pulse, false) => missile(20, 0.15, 1, Pulse, 0.0, 0.0, 0),
         (Weapon::Pulse, true) => trace(12, 0.24, 1, super::PulseBeam::RANGE),
-        (Weapon::Ripper, false) => missile(33, 0.41, 1, Razor, 0.0, 0.0, 3),
-        (Weapon::Ripper, true) => missile(42, 0.58, 1, RazorAlt, 115.0, 0.0, 0),
+        (Weapon::Ripper, false) => missile(30, 0.41, 1, Razor, 0.0, 0.0, 3),
+        (Weapon::Ripper, true) => missile(34, 0.58, 1, RazorAlt, 180.0, 0.0, 0),
         (Weapon::Minigun, _) => bullet(),
         (Weapon::Flak, false) => missile(
             16,
@@ -242,8 +242,8 @@ pub(super) fn shot(weapon: Weapon, alt: bool) -> Shot {
             let (radius, damage, _) = super::super::ordnance::FLAK_SHELL_BLAST;
             missile(damage as u16, 0.92, 1, FlakShell, radius, 1.0, 0)
         }
-        (Weapon::Rocket, false) => missile(83, 0.92, 1, Rocket, 207.0, 0.0, 0),
-        (Weapon::Rocket, true) => missile(80, 0.98, 1, Grenade, 190.0, 0.87, 2),
+        (Weapon::Rocket, false) => missile(75, 0.92, 1, Rocket, 220.0, 0.0, 0),
+        (Weapon::Rocket, true) => missile(80, 0.98, 1, Grenade, 200.0, 0.87, 2),
         (Weapon::Sniper, false) => bullet(),
         (Weapon::Sniper, true) => Shot {
             damage: 0,

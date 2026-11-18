@@ -362,6 +362,7 @@ impl Frame {
         game: &crate::game::deathmatch::Match,
         fov: f32,
         body_blend: f32,
+        scoreboard: bool,
     ) {
         let player = &game.fighters[0];
         let piloting = game.guidance_left().is_some();
@@ -564,7 +565,7 @@ impl Frame {
             }
         }
         self.layer(Layer::Hud);
-        if game.finished {
+        if game.finished || scoreboard {
             return;
         }
         if self.draw_guidance_hud(

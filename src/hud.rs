@@ -2,7 +2,7 @@ use std::ptr::null_mut;
 use windows_sys::Win32::{Foundation::RECT, Graphics::Gdi::*};
 
 use crate::{
-    game::{Practice, Weapon, deathmatch::Match},
+    game::{ArmorKind, Item, Powerup, Practice, Weapon, deathmatch::Match},
     map::Map,
     render::Frame,
     texture::TextureImage,
@@ -42,7 +42,7 @@ impl Hud {
             .arsenal
             .get(&Weapon::Redeemer)
             .is_some_and(|weapon| weapon.guided_hud[0].is_some());
-        let scale = (frame.width as f32 / 1280.0).clamp(0.65, 1.6);
+        let scale = (game.hud_scale * frame.width as f32 / 1280.0).clamp(0.55, 1.6);
         let player = &game.fighters[0];
         let remaining = game.remaining();
         let white = [0.92, 0.96, 1.0];
@@ -61,6 +61,16 @@ impl Hud {
             )
         };
         self.text(frame, 16, 12, scale, &clock, accent);
+        for (line, message) in game.notices().enumerate() {
+            self.text(
+                frame,
+                16,
+                60 + (line as f32 * 22.0 * scale) as i32,
+                scale,
+                message,
+                white,
+            );
+        }
         if !has_art {
             self.text(
                 frame,
@@ -94,7 +104,7 @@ impl Hud {
                 frame,
                 16,
                 if has_art {
-                    (66.0 * scale) as i32
+                    60 + (4.0 * 22.0 * scale) as i32
                 } else {
                     frame.height as i32 - (61.0 * scale) as i32
                 },
@@ -161,8 +171,14 @@ impl Hud {
                 [0.96, 0.83, 0.45],
             );
         }
-        if player.health == 0 {
-            self.centered(frame, frame.height as i32 / 2, scale, "RESPAWNING", white);
+        if let Some(seconds) = game.respawn_left() {
+            self.centered(
+                frame,
+                frame.height as i32 / 2,
+                scale,
+                &format!("Respawn in {seconds:.1}s"),
+                white,
+            );
         } else if !captured {
             self.centered(
                 frame,
@@ -171,8 +187,19 @@ impl Hud {
                 "CLICK TO CAPTURE MOUSE",
                 white,
             );
-        } else if let Some(message) = game.notice() {
-            self.centered(frame, (42.0 * scale) as i32, scale, message, accent);
+        } else if let Some(item) = game.pickup_notice() {
+            let name = match item {
+                Item::Gun(weapon) => weapon.label().to_owned(),
+                Item::Ammo(weapon, _) => format!("{} ammo", weapon.label()),
+                Item::Health(..) => "Health".to_owned(),
+                Item::Armor(ArmorKind::Belt) => "Shield Belt".to_owned(),
+                Item::Armor(ArmorKind::Chest) => "Body Armor".to_owned(),
+                Item::Armor(ArmorKind::Thigh) => "Thigh Pads".to_owned(),
+                Item::Power(Powerup::Boots, _) => "Jump Boots".to_owned(),
+                Item::Power(Powerup::Damage, _) => "Damage Amplifier".to_owned(),
+                Item::Power(Powerup::Invisibility, _) => "Invisibility".to_owned(),
+            };
+            self.centered(frame, (112.0 * scale) as i32, scale, &name, accent);
         }
     }
 

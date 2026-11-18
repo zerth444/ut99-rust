@@ -356,7 +356,15 @@ const CONTROLS: [&str; 8] = [
 ];
 const INPUT: [&str; 2] = ["Mouse Sensitivity", "Invert Mouse"];
 const HUD: [&str; 1] = ["HUD Scale"];
-const GAME: [&str; 4] = ["Dodging", "Game Speed", "View Bob", "Bot Difficulty"];
+const GAME: [&str; 7] = [
+    "Dodging",
+    "Game Speed",
+    "View Bob",
+    "Bot Difficulty",
+    "Bot Count",
+    "Frag Limit",
+    "Time Limit",
+];
 const TOP_ITEMS: [i32; 5] = [0, 56, 103, 159, 201];
 const MENU_ROW: i32 = 18;
 
@@ -404,7 +412,7 @@ impl Pulldown {
                 ("Quit", "Exit Unreal Tournament."),
                 (
                     "Deathmatch with Bots",
-                    "Start an offline match with three bots.",
+                    "Start an offline match with the configured rules.",
                 ),
             ],
             Self::Options => &[("Preferences", "Configure settings.")],
@@ -818,6 +826,9 @@ impl Menu {
             (5, 1) => adjust(&mut settings.game_speed, 5, 50, 200),
             (5, 2) => adjust(&mut settings.view_bob, 1, 0, 8),
             (5, 3) => adjust(&mut settings.bot_difficulty, 1, 1, 3),
+            (5, 4) => adjust(&mut settings.bot_count, 1, 1, 8),
+            (5, 5) => adjust(&mut settings.frag_limit, 1, 1, 100),
+            (5, 6) => adjust(&mut settings.match_minutes, 1, 1, 60),
             _ => return Action::None,
         }
         Action::Changed
@@ -1115,6 +1126,9 @@ impl Menu {
                 crate::game::deathmatch::Difficulty::from_level(settings.bot_difficulty)
                     .label()
                     .into(),
+                settings.bot_count.to_string(),
+                settings.frag_limit.to_string(),
+                format!("{} min", settings.match_minutes),
             ],
         };
         for (index, (caption, value)) in self.rows().iter().zip(values).enumerate() {

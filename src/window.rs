@@ -197,10 +197,7 @@ unsafe fn message_loop(
                     start = 6.min(map.starts.len() - 1);
                     frame = Frame::hardware(map);
                 }
-                match_rules = Some(deathmatch::Rules {
-                    difficulty: deathmatch::Difficulty::from_level(settings.bot_difficulty),
-                    ..deathmatch::Rules::default()
-                })
+                match_rules = Some(settings.match_rules())
             }
             Action::Quit => return Ok(()),
             _ => {}
@@ -311,13 +308,7 @@ unsafe fn message_loop(
                                                 deathmatch = Some(deathmatch::Match::new(
                                                     map,
                                                     start,
-                                                    deathmatch::Rules {
-                                                        difficulty:
-                                                            deathmatch::Difficulty::from_level(
-                                                                settings.bot_difficulty,
-                                                            ),
-                                                        ..deathmatch::Rules::default()
-                                                    },
+                                                    settings.match_rules(),
                                                 ));
                                             }
                                             _ => {
@@ -597,7 +588,12 @@ unsafe fn message_loop(
                     match_clock.clear();
                     last_direction = None;
                 }
-                let view = game.player_view(map);
+                let blend = if active && mouse.captured && !game.finished {
+                    match_clock.body_blend()
+                } else {
+                    1.0
+                };
+                let view = game.render_view(map, blend, 0.004 * settings.view_bob as f32);
                 if let Some(audio) = &mut audio {
                     audio.set_weapon_loop(game.weapon_loop(map));
                     audio.set_world_loops(game.world_loops(map));
@@ -628,20 +624,17 @@ unsafe fn message_loop(
                     (frame.width, frame.height) = (size.0 as usize, size.1 as usize);
                     game.hud_scale = settings.hud_scale as f32 / 100.0;
                     game.show_decals = settings.show_decals;
-                    let blend = if active && mouse.captured && !game.finished {
-                        match_clock.body_blend()
-                    } else {
-                        1.0
-                    };
-                    frame.draw_deathmatch(map, &view, game, settings.field_of_view as f32, blend);
-                    hud.draw_deathmatch(
-                        &mut frame,
-                        game,
+                    let scoreboard = active && key(VK_TAB);
+                    frame.draw_deathmatch(
                         map,
-                        active && key(VK_TAB),
-                        mouse.captured,
+                        &view,
+                        game,
+                        settings.field_of_view as f32,
+                        blend,
+                        scoreboard,
                     );
-                    if settings.show_fps {
+                    hud.draw_deathmatch(&mut frame, game, map, scoreboard, mouse.captured);
+                    if settings.show_fps && !scoreboard && !game.finished {
                         let label = stats.label(window, size, presenter.software);
                         hud.text(&mut frame, 16, 35, 0.8, &label, [0.72, 0.95, 0.78]);
                     }
@@ -887,7 +880,17 @@ unsafe fn message_loop(
                 };
                 frame.width = size.0 as usize;
                 frame.height = size.1 as usize;
-                frame.draw_practice(map, &camera, game.time, &game);
+                let mut visual_camera = Camera { ..camera };
+                if !fly {
+                    let delta = Vec3(0.0, 0.0, walker.stair_offset());
+                    visual_camera.position = map
+                        .collision
+                        .ray_surface(camera.position, delta)
+                        .map_or(camera.position + delta, |(point, normal)| {
+                            point + normal * 0.5
+                        });
+                }
+                frame.draw_practice(map, &visual_camera, game.time, &game);
                 let track = map
                     .music
                     .as_ref()

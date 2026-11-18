@@ -575,6 +575,7 @@ pub struct PulseBeam {
 }
 
 impl PulseBeam {
+    const DAMAGE_PER_SECOND: f32 = 72.0;
     const RANGE: f32 = 810.0;
 
     fn trace(map: &Map, camera: &Camera, started: f32) -> Self {
@@ -1675,13 +1676,13 @@ impl Practice {
             let mut damage = 0;
             if !self.pulse_contact {
                 let initial = (0.5 * (self.time - self.pulse_last_contact)).min(0.1);
-                damage = (72.0 * initial) as u16;
+                damage = (PulseBeam::DAMAGE_PER_SECOND * initial) as u16;
             }
             self.pulse_contact = true;
             self.pulse_last_contact = self.time;
             self.pulse_contact_time += dt;
             if self.pulse_contact_time > 0.22 {
-                damage += (72.0 * self.pulse_contact_time) as u16;
+                damage += (PulseBeam::DAMAGE_PER_SECOND * self.pulse_contact_time) as u16;
                 self.pulse_contact_time = 0.0;
             }
             if let Some((index, _)) = projectile {
@@ -1699,7 +1700,7 @@ impl Practice {
         } else {
             if self.pulse_contact_time > 0.0 {
                 if let Some(target) = &mut self.target {
-                    target.damage((72.0 * self.pulse_contact_time) as u16);
+                    target.damage((PulseBeam::DAMAGE_PER_SECOND * self.pulse_contact_time) as u16);
                 }
                 self.pulse_contact_time = 0.0;
             }
