@@ -3,6 +3,7 @@ mod intro;
 pub(crate) mod smoke;
 
 use std::{
+    collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
     sync::Arc,
@@ -78,27 +79,17 @@ impl Frontend {
         let logo = load_logo()
             .map_err(|error| optional(&logo_path, error))
             .ok();
-        let mut match_maps: Vec<_> = fs::read_dir(maps)
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|value| value.eq_ignore_ascii_case("unr"))
-                    && path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.to_ascii_lowercase().starts_with("dm-"))
-                    && path.file_name() != map_path.file_name()
-            })
-            .collect();
-        match_maps.sort_by_key(|path| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().to_ascii_lowercase())
-        });
-        match_maps.insert(0, map_path.to_path_buf());
+        let installed = std::env::var_os("UT99_GAME_DIR")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
+        let reference_maps = maps.join("../../reference-client/Maps");
+        let installed_maps = installed.as_ref().map(|path| path.join("Maps"));
+        let match_maps = match_catalog(
+            map_path,
+            std::iter::once(maps)
+                .chain(installed_maps.as_deref())
+                .chain(std::iter::once(reference_maps.as_path())),
+        );
         Self {
             intro,
             logo,
@@ -140,6 +131,35 @@ impl Frontend {
         }
         Ok(None)
     }
+}
+
+fn match_catalog<'a>(base: &Path, directories: impl IntoIterator<Item = &'a Path>) -> Vec<PathBuf> {
+    let key = |path: &Path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+    };
+    let base_key = key(base);
+    let mut maps = BTreeMap::new();
+    for directory in directories {
+        for entry in fs::read_dir(directory)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+        {
+            let path = entry.path();
+            if let Some(name) = key(&path)
+                && name.starts_with("dm-")
+                && name.ends_with(".unr")
+                && base_key.as_deref() != Some(&name)
+                && path.is_file()
+            {
+                maps.entry(name).or_insert(path);
+            }
+        }
+    }
+    std::iter::once(base.to_path_buf())
+        .chain(maps.into_values())
+        .collect()
 }
 
 impl MenuArt {
@@ -1419,6 +1439,69 @@ mod tests {
         assert!(menu.commit_match_settings(&mut settings));
         let rules = settings.match_rules();
         assert_eq!((rules.bots, rules.frag_limit, rules.seconds), (0, 0, 0));
+    }
+
+    #[test]
+    #[ignore = "requires the local GOTY and reference-client map installations"]
+    fn installed_deathmatch_catalog_loads_and_simulates_each_arena() {
+        use crate::game::deathmatch::{Command, Match, Rules};
+
+        let bundled = Path::new("local/goty/Maps");
+        let reference = Path::new("local/reference-client/Maps");
+        let base = bundled.join("DM-Deck16][.unr");
+        assert!(base.is_file() && reference.is_dir());
+        let catalog = match_catalog(&base, [bundled, reference]);
+        assert_eq!(catalog[0], base);
+        assert!(catalog.len() >= 34);
+        assert!(catalog.contains(&bundled.join("DM-Liandri.unr")));
+        assert!(!catalog.contains(&reference.join("DM-Liandri.unr")));
+
+        for path in catalog {
+            let data = fs::read(&path).unwrap();
+            let package = Package::read(&data).unwrap();
+            let mut map = Map::load(&package, Some(&path))
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            assert!(
+                map.faces.iter().any(|face| face.texture.is_some()),
+                "{}",
+                path.display()
+            );
+            if matches!(
+                path.file_stem().and_then(|name| name.to_str()),
+                Some("DM-ArcaneTemple" | "DM-Morpheus" | "DM-SpaceNoxx")
+            ) {
+                assert!(
+                    map.faces.iter().all(|face| face.texture.is_some()),
+                    "{} has missing materials",
+                    path.display()
+                );
+            }
+            assert!(
+                map.hud.ready() && !map.arsenal.is_empty(),
+                "{}",
+                path.display()
+            );
+            let mut game = Match::new(
+                &map,
+                0,
+                Rules {
+                    bots: 1,
+                    ..Rules::default()
+                },
+            );
+            for _ in 0..180 {
+                game.step(&mut map, Command::default(), 1.0 / 120.0);
+            }
+            assert!(game.time >= 1.4 && !game.finished);
+            assert!(
+                game.fighters.iter().all(|fighter| {
+                    let crate::map::Vec3(x, y, z) = fighter.walker.position;
+                    x.is_finite() && y.is_finite() && z.is_finite()
+                }),
+                "{}",
+                path.display()
+            );
+        }
     }
 
     #[test]

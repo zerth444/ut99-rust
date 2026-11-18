@@ -8,6 +8,7 @@ pub struct Texture {
     rate: f32,
 }
 
+#[derive(Clone)]
 pub struct TextureImage {
     width: usize,
     height: usize,
@@ -176,31 +177,7 @@ impl Texture {
                 _ => {}
             }
         }
-        let image = if source > 0 {
-            let export = package
-                .exports
-                .get(source as usize - 1)
-                .ok_or_else(|| invalid("Invalid wet texture source"))?;
-            TextureImage::read(package, export)?
-        } else {
-            let (name, path) = import_path(package, source)
-                .ok_or_else(|| invalid("Missing wet texture source"))?;
-            let data = fs::read(
-                files
-                    .get(&name)
-                    .ok_or_else(|| invalid("Missing wet texture package"))?,
-            )?;
-            let source = Package::read(&data)?;
-            let export = source
-                .exports
-                .iter()
-                .find(|item| {
-                    source.object_name(item.class) == Some("Texture")
-                        && export_path(&source, item).as_ref() == Some(&path)
-                })
-                .ok_or_else(|| invalid("Missing wet texture image"))?;
-            TextureImage::read(&source, export)?
-        };
+        let image = read_source_image(package, source, files)?;
         if drops.is_empty() {
             return Ok(Self {
                 poly_flags,
@@ -274,6 +251,127 @@ impl Texture {
         })
     }
 
+    fn read_source_surface(
+        package: &Package<'_>,
+        export: &Export,
+        files: &HashMap<String, std::path::PathBuf>,
+        ice: bool,
+    ) -> io::Result<Self> {
+        let mut props = package.properties(export)?;
+        let mut source = 0;
+        let mut glass = 0;
+        let mut speed = [128; 2];
+        let mut amplitude = 0;
+        let mut poly_flags = 0;
+        while let Some(prop) = props.next_tag()? {
+            let mut value = prop.value;
+            match prop.name {
+                "SourceTexture" => source = value.compact()?,
+                "GlassTexture" => glass = value.compact()?,
+                "HorizPanSpeed" => speed[0] = value.byte()?,
+                "VertPanSpeed" => speed[1] = value.byte()?,
+                "Amplitude" => amplitude = value.byte()?,
+                "PolyFlags" => poly_flags = value.u32()?,
+                _ => {}
+            }
+        }
+        let source = read_source_image(package, source, files)?;
+        let mut frames = Vec::new();
+        if ice && let Ok(glass) = read_source_image(package, glass, files) {
+            for frame in 0..32 {
+                let angle = frame as f32 * std::f32::consts::TAU / 32.0;
+                let pan = [angle.sin(), angle.cos()].map(|component| component * 0.5);
+                let [du, dv] =
+                    std::array::from_fn(|axis| pan[axis] * (f32::from(speed[axis]) - 128.0));
+                let mut image = source.clone();
+                for y in 0..source.height {
+                    for x in 0..source.width {
+                        let mask = |u: f32, v: f32| glass.sample(u, v, false).unwrap()[0];
+                        let (u, v) = (x as f32, y as f32);
+                        let scale = f32::from(amplitude) / 255.0;
+                        let sx = u + (mask(u + du, v + dv) - mask(u + du + 1.0, v + dv)) * scale;
+                        let sy = v + (mask(u + du, v + dv) - mask(u + du, v + dv + 1.0)) * scale;
+                        let sx = (sx.round() as isize).rem_euclid(source.width as isize) as usize;
+                        let sy = (sy.round() as isize).rem_euclid(source.height as isize) as usize;
+                        image.pixels[y * source.width + x] = source.pixels[sy * source.width + sx];
+                    }
+                }
+                frames.push(image);
+            }
+        }
+        if frames.is_empty() {
+            frames.push(source);
+        }
+        Ok(Self {
+            frames,
+            rate: 20.0,
+            poly_flags,
+        })
+    }
+
+    fn read_wave(package: &Package<'_>, export: &Export) -> io::Result<Self> {
+        let mut props = package.properties(export)?;
+        let (mut width, mut height, mut palette, mut poly_flags) = (0, 0, 0, 0);
+        let mut drops = Vec::new();
+        while let Some(prop) = props.next_tag()? {
+            let mut value = prop.value;
+            match prop.name {
+                "UClamp" => width = value.u32()? as usize,
+                "VClamp" => height = value.u32()? as usize,
+                "Palette" => palette = value.index()?,
+                "PolyFlags" => poly_flags = value.u32()?,
+                "Drops" if value.remaining.len() == 8 => {
+                    let bytes: [u8; 8] = value.take(8)?.try_into().unwrap();
+                    drops.push(bytes);
+                }
+                _ => {}
+            }
+        }
+        if !(1..=512).contains(&width) || !(1..=512).contains(&height) || drops.is_empty() {
+            return Err(invalid("Wave texture needs dimensions and emitters"));
+        }
+        let palette = read_palette(package, palette)?;
+        let mut frames = Vec::with_capacity(32);
+        for frame in 0..32 {
+            let phase = frame as f32 * std::f32::consts::TAU / 32.0;
+            let mut field = vec![106.0f32; width * height];
+            for &[_, strength, x, y, offset, _, _, period] in &drops {
+                let radius = 12 + i32::from(period) / 24;
+                for dy in -radius..=radius {
+                    for dx in -radius..=radius {
+                        let distance = (dx as f32).hypot(dy as f32);
+                        let falloff = 1.0 - distance / radius as f32;
+                        if falloff <= 0.0 {
+                            continue;
+                        }
+                        let px = (2 * i32::from(x) + dx).rem_euclid(width as i32) as usize;
+                        let py = (2 * i32::from(y) + dy).rem_euclid(height as i32) as usize;
+                        field[py * width + px] +=
+                            (distance * 0.78 - phase + f32::from(offset) / 40.0).sin()
+                                * falloff
+                                * f32::from(strength)
+                                * 0.065;
+                    }
+                }
+            }
+            frames.push(TextureImage {
+                width,
+                height,
+                pixels: field
+                    .into_iter()
+                    .map(|value| value.clamp(0.0, 255.0) as u8)
+                    .collect(),
+                palette: palette.clone(),
+                opaque: false,
+            });
+        }
+        Ok(Self {
+            frames,
+            rate: 20.0,
+            poly_flags,
+        })
+    }
+
     pub fn size(&self) -> (f32, f32) {
         self.frames[0].size()
     }
@@ -295,6 +393,37 @@ impl Texture {
         let frame = (progress * self.frames.len() as f32) as usize;
         &self.frames[frame.min(self.frames.len() - 1)]
     }
+}
+
+fn read_source_image(
+    package: &Package<'_>,
+    reference: i32,
+    files: &HashMap<String, std::path::PathBuf>,
+) -> io::Result<TextureImage> {
+    if reference > 0 {
+        let export = package
+            .exports
+            .get(reference as usize - 1)
+            .ok_or_else(|| invalid("Invalid texture source"))?;
+        return TextureImage::read(package, export);
+    }
+    let (package_name, path) =
+        import_path(package, reference).ok_or_else(|| invalid("Missing texture source"))?;
+    let bytes = fs::read(
+        files
+            .get(&package_name)
+            .ok_or_else(|| invalid("Missing source texture package"))?,
+    )?;
+    let package = Package::read(&bytes)?;
+    let export = package
+        .exports
+        .iter()
+        .find(|export| {
+            package.object_name(export.class) == Some("Texture")
+                && export_path(&package, export).as_ref() == Some(&path)
+        })
+        .ok_or_else(|| invalid("Missing source texture image"))?;
+    TextureImage::read(&package, export)
 }
 
 fn wrapped_distance(delta: f32, period: usize) -> f32 {
@@ -410,23 +539,6 @@ pub fn load_materials(
     path: &Path,
     references: impl Iterator<Item = i32>,
 ) -> HashMap<i32, Arc<Texture>> {
-    let mut textures = HashMap::new();
-    let mut imports = HashMap::<String, HashMap<i32, Vec<String>>>::new();
-    for reference in references {
-        if reference > 0 {
-            let export = &map.exports.get(reference as usize - 1);
-            if let Some(export) = export.filter(|item| {
-                matches!(map.object_name(item.class), Some("Texture" | "FireTexture"))
-            }) {
-                textures
-                    .entry(reference)
-                    .or_insert_with(|| Texture::read(map, export).ok().map(Arc::new));
-            }
-        } else if let Some((package, path)) = import_path(map, reference) {
-            imports.entry(package).or_default().insert(reference, path);
-        }
-    }
-
     let search_paths = path.parent().into_iter().flat_map(|folder| {
         [
             folder.to_path_buf(),
@@ -446,6 +558,31 @@ pub fn load_materials(
         })
         .collect();
 
+    let read = |package: &Package<'_>, item: &Export| {
+        let result = match package.object_name(item.class) {
+            Some("Texture" | "FireTexture") => Texture::read(package, item),
+            Some("WetTexture") => Texture::read_wet(package, item, &files),
+            Some("WaveTexture") => Texture::read_wave(package, item),
+            Some("IceTexture") => Texture::read_source_surface(package, item, &files, true),
+            Some("ScriptedTexture") => Texture::read_source_surface(package, item, &files, false),
+            _ => return None,
+        };
+        result.ok().map(Arc::new)
+    };
+    let mut textures = HashMap::new();
+    let mut imports = HashMap::<String, HashMap<i32, Vec<String>>>::new();
+    for reference in references {
+        if reference > 0 {
+            if let Some(export) = map.exports.get(reference as usize - 1) {
+                textures
+                    .entry(reference)
+                    .or_insert_with(|| read(map, export));
+            }
+        } else if let Some((package, path)) = import_path(map, reference) {
+            imports.entry(package).or_default().insert(reference, path);
+        }
+    }
+
     for (name, materials) in imports {
         let Some(bytes) = files.get(&name).and_then(|file| fs::read(file).ok()) else {
             continue;
@@ -454,20 +591,16 @@ pub fn load_materials(
             continue;
         };
         for (reference, path) in materials {
-            let export = package.exports.iter().find(|export| {
-                matches!(
-                    package.object_name(export.class),
-                    Some("Texture" | "WetTexture" | "FireTexture")
-                ) && export_path(&package, export).as_ref() == Some(&path)
+            let matching = package.exports.iter().filter(|export| {
+                package
+                    .name(export.name)
+                    .ok()
+                    .zip(path.first())
+                    .is_some_and(|(name, leaf)| name.eq_ignore_ascii_case(leaf))
+                    && export_path(&package, export).as_ref() == Some(&path)
             });
-            if let Some(texture) = export.and_then(|item| {
-                if package.object_name(item.class) == Some("WetTexture") {
-                    Texture::read_wet(&package, item, &files).ok()
-                } else {
-                    Texture::read(&package, item).ok()
-                }
-            }) {
-                textures.insert(reference, Some(Arc::new(texture)));
+            if let Some(texture) = matching.filter_map(|item| read(&package, item)).next() {
+                textures.insert(reference, Some(texture));
             }
         }
     }
