@@ -514,12 +514,13 @@ unsafe fn message_loop(
                     }
                 }
                 if !foot_zone.water
-                    && movement_audio.landing.is_some_and(|speed| {
-                        0.1 * (speed / map.collision.profile.jump_speed.max(1.0)).powi(2) > 0.01
-                    })
+                    && let Some(speed) = movement_audio.landing
                     && let Some(sound) = &map.player_audio.land
                 {
-                    audio.play(std::sync::Arc::clone(sound));
+                    let intensity = (speed / map.collision.profile.jump_speed.max(1.0)).powi(2);
+                    if intensity > 0.1 {
+                        audio.play_with_gain(std::sync::Arc::clone(sound), intensity.min(1.0));
+                    }
                 }
                 for sound in shots {
                     audio.play(sound);

@@ -168,8 +168,14 @@ impl Wave {
 pub struct Mixer {
     cursors: Vec<f64>,
     mix: Vec<[f32; 2]>,
-    voices: Vec<(Arc<Wave>, f64)>,
+    voices: Vec<Voice>,
     weapon_loop: Option<(Arc<Wave>, f64)>,
+}
+
+struct Voice {
+    wave: Arc<Wave>,
+    cursor: f64,
+    gain: f32,
 }
 
 impl Mixer {
@@ -182,6 +188,20 @@ impl Mixer {
         }
     }
 
+    fn play(&mut self, wave: Arc<Wave>, gain: f32) {
+        if !gain.is_finite() || gain <= 0.0 {
+            return;
+        }
+        if self.voices.len() == 24 {
+            self.voices.remove(0);
+        }
+        self.voices.push(Voice {
+            wave,
+            cursor: 0.0,
+            gain: gain * 0.6,
+        });
+    }
+
     pub fn fill(
         &mut self,
         output: &mut [i16],
@@ -189,6 +209,7 @@ impl Mixer {
         listener: Vec3,
         right: Vec3,
         muted: bool,
+        effects_gain: f32,
     ) {
         self.cursors.resize(emitters.len(), 0.0);
         self.mix.resize(output.len() / 2, [0.0; 2]);
@@ -232,7 +253,7 @@ impl Mixer {
                 *cursor = (*cursor + step) % count as f64;
             }
         }
-        self.voices.retain_mut(|(wave, cursor)| {
+        self.voices.retain_mut(|Voice { wave, cursor, gain }| {
             let step = f64::from(wave.rate) / f64::from(MIX_RATE);
             for frame in &mut self.mix {
                 let index = *cursor as usize;
@@ -240,18 +261,75 @@ impl Mixer {
                     return false;
                 };
                 let b = wave.samples.get(index + 1).copied().unwrap_or(a);
-                let sample = (a + (b - a) * cursor.fract() as f32) * 0.6;
+                let sample = (a + (b - a) * cursor.fract() as f32) * *gain;
                 if !muted {
                     frame[0] += sample;
                     frame[1] += sample;
                 }
                 *cursor += step;
             }
-            true
+            (*cursor as usize) < wave.samples.len()
         });
         for (sample, mixed) in output.iter_mut().zip(self.mix.iter().flatten()) {
-            *sample = (mixed.clamp(-1.0, 1.0) * 32767.0) as i16;
+            *sample = ((mixed * effects_gain).clamp(-1.0, 1.0) * 32767.0) as i16;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn voice_gain_is_applied_per_playback_and_survives_buffer_boundaries() {
+        let mut mixer = Mixer::new();
+        let wave = Arc::new(Wave {
+            samples: vec![1.0; 3],
+            rate: MIX_RATE,
+        });
+        mixer.play(wave.clone(), 0.25);
+        mixer.play(wave, 0.5);
+
+        let mut next_frame = |muted| {
+            let mut frame = [0; 2];
+            mixer.fill(
+                &mut frame,
+                &[],
+                Vec3::default(),
+                Vec3::default(),
+                muted,
+                1.0,
+            );
+            frame
+        };
+        let frame = next_frame(false);
+        let expected = (0.45_f32 * 32767.0) as i16;
+        assert!((frame[0] - expected).abs() <= 1);
+        assert_eq!(frame[0], frame[1]);
+        assert_eq!(next_frame(false), frame);
+        assert_eq!(next_frame(true), [0; 2]);
+        assert_eq!(next_frame(false), [0; 2]);
+    }
+
+    #[test]
+    fn effects_volume_reduces_overlapping_sounds_before_clipping() {
+        let mut mixer = Mixer::new();
+        let wave = Arc::new(Wave {
+            samples: vec![1.0; 1],
+            rate: MIX_RATE,
+        });
+        mixer.play(wave.clone(), 1.0);
+        mixer.play(wave, 1.0);
+        let mut frame = [0; 2];
+        mixer.fill(
+            &mut frame,
+            &[],
+            Vec3::default(),
+            Vec3::default(),
+            false,
+            0.5,
+        );
+        assert_eq!(frame, [(0.6_f32 * 32767.0) as i16; 2]);
     }
 }
 
@@ -344,10 +422,11 @@ pub mod device {
         }
 
         pub fn play(&mut self, wave: Arc<Wave>) {
-            if self.mixer.voices.len() == 24 {
-                self.mixer.voices.remove(0);
-            }
-            self.mixer.voices.push((wave, 0.0));
+            self.play_with_gain(wave, 1.0);
+        }
+
+        pub fn play_with_gain(&mut self, wave: Arc<Wave>, gain: f32) {
+            self.mixer.play(wave, gain);
         }
 
         pub fn set_weapon_loop(&mut self, wave: Option<&Arc<Wave>>) {
@@ -374,13 +453,14 @@ pub mod device {
                 let header = &raw mut *buffer.header;
                 let flags = unsafe { std::ptr::read_volatile(&raw const (*header).dwFlags) };
                 if !buffer.queued || flags & WHDR_DONE != 0 {
-                    self.mixer
-                        .fill(&mut *buffer.samples, emitters, listener, right, muted);
-                    if self.effects_gain != 1.0 {
-                        for sample in &mut *buffer.samples {
-                            *sample = (f32::from(*sample) * self.effects_gain) as i16;
-                        }
-                    }
+                    self.mixer.fill(
+                        &mut *buffer.samples,
+                        emitters,
+                        listener,
+                        right,
+                        muted,
+                        self.effects_gain,
+                    );
                     if !muted
                         && !music_muted
                         && let Some(music) = &mut self.music
