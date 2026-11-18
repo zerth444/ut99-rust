@@ -182,6 +182,65 @@ pub struct RocketAnimations {
     pub rotate_sound: Option<Arc<Wave>>,
 }
 
+pub(crate) const ROCKET_CAPACITY: u8 = 6;
+
+impl RocketAnimations {
+    fn firing_duration(art: Option<&Self>, count: u8) -> f32 {
+        art.and_then(|art| art.fires.get(usize::from(count.saturating_sub(1))))
+            .map(Motion::duration)
+            .filter(|duration| *duration > 0.0)
+            .unwrap_or(0.6)
+    }
+
+    fn recovery(art: Option<&Self>, count: u8, has_ammo: bool) -> f32 {
+        Self::firing_duration(art, count)
+            + if has_ammo {
+                Self::phase_duration(art, false, 0)
+            } else {
+                0.0
+            }
+    }
+
+    fn phase_duration(art: Option<&Self>, rotating: bool, index: usize) -> f32 {
+        art.map(|art| {
+            if rotating {
+                &art.rotations[index]
+            } else {
+                &art.loads[index]
+            }
+        })
+        .map(Motion::duration)
+        .filter(|duration| *duration > 0.0)
+        .unwrap_or(7.0 / 15.0)
+    }
+
+    fn load_time(art: Option<&Self>, count: u8) -> f32 {
+        (1..usize::from(count))
+            .map(|index| {
+                Self::phase_duration(art, true, index - 1) + Self::phase_duration(art, false, index)
+            })
+            .sum()
+    }
+
+    fn load_phase(art: Option<&Self>, elapsed: f32, limit: u8) -> (u8, bool, f32) {
+        let mut age = elapsed.max(0.0);
+        for loaded in 1..limit {
+            let slot = usize::from(loaded);
+            let rotate = Self::phase_duration(art, true, slot - 1);
+            if age < rotate {
+                return (loaded, true, age);
+            }
+            age -= rotate;
+            let load = Self::phase_duration(art, false, slot);
+            if age < load {
+                return (loaded, false, age);
+            }
+            age -= load;
+        }
+        (limit, true, age)
+    }
+}
+
 impl WeaponAssets {
     pub fn muzzle_position(&self, pose: Pose<'_>) -> Option<Vec3> {
         pose.edge_center(self.muzzle_triangle?)
@@ -1290,7 +1349,7 @@ impl Practice {
             && let Some(art) = map.arsenal.get(&Weapon::Rocket)
             && let Some(rocket) = &art.rocket
         {
-            let reload_at = since + rocket.fires[usize::from(loaded - 1)].duration();
+            let reload_at = since + RocketAnimations::firing_duration(Some(rocket), loaded);
             if self.time - dt < reload_at && self.time >= reload_at {
                 sounds.extend(art.load_sound.clone());
                 self.next_shot = self.next_shot.max(reload_at + rocket.loads[0].duration());
@@ -1726,18 +1785,10 @@ impl Practice {
             alternate
         };
         let animations = map.arsenal.get(&weapon).and_then(|art| art.rocket.as_ref());
-        let rotate_duration = |index: u8| {
-            animations
-                .map_or(7.0 / 15.0, |art| {
-                    art.rotations[usize::from(index)].duration()
-                })
-                .max(0.001)
-        };
-        let load_duration = |index: u8| {
-            animations
-                .map_or(7.0 / 15.0, |art| art.loads[usize::from(index)].duration())
-                .max(0.001)
-        };
+        let rotate_duration =
+            |index: u8| RocketAnimations::phase_duration(animations, true, usize::from(index));
+        let load_duration =
+            |index: u8| RocketAnimations::phase_duration(animations, false, usize::from(index));
         let ammo = &mut self.ammo[weapon.ammo_pool()];
         let load_sound = || {
             map.arsenal
@@ -1788,7 +1839,11 @@ impl Practice {
             charge.tight = true;
         }
         if rocket {
-            while held && self.time >= charge.next_load && charge.loaded < 6 && *ammo > 0 {
+            while held
+                && self.time >= charge.next_load
+                && charge.loaded < ROCKET_CAPACITY
+                && *ammo > 0
+            {
                 charge.phase_since = charge.next_load;
                 if charge.rotating {
                     charge.rotating = false;
@@ -1811,7 +1866,7 @@ impl Practice {
             charge.phase_since = self.time;
             charge.next_load = self.time + 0.5;
         }
-        if held && (!rocket || (charge.loaded < 6 && *ammo > 0)) {
+        if held && (!rocket || (charge.loaded < ROCKET_CAPACITY && *ammo > 0)) {
             return true;
         }
         let charge = self.charge.take().unwrap();
@@ -1860,13 +1915,11 @@ impl Practice {
         }
         self.next_shot = self.time
             + if rocket {
-                animations.map_or(0.6, |art| {
-                    art.fires[usize::from(charge.loaded - 1)].duration()
-                }) + if self.ammo[weapon.ammo_pool()] > 0 {
-                    load_duration(0)
-                } else {
-                    0.0
-                }
+                RocketAnimations::recovery(
+                    animations,
+                    charge.loaded,
+                    self.ammo[weapon.ammo_pool()] > 0,
+                )
             } else {
                 map.arsenal
                     .get(&Weapon::Bio)

@@ -1,7 +1,12 @@
 use std::ptr::null_mut;
 use windows_sys::Win32::{Foundation::RECT, Graphics::Gdi::*};
 
-use crate::{game::Practice, render::Frame, texture::TextureImage};
+use crate::{
+    game::{Practice, Weapon, deathmatch::Match},
+    map::Map,
+    render::Frame,
+    texture::TextureImage,
+};
 
 const CELL_W: usize = 12;
 const CELL_H: usize = 20;
@@ -22,14 +27,21 @@ impl Hud {
     pub fn draw_deathmatch(
         &self,
         frame: &mut Frame,
-        game: &crate::game::deathmatch::Match,
+        game: &Match,
+        map: &Map,
         scoreboard: bool,
         captured: bool,
-        has_art: bool,
-        has_guidance_art: bool,
     ) {
-        use crate::game::deathmatch::Match;
         frame.begin_ui(false);
+        if scoreboard || game.finished {
+            self.draw_match_board(frame, game);
+            return;
+        }
+        let has_art = map.hud.ready();
+        let has_guidance_art = map
+            .arsenal
+            .get(&Weapon::Redeemer)
+            .is_some_and(|weapon| weapon.guided_hud[0].is_some());
         let scale = (frame.width as f32 / 1280.0).clamp(0.65, 1.6);
         let player = &game.fighters[0];
         let remaining = game.remaining();
@@ -89,7 +101,7 @@ impl Hud {
                 accent,
             );
         }
-        if !has_art && let Some((units, progress)) = player.charge_status(game.time) {
+        if !has_art && let Some((units, progress)) = player.charge_status(map, game.time) {
             let width = (135.0 * scale) as i32;
             let x = (frame.width as i32 - width) / 2;
             let y = frame.height as i32 / 2 + (40.0 * scale) as i32;
@@ -119,55 +131,7 @@ impl Hud {
                 white,
             );
         }
-        if scoreboard || game.finished {
-            let standings = game.standings();
-            let w = (440.0 * scale) as i32;
-            let row = (25.0 * scale) as i32;
-            let h = row * (standings.len() as i32 + 4);
-            let x = (frame.width as i32 - w) / 2;
-            let y = (frame.height as i32 - h) / 2;
-            frame.solid([x, y, w, h], [0.06, 0.10, 0.15]);
-            let top = standings[0];
-            let tied = standings
-                .get(1)
-                .is_some_and(|&id| game.fighters[id].score == game.fighters[top].score);
-            let title = if game.finished {
-                if tied {
-                    "MATCH DRAWN".into()
-                } else {
-                    format!("{} WINS", Match::label(top))
-                }
-            } else {
-                "SCOREBOARD".into()
-            };
-            self.centered(frame, y + row / 2, scale, &title, accent);
-            self.centered(
-                frame,
-                y + 2 * row,
-                scale,
-                "FIGHTER       FRAGS  DEATHS",
-                white,
-            );
-            for (index, id) in standings.into_iter().enumerate() {
-                let fighter = &game.fighters[id];
-                let line = format!(
-                    "{:<12} {:>5} {:>7}",
-                    Match::label(id),
-                    fighter.score,
-                    fighter.deaths
-                );
-                self.centered(
-                    frame,
-                    y + row * (3 + index as i32),
-                    scale,
-                    &line,
-                    if id == 0 { accent } else { white },
-                );
-            }
-            if game.finished {
-                self.centered(frame, y + h + row / 2, scale, "ENTER TO PLAY AGAIN", white);
-            }
-        } else if player.health == 0 {
+        if player.health == 0 {
             self.centered(frame, frame.height as i32 / 2, scale, "RESPAWNING", white);
         } else if !captured {
             self.centered(
@@ -179,6 +143,130 @@ impl Hud {
             );
         } else if let Some(message) = game.notice() {
             self.centered(frame, (42.0 * scale) as i32, scale, message, accent);
+        }
+    }
+
+    fn draw_match_board(&self, frame: &mut Frame, game: &Match) {
+        let standings = game.standings();
+        let scale = (frame.width as f32 / 790.0)
+            .min(frame.height as f32 / (168.0 + standings.len() as f32 * 30.0))
+            .min(1.5);
+        let px = |value: f32| (value * scale).round() as i32;
+        let width = px(640.0);
+        let height = px(144.0 + standings.len() as f32 * 30.0);
+        let left = (frame.width as i32 - width) / 2;
+        let top = (frame.height as i32 - height) / 2;
+        let white = [0.94, 0.96, 0.98];
+        let dim = [0.67, 0.72, 0.78];
+        let accent = [0.81, 0.88, 0.98];
+        frame.solid([left, top, width, height], [0.075, 0.09, 0.12]);
+        frame.solid([left, top, width, px(76.0)], [0.11, 0.15, 0.21]);
+        let leader = standings[0];
+        let score = game.fighters[leader].score;
+        let tied = standings
+            .get(1)
+            .is_some_and(|&id| game.fighters[id].score == score);
+        let title = if game.finished {
+            if tied {
+                "Match drawn".to_owned()
+            } else {
+                format!("{} wins", Match::label(leader))
+            }
+        } else {
+            "Deathmatch".to_owned()
+        };
+        self.text(
+            frame,
+            left + px(22.0),
+            top + px(11.0),
+            scale * 1.25,
+            &title,
+            white,
+        );
+        let (frag_limit, seconds) = game.limits();
+        let details = if game.finished {
+            let reason = if score >= frag_limit {
+                "Frag limit reached"
+            } else {
+                "Time limit reached"
+            };
+            let elapsed = game.time.min(f32::from(seconds)) as u16;
+            format!("{reason}    {:02}:{:02} played", elapsed / 60, elapsed % 60)
+        } else {
+            let left = game.remaining();
+            format!(
+                "{:02}:{:02} remaining    Frag limit {frag_limit}",
+                left / 60,
+                left % 60
+            )
+        };
+        self.text(
+            frame,
+            left + px(22.0),
+            top + px(47.0),
+            scale * 0.89,
+            &details,
+            dim,
+        );
+        for (x, title) in [
+            (22.0, "Rank"),
+            (100.0, "Fighter"),
+            (427.0, "Frags"),
+            (528.0, "Deaths"),
+        ] {
+            self.text(
+                frame,
+                left + px(x),
+                top + px(84.0),
+                scale * 0.88,
+                title,
+                dim,
+            );
+        }
+        let mut last_score = None;
+        let mut rank = 0;
+        for (index, id) in standings.into_iter().enumerate() {
+            let y = top + px(107.0 + index as f32 * 30.0);
+            let fighter = &game.fighters[id];
+            if Some(fighter.score) != last_score {
+                rank = index + 1;
+                last_score = Some(fighter.score);
+            }
+            let tint = if id == 0 {
+                [0.19, 0.27, 0.38]
+            } else if index % 2 == 0 {
+                [0.106, 0.13, 0.17]
+            } else {
+                [0.085, 0.11, 0.15]
+            };
+            frame.solid([left, y, width, px(30.0)], tint);
+            if id == 0 {
+                frame.solid([left, y, px(3.0).max(1), px(30.0)], accent);
+            }
+            for (x, value) in [
+                (22.0, rank.to_string()),
+                (
+                    100.0,
+                    if id == 0 {
+                        "PLAYER (YOU)".into()
+                    } else {
+                        Match::label(id)
+                    },
+                ),
+                (427.0, fighter.score.to_string()),
+                (528.0, fighter.deaths.to_string()),
+            ] {
+                self.text(frame, left + px(x), y + px(5.0), scale, &value, white);
+            }
+        }
+        if game.finished {
+            self.centered(
+                frame,
+                top + height + px(4.0),
+                scale * 0.85,
+                "Enter to play again",
+                white,
+            );
         }
     }
 

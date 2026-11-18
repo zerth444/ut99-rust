@@ -7,7 +7,7 @@ mod navigation;
 mod timestep;
 
 use super::{
-    Item, Pose, Powerup, PulseBeam, Weapon, WeaponAssets, ballistics, decals,
+    Item, Pose, Powerup, PulseBeam, RocketAnimations, Weapon, WeaponAssets, ballistics, decals,
     liquid::{Impact, LiquidState},
     ordnance,
     shock::{self, cylinder_hit},
@@ -172,17 +172,27 @@ impl Fighter {
         (self.weapon != Weapon::Hammer).then(|| self.inventory.ammo(self.weapon))
     }
 
-    pub fn charge_status(&self, time: f32) -> Option<(u16, f32)> {
+    pub fn charge_status(&self, map: &Map, time: f32) -> Option<(u16, f32)> {
         let charge = self.charge?;
         let elapsed = time - charge.since;
         let cost = arsenal::shot(self.weapon, charge.alternate).ammo;
-        let units = charge
+        let cap = charge
             .profile
-            .units(elapsed, self.inventory.ammo(self.weapon), cost);
+            .max_units
+            .min(self.inventory.ammo(self.weapon) / cost.max(1));
+        let rocket = map
+            .arsenal
+            .get(&self.weapon)
+            .and_then(|art| art.rocket.as_ref());
+        let units = charge.profile.units(rocket, elapsed, cap);
+        let duration = charge.profile.time_for(rocket, cap);
         Some((
             units,
-            (elapsed / (charge.profile.period * f32::from(charge.profile.max_units - 1)))
-                .clamp(0.0, 1.0),
+            if duration > 0.0 {
+                (elapsed / duration).clamp(0.0, 1.0)
+            } else {
+                1.0
+            },
         ))
     }
 
@@ -386,17 +396,10 @@ impl Charge {
         time: f32,
         ammo: u16,
     ) -> (usize, bool, f32) {
-        let age = (time - self.since).max(0.0);
-        let loaded = usize::from(self.profile.units(age, ammo, 1).max(1));
-        let cycle = (age / self.profile.period - (loaded - 1) as f32).clamp(0.0, 1.0);
-        let rotate = art.rotations[loaded - 1].duration();
-        let load = art.loads[loaded].duration();
-        let position = cycle * (rotate + load);
-        if position < rotate {
-            (loaded - 1, true, position)
-        } else {
-            (loaded, false, position - rotate)
-        }
+        let cap = self.profile.max_units.min(ammo).max(1);
+        let (count, rotating, position) =
+            RocketAnimations::load_phase(Some(art), time - self.since, cap as u8);
+        (usize::from(count - u8::from(rotating)), rotating, position)
     }
 }
 
@@ -469,6 +472,7 @@ struct Bolt {
     born: f32,
     payload: ProjectilePayload,
     pilot: Option<Pilot>,
+    next_trail: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -567,6 +571,7 @@ pub struct Match {
     pub ballistics: ballistics::Effects,
     pub shock: shock::Shots,
     pub traces: Vec<Trace>,
+    pub rocket_trails: ordnance::RocketTrails,
     bolts: Vec<Bolt>,
     initial_props: Vec<bool>,
     pickups: Vec<Option<f32>>,
@@ -593,6 +598,7 @@ impl Match {
             ballistics: ballistics::Effects::default(),
             shock: shock::Shots::default(),
             traces: Vec::new(),
+            rocket_trails: ordnance::RocketTrails::default(),
             bolts: Vec::new(),
             initial_props: map.props.iter().map(|prop| prop.visible).collect(),
             pickups: vec![None; map.props.len()],
@@ -636,6 +642,7 @@ impl Match {
         self.finished = false;
         self.guidance_lost_until = 0.0;
         self.traces.clear();
+        self.rocket_trails = ordnance::RocketTrails::default();
         self.decals = decals::Marks::default();
         self.ballistics = ballistics::Effects::default();
         self.shock = shock::Shots::default();
@@ -693,6 +700,10 @@ impl Match {
 
     pub fn remaining(&self) -> u16 {
         (f32::from(self.rules.seconds) - self.time).ceil().max(0.0) as u16
+    }
+
+    pub fn limits(&self) -> (i16, u16) {
+        (self.rules.frag_limit, self.rules.seconds)
     }
 
     pub(crate) fn hud_state(&self, map: &Map, scale: f32) -> crate::hud_art::State {
@@ -922,6 +933,26 @@ impl Match {
                 continue;
             }
             let fighter = &mut self.fighters[id];
+            if fighter.weapon == Weapon::Rocket
+                && fighter.fired_units > 0
+                && fighter.inventory.ammo(Weapon::Rocket) > 0
+                && let Some(art) = map.arsenal.get(&Weapon::Rocket)
+            {
+                let reload_at = fighter.fired_at
+                    + RocketAnimations::firing_duration(art.rocket.as_ref(), fighter.fired_units);
+                if self.time - dt < reload_at && self.time >= reload_at {
+                    if id == 0 {
+                        sounds.extend(art.load_sound.iter().cloned());
+                    } else {
+                        sounds.extend_at(
+                            art.load_sound.iter().cloned(),
+                            fighter.walker.position,
+                            CONTACT_SOUND_RADIUS,
+                            0.75,
+                        );
+                    }
+                }
+            }
             fighter.yaw = (fighter.yaw + input.look[0]).rem_euclid(std::f32::consts::TAU);
             fighter.pitch = (fighter.pitch + input.look[1]).clamp(-1.48, 1.48);
             let aim = fighter.camera(map);
@@ -1284,14 +1315,14 @@ impl Match {
             let alt = charge.alternate;
             let shot = arsenal::shot(weapon, alt);
             let held = input_holds(alt);
-            let units = charge
-                .profile
-                .units(self.time - charge.since, ammo, shot.ammo);
             let cap = charge.profile.max_units.min(ammo / shot.ammo.max(1));
+            let art = map.arsenal.get(&weapon);
+            let rocket = art.and_then(|art| art.rocket.as_ref());
+            let units = charge.profile.units(rocket, self.time - charge.since, cap);
             if held && units < cap {
                 if weapon == Weapon::Rocket
-                    && let Some(art) = map.arsenal.get(&weapon)
-                    && let Some(rocket) = &art.rocket
+                    && let Some(art) = art
+                    && let Some(rocket) = rocket
                 {
                     let (slot, rotating, _) = charge.rocket_phase(rocket, self.time, ammo);
                     if charge.rocket_cue != Some((slot, rotating)) {
@@ -1415,6 +1446,16 @@ impl Match {
             .as_ref()
             .map(|bullet| bullet.interval)
             .or_else(|| super::shot_interval(map, weapon, alt))
+            .or_else(|| {
+                (weapon == Weapon::Rocket).then(|| {
+                    let rocket = map.arsenal.get(&weapon).and_then(|art| art.rocket.as_ref());
+                    RocketAnimations::recovery(
+                        rocket,
+                        units as u8,
+                        fighter.inventory.ammo(weapon) > 0,
+                    )
+                })
+            })
             .unwrap_or(shot.interval);
         fighter.ready_at = self.time + interval + pause;
         let aim = fighter.camera(map);
@@ -1534,6 +1575,7 @@ impl Match {
                             scale: if grow { 1.0 + 0.20 * extra } else { 1.0 },
                         },
                         pilot: guided.then(|| Pilot::new(&aim)),
+                        next_trail: self.time,
                     });
                 }
             }
@@ -1695,10 +1737,23 @@ impl Match {
     fn move_bolts(&mut self, map: &Map, dt: f32, hits: &mut Vec<Hit>, sounds: &mut SoundEvents) {
         let mut detonations = Vec::new();
         let mut fragments = Vec::new();
+        self.rocket_trails.expire(self.time);
         self.bolts.retain_mut(|bolt| {
             let payload = &mut bolt.payload;
             let art = &map.ordnance[payload.kind as usize];
             let zone = map.collision.regions.at(bolt.position);
+            if payload.kind == ordnance::Kind::Rocket && self.time < bolt.expires {
+                let direction = unit(bolt.velocity);
+                self.rocket_trails.emit(
+                    map,
+                    bolt.position,
+                    direction,
+                    self.time,
+                    &mut bolt.next_trail,
+                );
+                bolt.velocity =
+                    direction * (bolt.velocity.dot(bolt.velocity).sqrt() + 50.0 * dt).min(1600.0);
+            }
             let chunk = payload.kind == ordnance::Kind::Chunk;
             if chunk && self.time >= bolt.expires {
                 return false;
@@ -1783,6 +1838,7 @@ impl Match {
                             scale: 1.0,
                         },
                         pilot: None,
+                        next_trail: self.time,
                     }));
                 }
                 detonations.push(Detonation {
@@ -1851,10 +1907,10 @@ impl Match {
                     impulse: unit(delta) * (370.0 * strength),
                 });
             }
-            let (duration, scale) = if payload.kind == ordnance::Kind::FlakShell {
-                ordnance::FLAK_SHELL_IMPACT
-            } else {
-                (0.48, payload.scale)
+            let (duration, scale) = match payload.kind {
+                ordnance::Kind::FlakShell => ordnance::FLAK_SHELL_IMPACT,
+                ordnance::Kind::Rocket | ordnance::Kind::Grenade => ordnance::ROCKET_IMPACT,
+                _ => (0.48, payload.scale),
             };
             self.traces.push(Trace {
                 start: position,
@@ -1975,17 +2031,18 @@ impl Match {
             return evade(fighter, evading.direction, dt);
         }
         if self.time >= fighter.bot.evade_again_at
-            && let Some(direction) = self.evade_direction(map, id, &skill)
+            && let Some((direction, dodge)) = self.evade_direction(map, id, &skill)
         {
             let fighter = &mut self.fighters[id];
+            let walk = direction * skill.evade_speed;
             fighter.bot.evasion = Some(Evasion {
-                direction,
-                until: self.time + 0.32,
+                direction: walk,
+                until: self.time + 0.3,
             });
-            fighter.bot.evade_again_at = self.time + 0.9;
-            let mut command = evade(fighter, direction, dt);
-            if skill.dodge {
-                command.dodge = Some(command.movement);
+            fighter.bot.evade_again_at = self.time + skill.evade_cooldown;
+            let mut command = evade(fighter, walk, dt);
+            if dodge {
+                command.dodge = Some(movement_input(direction, fighter.yaw + command.look[0]));
             }
             return command;
         }
@@ -2154,11 +2211,12 @@ impl Match {
             let release_charge = firing
                 && charge.is_some_and(|charge| {
                     let wanted = match self.rules.difficulty {
-                        Difficulty::Easy => 1.0,
-                        Difficulty::Standard => 2.0,
-                        Difficulty::Hard => 3.0,
+                        Difficulty::Easy => 1,
+                        Difficulty::Standard => 2,
+                        Difficulty::Hard => 3,
                     };
-                    self.time - charge.since >= charge.profile.period * (wanted - 0.85)
+                    let rocket = map.arsenal.get(&weapon).and_then(|art| art.rocket.as_ref());
+                    self.time - charge.since >= charge.profile.time_for(rocket, wanted).max(0.12)
                 });
             let hold_trigger = firing && !release_charge && fighter.charge_locked != Some(alt);
             let advance = if weapon == Weapon::Hammer {
@@ -2292,12 +2350,13 @@ impl Match {
         }
     }
 
-    fn evade_direction(&self, map: &Map, id: usize, skill: &ai::Combat) -> Option<Vec3> {
+    fn evade_direction(&self, map: &Map, id: usize, skill: &ai::Combat) -> Option<(Vec3, bool)> {
         let fighter = &self.fighters[id];
         let position = fighter.walker.position;
         if !fighter.walker.grounded || map.collision.regions.at(position).water {
             return None;
         }
+        let eye = fighter.camera(map);
         let threat = self
             .bolts
             .iter()
@@ -2315,7 +2374,7 @@ impl Match {
                     .incoming(shock::assets(map).map_or(1000.0, |assets| assets.speed)),
             )
             .filter_map(|(owner, location, velocity, born, blast)| {
-                if owner == id || self.time - born < skill.reaction.min(0.16) {
+                if owner == id || self.time - born < skill.reaction.min(0.28) {
                     return None;
                 }
                 let relative = velocity - fighter.walker.velocity();
@@ -2324,27 +2383,33 @@ impl Match {
                     return None;
                 }
                 let offset = location - position;
+                let visible = location - eye.position;
+                if visible.dot(eye.forward()) <= 0.12 * visible.0.hypot(visible.1) {
+                    return None;
+                }
                 let closest = -offset.dot(relative) / speed_squared;
                 if !(0.02..=skill.evade_window).contains(&closest) {
                     return None;
                 }
                 let pass = offset + relative * closest;
-                let clearance = 43.0 + blast.min(150.0) * 0.53;
+                let clearance = 27.0 + blast.min(120.0) * 0.3;
                 if pass.dot(pass) >= clearance * clearance
-                    || map.collision.ray(position, offset).is_some()
+                    || map.collision.ray(eye.position, visible).is_some()
                     || map.collision.ray(location, velocity * closest).is_some()
                 {
                     return None;
                 }
                 let side = unit(Vec3(-relative.1, relative.0, 0.0));
-                (side.dot(side) > 0.5).then_some((closest, pass, side))
+                (side.dot(side) > 0.5).then_some((closest, pass, side, blast >= 100.0))
             })
             .min_by(|a, b| a.0.total_cmp(&b.0))?;
-        let (_, pass, side) = threat;
+        let (_, pass, side, explosive) = threat;
+        let dodge = skill.dodge && explosive;
+        let intent = fighter.bot.combat_move;
         [side, side * -1.0]
             .into_iter()
             .filter(|&direction| {
-                let step = direction * if skill.dodge { 160.0 } else { 95.0 };
+                let step = direction * if dodge { 160.0 } else { 65.0 };
                 if map
                     .collision
                     .projectile_surface(position, step, PLAYER_RADIUS, PLAYER_HEIGHT)
@@ -2361,7 +2426,11 @@ impl Match {
                     ground.is_some() && !zone.water && !zone.pain
                 })
             })
-            .min_by(|a, b| a.dot(pass).total_cmp(&b.dot(pass)))
+            .min_by(|a, b| {
+                a.dot(pass - intent * 24.0)
+                    .total_cmp(&b.dot(pass - intent * 24.0))
+            })
+            .map(|direction| (direction, dodge))
     }
 }
 
@@ -2888,42 +2957,60 @@ mod tests {
 
     #[test]
     #[ignore = "requires local GOTY assets"]
-    fn bot_dodges_a_visible_projectile_but_not_one_behind_cover() {
+    fn standard_bot_sidesteps_on_the_ground_and_has_recovery_between_threats() {
         let (mut map, mut game) = flight_fixture();
         game.fighters[0].protected_until = f32::INFINITY;
+        game.fighters[1].yaw = std::f32::consts::PI;
         let start = game.fighters[1].walker.position;
         let payload = ProjectilePayload {
-            kind: super::super::ordnance::Kind::Pulse,
+            kind: ordnance::Kind::Pulse,
             damage: 70,
             blast: 0.0,
             gravity: 0.0,
             rebounds: 0,
             scale: 1.0,
         };
-        let bolt_start = start - Vec3(220.0, 0.0, 0.0);
+        let bolt_start = start - Vec3(150.0, 0.0, 0.0);
+        game.time = 1.0;
         game.bolts.push(Bolt {
             owner: 0,
             position: bolt_start,
             velocity: Vec3(700.0, 0.0, 0.0),
-            expires: 2.0,
-            born: -0.30,
+            expires: 3.0,
+            born: 0.65,
             payload,
             pilot: None,
+            next_trail: 0.0,
         });
-        for _ in 0..40 {
-            game.step(&mut map, Command::default(), 1.0 / 120.0);
-        }
-        assert_eq!(game.fighters[1].health, 100);
-        assert!((game.fighters[1].walker.position.1 - start.1).abs() > 70.0);
-        game.fighters[1].walker = Walker::spawn(&map.collision, start);
-        game.bolts[0].position = bolt_start;
+        let dt = 1.0 / 120.0;
+        let first = game.bot_command(&map, 1, dt);
+        assert!(game.fighters[1].bot.evasion.is_some());
+        let recover = game.fighters[1].bot.evade_again_at;
+        assert!(recover >= game.time + 2.7 && first.dodge.is_none() && !first.jump);
+        assert!(first.movement[0].hypot(first.movement[1]) <= 0.53);
+
+        game.time = 1.35;
+        game.bot_command(&map, 1, dt);
+        assert_eq!(
+            game.fighters[1].bot.evade_again_at, recover,
+            "repeated fire must not trigger another sidestep during recovery"
+        );
+        assert!(game.fighters[1].walker.grounded);
+
+        let hard = Difficulty::Hard.combat();
+        assert!(
+            !game.evade_direction(&map, 1, &hard).unwrap().1,
+            "plasma is answered on foot even on Hard"
+        );
+        game.bolts[0].payload.blast = 200.0;
+        assert!(
+            game.evade_direction(&map, 1, &hard).unwrap().1,
+            "a visible rocket can justify a dodge on Hard"
+        );
         let wall = start - Vec3(95.0, 0.0, 0.0);
         map.collision
             .add_box(wall - Vec3(7.0, 95.0, 50.0), wall + Vec3(7.0, 95.0, 70.0));
-        assert!(
-            game.evade_direction(&map, 1, &Difficulty::Standard.combat())
-                .is_none()
-        );
+        assert!(game.evade_direction(&map, 1, &hard).is_none());
     }
 
     #[test]
@@ -3283,11 +3370,22 @@ mod tests {
             game.fighters[0].weapon_pose(art, game.time).current,
             rocket.rotations[0].frames[0].as_slice()
         ));
-        game.time = 0.74;
+        let three_rockets = RocketAnimations::load_time(Some(rocket), 3);
+        assert!(three_rockets > 0.74);
+        game.time = three_rockets - 0.001;
+        game.fire(&map, 0, held, &mut hits, &mut sounds);
+        assert_eq!(
+            game.fighters[0].charge_status(&map, game.time).unwrap().0,
+            2
+        );
+        game.time = three_rockets + 0.001;
         game.fire(&map, 0, held, &mut hits, &mut sounds);
         assert!(game.bolts.is_empty());
         assert_eq!(game.fighters[0].ammo(), Some(starting_ammo));
-        assert_eq!(game.fighters[0].charge_status(game.time).unwrap().0, 3);
+        assert_eq!(
+            game.fighters[0].charge_status(&map, game.time).unwrap().0,
+            3
+        );
         game.fire(&map, 0, Command::default(), &mut hits, &mut sounds);
         assert_eq!(game.bolts.len(), 3);
         assert!(std::ptr::eq(
@@ -3299,23 +3397,90 @@ mod tests {
         assert!(spread.dot(spread) > 500.0);
         assert_eq!(game.fighters[0].ammo(), Some(starting_ammo - 3));
 
-        game.time = 2.0;
+        game.time = game.fighters[0].ready_at + 0.01;
         let remainder = game.fighters[0].ammo().unwrap() - 2;
         assert!(game.fighters[0].inventory.spend(Weapon::Rocket, remainder));
         game.fire(&map, 0, held, &mut hits, &mut sounds);
-        game.time = 2.4;
+        game.time += RocketAnimations::load_time(Some(rocket), 2) + 0.001;
         game.fire(&map, 0, held, &mut hits, &mut sounds);
         assert_eq!(game.bolts.len(), 5);
         assert_eq!(game.fighters[0].ammo(), Some(0));
         game.fighters[0]
             .inventory
             .grant_ammo(&map.arsenal, Weapon::Rocket, 4);
-        game.time = 4.0;
+        game.time = game.fighters[0].ready_at + 0.01;
         game.fire(&map, 0, held, &mut hits, &mut sounds);
         assert!(game.fighters[0].charge.is_none());
         game.fire(&map, 0, Command::default(), &mut hits, &mut sounds);
         game.fire(&map, 0, held, &mut hits, &mut sounds);
         assert!(game.fighters[0].charge.is_some());
+        game.fighters[0]
+            .inventory
+            .grant_ammo(&map.arsenal, Weapon::Rocket, 2);
+        game.time +=
+            RocketAnimations::load_time(Some(rocket), super::super::ROCKET_CAPACITY) - 0.001;
+        game.fire(&map, 0, held, &mut hits, &mut sounds);
+        assert_eq!(
+            game.fighters[0].charge_status(&map, game.time).unwrap().0,
+            5
+        );
+        game.time += 0.002;
+        game.fire(&map, 0, held, &mut hits, &mut sounds);
+        assert_eq!(game.bolts.len(), 11);
+        assert_eq!(game.fighters[0].ammo(), Some(0));
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY assets"]
+    fn rocket_smoke_uses_loaded_trail_art_and_stops_in_water_and_after_expiry() {
+        let (mut map, mut game) = flight_fixture();
+        game.time = 2.0;
+        let fighter = &mut game.fighters[0];
+        fighter.inventory.pickup(&map.arsenal, Weapon::Rocket);
+        fighter.weapon = Weapon::Rocket;
+        let mut hits = Vec::new();
+        let mut sounds = SoundEvents::default();
+        game.fire(
+            &map,
+            0,
+            Command {
+                primary: true,
+                ..Command::default()
+            },
+            &mut hits,
+            &mut sounds,
+        );
+        game.time += 0.01;
+        game.fire(&map, 0, Command::default(), &mut hits, &mut sounds);
+        let launch_speed = game.bolts[0].velocity.dot(game.bolts[0].velocity).sqrt();
+        game.move_bolts(&map, 0.02, &mut hits, &mut sounds);
+        assert!(game.bolts[0].velocity.dot(game.bolts[0].velocity).sqrt() > launch_speed);
+        let trail = map.ordnance[ordnance::Kind::Rocket as usize]
+            .trail
+            .as_ref()
+            .unwrap();
+        let mut count = 0;
+        game.rocket_trails
+            .visuals(&map.ordnance, game.time, |visual| {
+                let ordnance::Visual::Sprite(_, image, scale, glow) = visual else {
+                    panic!("rocket trail must be a sprite");
+                };
+                assert!(std::ptr::eq(image, trail.image_once(0.0)));
+                assert_eq!((scale, glow), (0.5, 1.0));
+                count += 1;
+            });
+        assert_eq!(count, 1);
+        map.collision.regions.level.water = true;
+        game.time += 0.06;
+        game.move_bolts(&map, 0.02, &mut hits, &mut sounds);
+        let mut visible = 0;
+        game.rocket_trails
+            .visuals(&map.ordnance, game.time, |_| visible += 1);
+        assert_eq!(visible, 1, "only the existing particle remains");
+        game.time += 0.22;
+        game.move_bolts(&map, 0.02, &mut hits, &mut sounds);
+        game.rocket_trails
+            .visuals(&map.ordnance, game.time, |_| panic!("expired rocket smoke"));
     }
 
     #[test]
@@ -3610,6 +3775,7 @@ mod tests {
                     expires: 9.0,
                     payload,
                     pilot: None,
+                    next_trail: 0.0,
                 });
             }
             if cover {
@@ -4434,14 +4600,7 @@ mod tests {
             let mut frame = crate::render::Frame::new();
             frame.draw_deathmatch(&map, &camera, &game, 90.0, 1.0);
             let scene = frame.pixels.clone();
-            crate::hud::Hud::new().draw_deathmatch(
-                &mut frame,
-                &game,
-                false,
-                false,
-                map.hud.ready(),
-                true,
-            );
+            crate::hud::Hud::new().draw_deathmatch(&mut frame, &game, &map, false, false);
             let center = frame.width * (frame.height / 2) + frame.width / 2;
             assert_ne!(
                 frame.pixels[center], scene[center],
@@ -4508,6 +4667,7 @@ mod tests {
             born: game.time,
             expires: game.time + 2.0,
             pilot: None,
+            next_trail: 0.0,
             payload: ProjectilePayload {
                 kind: super::super::ordnance::Kind::Rocket,
                 damage: 85,

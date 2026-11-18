@@ -374,6 +374,10 @@ impl Frame {
         self.draw(map, camera, game.time);
         self.layer(Layer::Effects);
         let view = self.camera_view(camera);
+        game.rocket_trails
+            .visuals(&map.ordnance, game.time, |visual| {
+                self.draw_world_effect(&view, game.time, visual);
+            });
         self.draw_shock(map, &view, &game.shock, game.time);
         for beam in game.pulse_beams(map) {
             self.draw_pulse_beam(map, &view, &beam, game.time);
@@ -425,7 +429,12 @@ impl Frame {
         for trace in &game.traces {
             let art = &map.ordnance[trace.explosion as usize];
             let age = game.time - trace.born;
-            if trace.explosion == crate::game::ordnance::Kind::FlakShell {
+            if matches!(
+                trace.explosion,
+                crate::game::ordnance::Kind::FlakShell
+                    | crate::game::ordnance::Kind::Rocket
+                    | crate::game::ordnance::Kind::Grenade
+            ) {
                 let progress = age / (trace.expires - trace.born);
                 if let Some(visual) = art.impact_sprite(trace.start, progress, trace.scale) {
                     self.draw_world_effect(&view, game.time, visual);
@@ -495,6 +504,9 @@ impl Frame {
             }
         }
         self.layer(Layer::Hud);
+        if game.finished {
+            return;
+        }
         if self.draw_guidance_hud(
             map,
             game.time,

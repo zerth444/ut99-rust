@@ -570,12 +570,9 @@ unsafe fn message_loop(
                     hud.draw_deathmatch(
                         &mut frame,
                         game,
+                        map,
                         active && key(VK_TAB),
                         mouse.captured,
-                        map.hud.ready(),
-                        map.arsenal
-                            .get(&crate::game::Weapon::Redeemer)
-                            .is_some_and(|weapon| weapon.guided_hud[0].is_some()),
                     );
                     if settings.show_fps {
                         let label = stats.label(window, size, presenter.software);

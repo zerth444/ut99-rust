@@ -102,7 +102,6 @@ pub(super) struct Shot {
 
 #[derive(Clone, Copy)]
 pub(super) struct ChargeProfile {
-    pub period: f32,
     pub max_units: u16,
     pub shape: ChargeShape,
 }
@@ -114,22 +113,39 @@ pub(super) enum ChargeShape {
 }
 
 impl ChargeProfile {
-    pub fn units(self, elapsed: f32, ammo: u16, cost: u16) -> u16 {
-        let available = ammo / cost.max(1);
-        let built = 1u16.saturating_add((elapsed.max(0.0) / self.period) as u16);
-        built.min(self.max_units).min(available)
+    const BIO_LOAD_PERIOD: f32 = 0.52;
+
+    pub fn units(
+        self,
+        rocket: Option<&super::super::RocketAnimations>,
+        elapsed: f32,
+        cap: u16,
+    ) -> u16 {
+        match self.shape {
+            ChargeShape::Volley => {
+                u16::from(super::super::RocketAnimations::load_phase(rocket, elapsed, cap as u8).0)
+            }
+            ChargeShape::Grow => 1u16
+                .saturating_add((elapsed.max(0.0) / Self::BIO_LOAD_PERIOD) as u16)
+                .min(cap),
+        }
+    }
+
+    pub fn time_for(self, rocket: Option<&super::super::RocketAnimations>, units: u16) -> f32 {
+        match self.shape {
+            ChargeShape::Volley => super::super::RocketAnimations::load_time(rocket, units as u8),
+            ChargeShape::Grow => Self::BIO_LOAD_PERIOD * f32::from(units.saturating_sub(1)),
+        }
     }
 }
 
 pub(super) fn charge_profile(weapon: Weapon, alt: bool) -> Option<ChargeProfile> {
     match (weapon, alt) {
         (Weapon::Rocket, _) => Some(ChargeProfile {
-            period: 0.35,
-            max_units: 4,
+            max_units: u16::from(super::super::ROCKET_CAPACITY),
             shape: ChargeShape::Volley,
         }),
         (Weapon::Bio, true) => Some(ChargeProfile {
-            period: 0.52,
             max_units: 5,
             shape: ChargeShape::Grow,
         }),

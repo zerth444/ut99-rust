@@ -160,6 +160,45 @@ pub enum Visual<'a> {
     Mesh(Vec3, Vec3, Pose<'a>, f32, Option<f32>),
 }
 
+#[derive(Default)]
+pub struct RocketTrails(Vec<(Vec3, f32)>);
+
+impl RocketTrails {
+    const LIFETIME: f32 = 0.22;
+
+    pub(super) fn emit(
+        &mut self,
+        map: &Map,
+        position: Vec3,
+        direction: Vec3,
+        time: f32,
+        next: &mut f32,
+    ) {
+        if time >= *next && !map.collision.regions.at(position).water {
+            *next = time + 0.035;
+            self.0.push((position - direction * 10.0, time));
+        }
+    }
+
+    pub(super) fn expire(&mut self, time: f32) {
+        self.0.retain(|&(_, born)| time - born < Self::LIFETIME);
+    }
+
+    pub fn visuals<'a>(&self, assets: &'a Arsenal, time: f32, mut draw: impl FnMut(Visual<'a>)) {
+        if let Some(texture) = &assets[Kind::Rocket as usize].trail {
+            for &(position, born) in &self.0 {
+                let age = ((time - born) / Self::LIFETIME).clamp(0.0, 1.0);
+                draw(Visual::Sprite(
+                    position,
+                    texture.image_once(age),
+                    0.5,
+                    1.0 - age,
+                ));
+            }
+        }
+    }
+}
+
 impl Art {
     pub fn impact_sprite(&self, position: Vec3, progress: f32, scale: f32) -> Option<Visual<'_>> {
         Some(Visual::Sprite(
@@ -203,6 +242,7 @@ pub struct Shots {
     ripples: Vec<Ripple>,
     self_hits: Vec<(u16, Vec3)>,
     marks: Vec<(Kind, Vec3, Vec3, Option<usize>)>,
+    rocket_trails: RocketTrails,
     pub guided_roll: f32,
 }
 
@@ -693,6 +733,7 @@ impl Shots {
         sounds: &mut SoundEvents,
         blasts: &mut Vec<Blast>,
     ) {
+        self.rocket_trails.expire(time);
         self.effects
             .retain(|effect| time - effect.born < effect.duration);
         self.ripples.retain(|ripple| {
@@ -819,18 +860,14 @@ impl Shots {
                                 });
                             }
                         }
-                    } else if !map.collision.regions.at(shot.position).water {
-                        shot.next_trail = time + 0.035;
-                        self.effects.push(Effect {
-                            kind,
-                            position: shot.position - shot.direction * 10.0,
-                            born: time,
-                            duration: 0.22,
-                            scale: 0.5,
-                            trail: true,
-                            nuclear: false,
-                            struck: [false; 2],
-                        });
+                    } else {
+                        self.rocket_trails.emit(
+                            map,
+                            shot.position,
+                            shot.direction,
+                            time,
+                            &mut shot.next_trail,
+                        );
                     }
                 }
             } else if matches!(kind, Kind::Grenade | Kind::FlakShell)
@@ -1018,6 +1055,7 @@ impl Shots {
     }
 
     pub fn visuals<'a>(&self, assets: &'a Arsenal, time: f32, mut draw: impl FnMut(Visual<'a>)) {
+        self.rocket_trails.visuals(assets, time, &mut draw);
         for ripple in &self.ripples {
             let art = &assets[ripple.kind as usize];
             let age = time - ripple.born;
@@ -1170,6 +1208,7 @@ impl Shots {
 }
 
 pub(super) const FLAK_SHELL_IMPACT: (f32, f32) = (0.5, 2.0);
+pub(super) const ROCKET_IMPACT: (f32, f32) = (0.7, 1.4);
 
 fn projectile_damage(shot: &Projectile, art: &Art, center: Vec3) -> (u16, Vec3) {
     if shot.kind == Kind::Chunk && shot.velocity.dot(shot.velocity) <= 200.0 * 200.0 {
@@ -1353,7 +1392,7 @@ fn explode_at(
     };
     let (duration, scale) = match kind {
         Kind::Pulse => (0.5, 0.65),
-        Kind::Rocket | Kind::Grenade => (0.7, 1.4),
+        Kind::Rocket | Kind::Grenade => ROCKET_IMPACT,
         Kind::FlakShell => FLAK_SHELL_IMPACT,
         Kind::RazorAlt => (0.7, 1.0),
         Kind::Warhead | Kind::GuidedWarhead => (1.5, 2.8),
