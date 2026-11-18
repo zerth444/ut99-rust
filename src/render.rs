@@ -374,6 +374,9 @@ impl Frame {
         self.draw(map, camera, game.time);
         self.layer(Layer::Effects);
         let view = self.camera_view(camera);
+        for beam in game.pulse_beams(map) {
+            self.draw_pulse_beam(map, &view, &beam, game.time);
+        }
         if game.show_decals {
             for mark in game.decals.visible() {
                 self.draw_faces_in_view(mark, &view, game.time, false, None, None);
@@ -448,21 +451,13 @@ impl Frame {
         }
         for (kind, position, direction, age, scale) in game.bolts() {
             let art = &map.ordnance[kind as usize];
-            if let Some(sprite) = &art.sprite {
-                self.world_sprite(&view, position, sprite.image(age), 0.68 * scale, 0.8);
-                continue;
-            }
-            let duration = art.flight.duration();
-            if duration > 0.0
-                && let Some(pose) = art.flight.sample(age.rem_euclid(duration))
-            {
-                let direction = if direction.dot(direction) > 0.01 {
-                    direction
-                } else {
-                    Vec3(1.0, 0.0, 0.0)
-                };
-                let model = view.in_model(position, direction, scale);
-                self.draw_faces_in_view(pose.current, &model, game.time, false, Some(pose), None);
+            let direction = if direction.dot(direction) > 0.01 {
+                direction
+            } else {
+                Vec3(1.0, 0.0, 0.0)
+            };
+            if let Some(visual) = art.flight_visual(kind, position, direction, age, scale) {
+                self.draw_world_effect(&view, game.time, visual);
                 continue;
             }
             self.effect(
@@ -498,6 +493,15 @@ impl Frame {
             }
         }
         self.layer(Layer::Hud);
+        if self.draw_guidance_hud(
+            map,
+            game.time,
+            player.health > 0 && !game.finished,
+            piloting,
+            game.guidance_lost_until,
+        ) {
+            return;
+        }
         self.draw_hit_tint(
             0.20 - (game.time - player.hurt_at),
             0.16 - (game.time - player.shield_at),
@@ -708,40 +712,8 @@ impl Frame {
                     }
                 });
         }
-        if let Some(beam) = &game.pulse_beam
-            && !beam.blocked
-            && let Some(art) = map.arsenal.get(&crate::game::Weapon::Pulse)
-        {
-            let delta = beam.end - beam.start;
-            let length = delta.dot(delta).sqrt();
-            if length > 0.0 {
-                let forward = delta * length.recip();
-                let view = View::camera(camera);
-                let age = game.time - beam.started;
-                let animation = (age / 0.05) as usize;
-                for segment in 0..((length / 81.0).ceil() as usize).min(10) {
-                    let frames = if segment == 0 {
-                        &art.pulse_starter
-                    } else {
-                        &art.pulse_beam
-                    };
-                    if !frames.is_empty() {
-                        let faces = &frames[animation % frames.len()];
-                        let model = view.in_model(
-                            beam.start + forward * (segment as f32 * 81.0),
-                            forward,
-                            1.0,
-                        );
-                        self.draw_faces_in_view(faces, &model, time, false, None, Some(1.0));
-                    }
-                }
-                if !beam.hit_player
-                    && let Some(tip) = &art.pulse_tip[usize::from(beam.wall.is_some())]
-                {
-                    let inset = if beam.wall.is_some() { 5.0 } else { 4.0 };
-                    self.world_sprite(&view, beam.end - forward * inset, tip.image(age), 0.65, 1.0);
-                }
-            }
+        if let Some(beam) = &game.pulse_beam {
+            self.draw_pulse_beam(map, &view, beam, time);
         }
         self.zoom = 1.0;
         self.roll = 0.0;
@@ -766,9 +738,87 @@ impl Frame {
             );
         }
         self.layer(Layer::Hud);
+        if self.draw_guidance_hud(
+            map,
+            game.time,
+            game.death.is_none(),
+            guided_camera.is_some(),
+            game.guidance_lost_until,
+        ) {
+            return;
+        }
+        self.draw_hit_tint(
+            game.hit_flash_until - game.time,
+            game.shield_flash_until - game.time,
+        );
+        map.hud.draw(
+            self,
+            &crate::hud_art::State::practice(game, &map.arsenal),
+            &map.arsenal,
+        );
+        if game.death.is_some() {
+            return;
+        } else if game.scoped() {
+            self.draw_scope(map, game.weapon);
+        } else if map.hud.crosshair.is_none() {
+            self.draw_crosshair();
+        }
+    }
+
+    fn draw_pulse_beam(
+        &mut self,
+        map: &Map,
+        view: &View,
+        beam: &crate::game::PulseBeam,
+        time: f32,
+    ) {
+        if !beam.blocked
+            && let Some(art) = map.arsenal.get(&crate::game::Weapon::Pulse)
+        {
+            let delta = beam.end - beam.start;
+            let length = delta.dot(delta).sqrt();
+            if length > 0.0 {
+                let forward = delta * length.recip();
+
+                let age = time - beam.started;
+                let animation = (age / 0.05) as usize;
+                for segment in 0..((length / 81.0).ceil() as usize).min(10) {
+                    let frames = if segment == 0 {
+                        &art.pulse_starter
+                    } else {
+                        &art.pulse_beam
+                    };
+                    if !frames.is_empty() {
+                        let faces = &frames[animation % frames.len()];
+                        let model = view.in_model(
+                            beam.start + forward * (segment as f32 * 81.0),
+                            forward,
+                            1.0,
+                        );
+                        self.draw_faces_in_view(faces, &model, time, false, None, Some(1.0));
+                    }
+                }
+                if !beam.hit_player
+                    && let Some(tip) = &art.pulse_tip[usize::from(beam.wall.is_some())]
+                {
+                    let inset = if beam.wall.is_some() { 5.0 } else { 4.0 };
+                    self.world_sprite(view, beam.end - forward * inset, tip.image(age), 0.65, 1.0);
+                }
+            }
+        }
+    }
+
+    fn draw_guidance_hud(
+        &mut self,
+        map: &Map,
+        time: f32,
+        alive: bool,
+        guided: bool,
+        lost_until: f32,
+    ) -> bool {
         if let Some(weapon) = map.arsenal.get(&crate::game::Weapon::Redeemer) {
             let [reticle, readout, noise] = &weapon.guided_hud;
-            if guided_camera.is_some() && game.death.is_none() {
+            if guided {
                 self.screen_flash(0.8, Vec3(200.0 / 1000.0, 0.0, 0.0));
                 if let Some(reticle) = reticle {
                     let (w, h) = reticle.size();
@@ -788,7 +838,7 @@ impl Frame {
                 }
                 if let Some(readout) = readout {
                     let (w, h) = readout.size();
-                    let offset = (game.time * 75.0) as i32 % h as i32;
+                    let offset = (time * 75.0) as i32 % h as i32;
                     for y in (0..self.height as i32 + h as i32).step_by(h as usize) {
                         self.translucent_tile(
                             readout.image(0.0),
@@ -798,39 +848,24 @@ impl Frame {
                         );
                     }
                 }
-                return;
+                return true;
             }
-            if game.death.is_none()
-                && game.time < game.guidance_lost_until
+            if alive
+                && time < lost_until
                 && let Some(noise) = noise
             {
                 let (w, h) = noise.size();
                 let scale = self.width.max(self.height) as f32 / 256.0;
                 self.tile(
-                    noise.image_once(1.0 - (game.guidance_lost_until - game.time) / 0.3),
+                    noise.image_once(1.0 - (lost_until - time) / 0.3),
                     [0, 0, (w * scale) as i32, (h * scale) as i32],
                     [0.0, 0.0, w, h],
                     [1.0; 3],
                 );
-                return;
+                return true;
             }
         }
-        self.draw_hit_tint(
-            game.hit_flash_until - game.time,
-            game.shield_flash_until - game.time,
-        );
-        map.hud.draw(
-            self,
-            &crate::hud_art::State::practice(game, &map.arsenal),
-            &map.arsenal,
-        );
-        if game.death.is_some() {
-            return;
-        } else if game.scoped() {
-            self.draw_scope(map, game.weapon);
-        } else if map.hud.crosshair.is_none() {
-            self.draw_crosshair();
-        }
+        false
     }
 
     fn draw_hit_tint(&mut self, red_left: f32, shield_left: f32) {

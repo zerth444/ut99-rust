@@ -533,13 +533,7 @@ unsafe fn message_loop(
                 }
                 let view = game.player_view(map);
                 if let Some(audio) = &mut audio {
-                    let flight_sound = game.guidance_left().and_then(|_| {
-                        map.arsenal
-                            .get(&crate::game::Weapon::Redeemer)?
-                            .charge_loop
-                            .as_ref()
-                    });
-                    audio.set_weapon_loop(flight_sound);
+                    audio.set_weapon_loop(game.weapon_loop(map));
                     audio.set_volume(settings.effects_volume, settings.music_volume);
                     audio.update(
                         &map.ambient,
@@ -579,6 +573,9 @@ unsafe fn message_loop(
                         active && key(VK_TAB),
                         mouse.captured,
                         map.hud.ready(),
+                        map.arsenal
+                            .get(&crate::game::Weapon::Redeemer)
+                            .is_some_and(|weapon| weapon.guided_hud[0].is_some()),
                     );
                     if settings.show_fps {
                         let label = stats.label(window, size, presenter.software);

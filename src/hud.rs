@@ -26,6 +26,7 @@ impl Hud {
         scoreboard: bool,
         captured: bool,
         has_art: bool,
+        has_guidance_art: bool,
     ) {
         use crate::game::deathmatch::Match;
         frame.begin_ui(false);
@@ -34,20 +35,18 @@ impl Hud {
         let remaining = game.remaining();
         let white = [0.92, 0.96, 1.0];
         let accent = [0.42, 0.87, 0.95];
-        self.text(
-            frame,
-            16,
-            12,
-            scale,
-            &format!(
+        let clock = if has_art {
+            format!("{:02}:{:02}", remaining / 60, remaining % 60)
+        } else {
+            format!(
                 "DEATHMATCH   {:02}:{:02}   FRAGS {}   {}",
                 remaining / 60,
                 remaining % 60,
                 player.score,
                 game.difficulty().label().to_ascii_uppercase()
-            ),
-            accent,
-        );
+            )
+        };
+        self.text(frame, 16, 12, scale, &clock, accent);
         if !has_art {
             self.text(
                 frame,
@@ -67,10 +66,10 @@ impl Hud {
             );
         }
         let mut active = Vec::new();
-        if player.boot_charges() > 0 {
+        if !has_art && player.boot_charges() > 0 {
             active.push(format!("BOOTS {}", player.boot_charges()));
         }
-        if player.amp_left(game.time) > 0.0 {
+        if !has_art && player.amp_left(game.time) > 0.0 {
             active.push(format!("AMP {:.0}S", player.amp_left(game.time).ceil()));
         }
         if player.invis_left(game.time) > 0.0 {
@@ -90,7 +89,7 @@ impl Hud {
                 accent,
             );
         }
-        if let Some((units, progress)) = player.charge_status(game.time) {
+        if !has_art && let Some((units, progress)) = player.charge_status(game.time) {
             let width = (135.0 * scale) as i32;
             let x = (frame.width as i32 - width) / 2;
             let y = frame.height as i32 / 2 + (40.0 * scale) as i32;
@@ -104,7 +103,7 @@ impl Hud {
             frame.solid([x, y, width, 4], [0.08, 0.13, 0.17]);
             frame.solid([x, y, (width as f32 * progress) as i32, 4], accent);
         }
-        if let Some(seconds) = game.guidance_left() {
+        if !has_guidance_art && let Some(seconds) = game.guidance_left() {
             self.centered(
                 frame,
                 frame.height as i32 / 2 + (42.0 * scale) as i32,

@@ -200,7 +200,7 @@ pub(super) fn shot(weapon: Weapon, alt: bool) -> Shot {
         (Weapon::Shock, false) => trace(39, 0.59, 1, 6500.0, 1, 0.0),
         (Weapon::Shock, true) => missile(58, 0.71, 1, Pulse, 145.0, 0.0, 0),
         (Weapon::Pulse, false) => missile(16, 0.15, 1, Pulse, 0.0, 0.0, 0),
-        (Weapon::Pulse, true) => trace(12, 0.13, 1, 690.0, 1, 0.0),
+        (Weapon::Pulse, true) => trace(12, 0.24, 1, super::PulseBeam::RANGE, 1, 0.0),
         (Weapon::Ripper, false) => missile(33, 0.41, 1, Razor, 0.0, 0.0, 3),
         (Weapon::Ripper, true) => missile(42, 0.58, 1, RazorAlt, 115.0, 0.0, 0),
         (Weapon::Minigun, _) => bullet(),

@@ -58,6 +58,23 @@ impl Kind {
         }
     }
 
+    pub(super) fn launch_offset(self, camera: &Camera, side: f32, variation: f32) -> Vec3 {
+        let forward = camera.look_direction();
+        let right = camera.right();
+        let up = forward.cross(right);
+        match self {
+            Kind::Pulse => {
+                let (sin, cos) = variation.sin_cos();
+                forward * 16.5 + right * (15.0 - 4.0 * sin) + up * (4.0 * cos - 10.78)
+            }
+            Kind::Rocket | Kind::Grenade => forward * 20.0 + right * (8.0 + side) - up * 9.0,
+            Kind::FlakShell | Kind::Chunk => forward * 20.0 + right * (11.0 + side) - up * 15.0,
+            Kind::Razor | Kind::RazorAlt => forward * 20.0 + right * 15.0 - up * 13.0,
+            Kind::Warhead | Kind::GuidedWarhead => forward * 19.8 + right - up * 11.89,
+            Kind::Gel | Kind::Glob | Kind::Splash => forward * 13.7 + right * 11.85 - up * 6.95,
+        }
+    }
+
     fn bio(self) -> bool {
         matches!(self, Self::Gel | Self::Glob | Self::Splash)
     }
@@ -98,6 +115,33 @@ pub type Arsenal = [Art; Kind::ALL.len()];
 pub enum Visual<'a> {
     Sprite(Vec3, &'a TextureImage, f32, f32),
     Mesh(Vec3, Vec3, Pose<'a>, f32, Option<f32>),
+}
+
+impl Art {
+    pub fn flight_visual(
+        &self,
+        kind: Kind,
+        position: Vec3,
+        direction: Vec3,
+        age: f32,
+        scale: f32,
+    ) -> Option<Visual<'_>> {
+        if kind == Kind::Pulse {
+            return Some(Visual::Sprite(
+                position,
+                self.sprite.as_ref()?.image(age),
+                self.scale.unwrap_or(0.19),
+                1.0,
+            ));
+        }
+        Some(Visual::Mesh(
+            position,
+            direction,
+            self.flight.sample_loop(age)?,
+            scale,
+            None,
+        ))
+    }
 }
 
 #[derive(Default)]
@@ -505,20 +549,7 @@ impl Shots {
         if kind == Kind::GuidedWarhead {
             self.guided_roll = 0.0;
         }
-        let forward = camera.look_direction();
-        let right = camera.right();
-        let up = forward.cross(right);
-        let offset = match kind {
-            Kind::Pulse => {
-                let (sin, cos) = variation.sin_cos();
-                forward * 16.5 + right * (15.0 - 4.0 * sin) + up * (4.0 * cos - 10.78)
-            }
-            Kind::Rocket | Kind::Grenade => forward * 20.0 + right * (8.0 + side) - up * 9.0,
-            Kind::FlakShell | Kind::Chunk => forward * 20.0 + right * (11.0 + side) - up * 15.0,
-            Kind::Razor | Kind::RazorAlt => forward * 20.0 + right * 15.0 - up * 13.0,
-            Kind::Warhead | Kind::GuidedWarhead => forward * 19.8 + right - up * 11.89,
-            Kind::Gel | Kind::Glob | Kind::Splash => forward * 13.7 + right * 11.85 - up * 6.95,
-        };
+        let offset = kind.launch_offset(camera, side, variation);
         let speed = art.speed.unwrap_or(match kind {
             Kind::Pulse => 1450.0,
             Kind::Rocket => 900.0,
@@ -972,17 +1003,6 @@ impl Shots {
         }
         for shot in &self.projectiles {
             let art = &assets[shot.kind as usize];
-            if shot.kind == Kind::Pulse {
-                if let Some(sprite) = &art.sprite {
-                    draw(Visual::Sprite(
-                        shot.position,
-                        sprite.image(time - shot.born),
-                        art.scale.unwrap_or(0.19),
-                        1.0,
-                    ));
-                }
-                continue;
-            }
             let (motion, age) = if let Some(at) = shot.stuck.filter(|_| shot.kind.bio()) {
                 let elapsed = time - at;
                 let after_hit = elapsed - art.stuck.duration();
@@ -1005,7 +1025,16 @@ impl Shots {
                     )
                 }
             } else {
-                (&art.flight, time - shot.born)
+                if let Some(visual) = art.flight_visual(
+                    shot.kind,
+                    shot.position,
+                    shot.direction,
+                    time - shot.born,
+                    shot.scale,
+                ) {
+                    draw(visual);
+                }
+                continue;
             };
             let duration = motion.duration();
             if duration > 0.0
