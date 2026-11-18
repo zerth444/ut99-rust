@@ -1056,6 +1056,9 @@ fn run_frontend(
                     match action {
                         Action::Deathmatch(index) => match frontend.load_match(index) {
                             Ok(arena) => {
+                                if menu.commit_match_settings(settings) {
+                                    save_settings(settings, settings_path);
+                                }
                                 frontend.pending_arena = arena;
                                 return Ok(action);
                             }
