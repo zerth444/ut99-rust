@@ -1,3 +1,4 @@
+mod assault;
 mod collision;
 #[cfg(windows)]
 mod frontend;
@@ -149,7 +150,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Some("ctf") => game::deathmatch::Mode::CaptureTheFlag,
             Some("dom") => game::deathmatch::Mode::Domination,
             Some("lms") => game::deathmatch::Mode::LastManStanding,
-            _ => return Err(io::Error::other("Mode must be dm, tdm, ctf, dom, or lms").into()),
+            Some("as") => game::deathmatch::Mode::Assault,
+            _ => return Err(io::Error::other("Mode must be dm, tdm, ctf, dom, lms, or as").into()),
         };
         Some(rules)
     } else {
@@ -191,6 +193,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
         if command == "map-info" {
+            if let Some(data) = &map.assault {
+                println!(
+                    "{} Assault objectives, {} triggers, {} relays, {} seconds",
+                    data.forts.len(),
+                    data.triggers.len(),
+                    data.relays.len(),
+                    data.seconds
+                );
+            }
             println!(
                 "{} flag bases, {} control points",
                 map.flag_bases.iter().flatten().count(),
@@ -293,7 +304,7 @@ fn print_usage() {
     println!("ut99-rust [--obs] [--nosound] view <map.unr> [player-start]");
     println!("ut99-rust [--obs] [--nosound] play <map.unr> [player-start]");
     println!(
-        "ut99-rust [--obs] [--nosound] deathmatch <map.unr> [player-start] [bots] [goal] [seconds] [difficulty: 1-3] [dm|tdm|ctf|dom|lms]"
+        "ut99-rust [--obs] [--nosound] deathmatch <map.unr> [player-start] [bots] [goal] [seconds] [difficulty: 1-3] [dm|tdm|ctf|dom|lms|as]"
     );
     println!("ut99-rust capture <map.unr> <output.bmp> [player-start]");
     println!("ut99-rust capture-practice <map.unr> <output.bmp> [player-start]");

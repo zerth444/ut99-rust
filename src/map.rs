@@ -88,6 +88,7 @@ pub struct Map {
     pub(crate) start_teams: Vec<Option<usize>>,
     pub(crate) flag_bases: [Option<Vec3>; 2],
     pub(crate) control_points: Vec<Vec3>,
+    pub(crate) assault: Option<crate::assault::AssaultMap>,
     pub navigation_points: Vec<Vec3>,
     pub(crate) lift_exits: Vec<LiftExit>,
     pub collision: Collision,
@@ -116,6 +117,7 @@ impl Map {
         match mode {
             Mode::CaptureTheFlag => self.flag_bases.iter().all(Option::is_some),
             Mode::Domination => !self.control_points.is_empty(),
+            Mode::Assault => self.assault.is_some(),
             _ => true,
         }
     }
@@ -130,6 +132,7 @@ impl Map {
             .ok_or_else(|| invalid("Package has no Level export"))?;
         let (model, actors) =
             level_data(package, level).map_err(|error| invalid(format!("Level: {error}")))?;
+        let mut assault = crate::assault::AssaultMap::load(package, &actors)?;
         let city_intro = path.filter(|path| {
             path.file_stem()
                 .is_some_and(|stem| stem.eq_ignore_ascii_case("CityIntro"))
@@ -172,6 +175,7 @@ impl Map {
                     path,
                     &zone_actors,
                     collision.regions.level,
+                    assault.as_mut(),
                 )
             })
             .transpose()?
@@ -270,7 +274,9 @@ impl Map {
             starts.push(start);
             start_teams.push(team);
         }
-        if flag_bases.iter().all(Option::is_some) && start_teams.contains(&Some(1)) {
+        if (assault.is_some() || flag_bases.iter().all(Option::is_some))
+            && start_teams.contains(&Some(1))
+        {
             for team in &mut start_teams {
                 team.get_or_insert(0);
             }
@@ -344,6 +350,7 @@ impl Map {
             start_teams,
             flag_bases,
             control_points,
+            assault,
             navigation_points,
             lift_exits,
             collision,

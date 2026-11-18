@@ -10,15 +10,17 @@ pub enum Mode {
     CaptureTheFlag,
     Domination,
     LastManStanding,
+    Assault,
 }
 
 impl Mode {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Deathmatch,
         Self::TeamDeathmatch,
         Self::CaptureTheFlag,
         Self::Domination,
         Self::LastManStanding,
+        Self::Assault,
     ];
 
     pub fn label(self) -> &'static str {
@@ -28,13 +30,14 @@ impl Mode {
             Self::CaptureTheFlag => "Capture the Flag",
             Self::Domination => "Domination",
             Self::LastManStanding => "Last Man Standing",
+            Self::Assault => "Assault",
         }
     }
 
     pub fn team_based(self) -> bool {
         matches!(
             self,
-            Self::TeamDeathmatch | Self::CaptureTheFlag | Self::Domination
+            Self::TeamDeathmatch | Self::CaptureTheFlag | Self::Domination | Self::Assault
         )
     }
 
@@ -42,6 +45,7 @@ impl Mode {
         match self {
             Self::CaptureTheFlag => "ctf-",
             Self::Domination => "dom-",
+            Self::Assault => "as-",
             _ => "dm-",
         }
     }
@@ -51,6 +55,7 @@ impl Mode {
             Self::CaptureTheFlag => "Capture limit",
             Self::Domination => "Score limit",
             Self::LastManStanding => "Lives",
+            Self::Assault => "Goals",
             _ => "Frag limit",
         }
     }

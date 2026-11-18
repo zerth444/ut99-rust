@@ -1120,7 +1120,7 @@ fn run_frontend(
                             }
                             Ok(_) => menu.status = "Map is missing objectives for this mode".into(),
                             Err(error) => {
-                                eprintln!("Loading Deathmatch map: {error}");
+                                eprintln!("Loading match map: {error}");
                                 menu.status = "COULD NOT LOAD MAP".into();
                             }
                         },

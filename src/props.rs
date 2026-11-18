@@ -424,6 +424,7 @@ pub fn load(
     path: &Path,
     zone_actors: &[i32],
     level: crate::movement::Zone,
+    assault: Option<&mut crate::assault::AssaultMap>,
 ) -> io::Result<Scene> {
     let Some(folder) = path.parent() else {
         return Ok(Scene::default());
@@ -484,6 +485,17 @@ pub fn load(
     let mut meshes = HashMap::new();
     let mut textures = HashMap::<Object, Option<Arc<Texture>>>::new();
     let mut waves = HashMap::new();
+    if let Some(assault) = assault {
+        for relay in &mut assault.relays {
+            if let crate::assault::RelayAction::Sound {
+                reference, wave, ..
+            } = &mut relay.action
+            {
+                let sound = assets.resolve(0, *reference);
+                *wave = cached_wave(&assets, &mut waves, sound);
+            }
+        }
+    }
     let mut props = Vec::new();
     for &actor in actors {
         let item = map.object_name(actor.class).and_then(Item::from_class);

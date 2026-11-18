@@ -54,7 +54,38 @@ impl Hud {
         let player = &game.fighters[0];
         let white = [0.92, 0.96, 1.0];
         let accent = [0.42, 0.87, 0.95];
-        if let Some([red, blue]) = game.team_scores() {
+        if let Some(status) = game.assault_status(map) {
+            let seconds = game.remaining();
+            let role = if status.attacking { "Attack" } else { "Defend" };
+            self.centered(
+                frame,
+                (22.0 * scale) as i32,
+                scale,
+                &format!(
+                    "Round {}/2    {}/{} objectives    {:02}:{:02}",
+                    status.half,
+                    status.completed,
+                    status.total,
+                    seconds / 60,
+                    seconds % 60
+                ),
+                white,
+            );
+            if let Some((name, message)) = status.notice {
+                self.centered(
+                    frame,
+                    (47.0 * scale) as i32,
+                    scale,
+                    &format!("{name} {message}"),
+                    accent,
+                );
+            } else {
+                let objective = status
+                    .objective
+                    .map_or_else(|| role.to_owned(), |name| format!("{role} {name}"));
+                self.centered(frame, (47.0 * scale) as i32, scale, &objective, accent);
+            }
+        } else if let Some([red, blue]) = game.team_scores() {
             let team = if player.team == Some(0) {
                 "Red"
             } else {
@@ -262,7 +293,17 @@ impl Hud {
             white,
         );
         let (frag_limit, time_limit) = game.limits();
-        let details = if let Some([red, blue]) = game.team_scores() {
+        let details = if let Some(status) = game.assault_status(map) {
+            let seconds = game.remaining();
+            format!(
+                "Round {}/2    {}/{} objectives    {:02}:{:02}",
+                status.half,
+                status.completed,
+                status.total,
+                seconds / 60,
+                seconds % 60
+            )
+        } else if let Some([red, blue]) = game.team_scores() {
             let seconds = if game.finished || time_limit == 0 {
                 game.time as u32
             } else {

@@ -149,7 +149,7 @@ fn match_catalog<'a>(base: &Path, directories: impl IntoIterator<Item = &'a Path
         {
             let path = entry.path();
             if let Some(name) = key(&path)
-                && ["dm-", "ctf-", "dom-"]
+                && ["dm-", "ctf-", "dom-", "as-"]
                     .iter()
                     .any(|prefix| name.starts_with(prefix))
                 && name.ends_with(".unr")
@@ -360,6 +360,9 @@ impl MatchSetup {
     }
 
     fn change(&mut self, field: usize, step: i32) {
+        if self.mode == Mode::Assault && field >= 2 {
+            return;
+        }
         let (min, max) = self.bounds(field);
         self.values[field] = self.values[field]
             .saturating_add_signed(step)
@@ -367,6 +370,9 @@ impl MatchSetup {
     }
 
     fn bounds(&self, field: usize) -> (u32, u32) {
+        if self.mode == Mode::Assault && field >= 2 {
+            return (self.values[field], self.values[field]);
+        }
         let (min, max) = MATCH_BOUNDS[field];
         (
             if field == 2 && self.mode == Mode::LastManStanding {
@@ -379,6 +385,9 @@ impl MatchSetup {
     }
 
     fn value(&self, field: usize) -> String {
+        if self.mode == Mode::Assault && field >= 2 {
+            return "Set by map".into();
+        }
         let value = self.values[field];
         match field {
             0 => crate::game::deathmatch::Difficulty::from_level(value)
@@ -1596,6 +1605,7 @@ mod tests {
             "DOM-A".into(),
             "CTF-A".into(),
             "CTF-B".into(),
+            "AS-A".into(),
         ];
         setup.read_maps(&names);
         assert!(setup.launch() == Action::StartMatch(0, Mode::Deathmatch));
@@ -1608,6 +1618,77 @@ mod tests {
         assert!(setup.launch() == Action::StartMatch(1, Mode::Domination));
         setup.change_mode(&names, 1);
         assert!(setup.launch() == Action::StartMatch(0, Mode::LastManStanding));
+        setup.change_mode(&names, 1);
+        assert!(setup.launch() == Action::StartMatch(4, Mode::Assault));
+    }
+
+    #[test]
+    #[ignore = "requires the local reference-client map installation"]
+    fn installed_assault_maps_load_and_start_both_sides() {
+        use crate::game::deathmatch::{Command, Match, Rules};
+
+        let reference = Path::new("local/reference-client/Maps");
+        let maps = match_catalog(&reference.join("DM-Deck16][.unr"), [reference]);
+        let mut count = 0;
+        for path in maps.iter().filter(|path| {
+            path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .to_ascii_lowercase()
+                    .starts_with(Mode::Assault.map_prefix())
+            })
+        }) {
+            count += 1;
+            let bytes = fs::read(path).unwrap();
+            let package = Package::read(&bytes).unwrap();
+            let mut map = Map::load(&package, Some(path))
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            let data = map.assault.as_ref().unwrap();
+            assert!(
+                data.forts.len() >= 3 && data.seconds >= 240,
+                "{}",
+                path.display()
+            );
+            assert!(
+                map.hud.ready() && map.faces.iter().any(|face| face.texture.is_some()),
+                "{}",
+                path.display()
+            );
+            if path.file_stem().is_some_and(|name| name == "AS-Rook") {
+                assert!(
+                    map.faces.iter().all(|face| face.texture.is_some()),
+                    "AS-Rook is missing BSP materials"
+                );
+            }
+            let mut game = Match::new(
+                &map,
+                0,
+                Rules {
+                    mode: Mode::Assault,
+                    bots: 3,
+                    ..Rules::default()
+                },
+            );
+            let first = game.fighters[0].walker.position;
+            for _ in 0..60 {
+                game.step(&mut map, Command::default(), 1.0 / 120.0);
+            }
+            assert_eq!(game.assault_status(&map).map(|state| state.half), Some(1));
+            assert!(
+                game.fighters.iter().all(|fighter| fighter.health > 0),
+                "{}",
+                path.display()
+            );
+            game.time = f32::from(map.assault.as_ref().unwrap().seconds);
+            game.step(&mut map, Command::default(), 1.0 / 120.0);
+            assert_eq!(game.assault_status(&map).map(|state| state.half), Some(2));
+            let second = game.fighters[0].walker.position;
+            assert!(
+                (second - first).dot(second - first) > 17.0_f32.powi(2),
+                "same spawn after side switch on {}",
+                path.display()
+            );
+        }
+        assert!(count >= 8);
     }
 
     #[test]

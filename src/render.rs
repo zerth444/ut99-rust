@@ -581,7 +581,7 @@ impl Frame {
             && !piloting
         {
             self.layer(Layer::Hud);
-            for (position, marker, team) in game.objective_markers() {
+            for (position, marker, team) in game.objective_markers(map) {
                 self.match_marker(map, &view, position + Vec3(0.0, 0.0, 34.0), team, marker);
             }
             for fighter in &game.fighters[1..] {

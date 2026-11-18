@@ -239,6 +239,7 @@ fn blast_sound(assets: &Assets) -> Option<Arc<Wave>> {
 pub(super) enum Target {
     Pawn(usize),
     Projectile(usize),
+    Objective(crate::assault::Target),
 }
 
 pub(super) trait Targets {
@@ -304,6 +305,7 @@ impl Targets for PracticeTargets<'_> {
                 self.ordnance
                     .damage_target(&self.map.ordnance, index, damage, self.now, sounds)
             }
+            Target::Objective(_) => None,
         }
     }
 }

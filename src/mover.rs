@@ -10,6 +10,8 @@ enum Activation {
     Stand,
     Bump,
     Trigger,
+    Control,
+    Toggle,
     Unsupported,
 }
 
@@ -49,6 +51,11 @@ pub struct Mover {
     triggers: Vec<Trigger>,
     activation: Activation,
     pub(crate) tag: Option<usize>,
+    event: Option<usize>,
+    trigger_once: bool,
+    signaled: Option<bool>,
+    control_sources: usize,
+    damage_threshold: Option<f32>,
     pub attach_tag: Option<usize>,
     #[cfg(windows)]
     scene_keys: Vec<(Vec3, Vec3)>,
@@ -196,10 +203,13 @@ impl Mover {
 
     pub(crate) fn reset_motion(&mut self, world: &mut Collision) {
         self.offset = Vec3::default();
+        self.scene_rotation = Vec3::default();
         self.fraction = 0.0;
         self.countdown = 0.0;
         self.opening = false;
         self.ready = true;
+        self.signaled = None;
+        self.control_sources = 0;
         if let Some(hull) = self.hull {
             world.set_box(hull, self.min, self.max);
         }
@@ -212,8 +222,73 @@ impl Mover {
         dt: f32,
         service: Option<LiftStop>,
     ) {
-        let min = self.min + self.offset;
-        let max = self.max + self.offset;
+        self.tick_motion(world, walkers, dt, service, false);
+    }
+
+    pub(crate) fn signal(&mut self, tag: usize, attacker: bool) {
+        if self.tag != Some(tag)
+            || !matches!(
+                self.activation,
+                Activation::Trigger | Activation::Control | Activation::Toggle
+            )
+            || (self.trigger_once && self.signaled.is_some())
+        {
+            return;
+        }
+        self.signaled = Some(attacker);
+        if matches!(self.activation, Activation::Control) {
+            self.control_sources = self.control_sources.saturating_add(1);
+        }
+        self.opening = if matches!(self.activation, Activation::Toggle) {
+            !self.opening
+        } else {
+            true
+        };
+        self.countdown = self.pause;
+    }
+
+    pub(crate) fn release_signal(&mut self, tag: usize) {
+        if self.tag == Some(tag)
+            && matches!(self.activation, Activation::Control)
+            && !self.trigger_once
+        {
+            self.control_sources = self.control_sources.saturating_sub(1);
+            self.opening = self.control_sources > 0;
+        }
+    }
+
+    pub(crate) fn damage_event(&self, hull: usize, damage: u16) -> Option<usize> {
+        self.tag.filter(|_| {
+            self.hull == Some(hull)
+                && self
+                    .damage_threshold
+                    .is_some_and(|threshold| f32::from(damage) >= threshold)
+        })
+    }
+
+    pub(crate) fn tick_scripted(
+        &mut self,
+        world: &mut Collision,
+        walkers: &mut [&mut Walker],
+        dt: f32,
+        service: Option<LiftStop>,
+    ) -> Option<(usize, bool)> {
+        let before = self.fraction;
+        self.tick_motion(world, walkers, dt, service, true);
+        self.event
+            .filter(|_| before != 1.0 && self.fraction == 1.0)
+            .map(|event| (event, self.signaled.unwrap_or(false)))
+    }
+
+    fn tick_motion(
+        &mut self,
+        world: &mut Collision,
+        walkers: &mut [&mut Walker],
+        dt: f32,
+        service: Option<LiftStop>,
+        scripted: bool,
+    ) {
+        let (min, max) = self.bounds_at(self.offset, self.scene_rotation);
         let on_board = |walker: &Walker| self.hull.is_some() && walker.on_box(min, max);
         let requested = match self.activation {
             Activation::Stand => walkers.iter().any(|walker| on_board(walker)),
@@ -223,10 +298,10 @@ impl Mover {
                         .iter()
                         .any(|walker| walker.touches_box(min, max, 1.0))
             }
-            Activation::Trigger => walkers
+            Activation::Trigger if !scripted => walkers
                 .iter()
                 .any(|walker| self.triggers.iter().any(|trigger| trigger.touches(walker))),
-            Activation::Unsupported => false,
+            _ => false,
         };
         if let Some(stop) = service {
             self.opening = stop == LiftStop::Away;
@@ -242,7 +317,12 @@ impl Mover {
                 self.opening = true;
                 self.ready = false;
             }
-        } else if self.fraction == 1.0 {
+        } else if self.fraction == 1.0
+            && !(scripted
+                && self.signaled.is_some()
+                && (self.trigger_once
+                    || matches!(self.activation, Activation::Toggle | Activation::Control)))
+        {
             self.countdown -= dt;
             if self.countdown <= 0.0 {
                 self.opening = false;
@@ -260,10 +340,19 @@ impl Mover {
             next
         };
         let offset = self.travel * fraction;
+        #[cfg(windows)]
+        let rotation = if scripted {
+            self.scene_keys
+                .get(1)
+                .map_or(Vec3::default(), |(_, angle)| *angle * fraction)
+        } else {
+            Vec3::default()
+        };
+        #[cfg(not(windows))]
+        let rotation = Vec3::default();
         let delta = offset - self.offset;
         if let Some(id) = self.hull {
-            let new_min = self.min + offset;
-            let new_max = self.max + offset;
+            let (new_min, new_max) = self.bounds_at(offset, rotation);
             if walkers
                 .iter()
                 .any(|walker| !on_board(walker) && walker.touches_box(new_min, new_max, -0.5))
@@ -292,10 +381,29 @@ impl Mover {
             }
         }
         self.offset = offset;
+        self.scene_rotation = rotation;
         self.fraction = next;
         if next == 1.0 {
             self.countdown = self.pause;
         }
+    }
+
+    fn bounds_at(&self, offset: Vec3, rotation: Vec3) -> (Vec3, Vec3) {
+        if rotation.dot(rotation) <= f32::EPSILON {
+            return (self.min + offset, self.max + offset);
+        }
+        let mut min = Vec3(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+        let mut max = min * -1.0;
+        for x in [self.min.0, self.max.0] {
+            for y in [self.min.1, self.max.1] {
+                for z in [self.min.2, self.max.2] {
+                    let point = self.pivot + offset + rotate(Vec3(x, y, z) - self.pivot, rotation);
+                    min = Vec3(min.0.min(point.0), min.1.min(point.1), min.2.min(point.2));
+                    max = Vec3(max.0.max(point.0), max.1.max(point.1), max.2.max(point.2));
+                }
+            }
+        }
+        (min, max)
     }
 }
 
@@ -329,6 +437,10 @@ impl Brush {
         let mut keys = [(Vec3::default(), Vec3::default()); 8];
         #[cfg(windows)]
         let mut key_count = 2;
+        let mut event = None;
+        let mut trigger_once = false;
+        let mut damage_triggered = false;
+        let mut damage_threshold = 0.0;
         while let Some(property) = props.next_tag()? {
             let mut value = property.value;
             match property.name {
@@ -368,6 +480,13 @@ impl Brush {
                 "StayOpenTime" => pause = value.f32()?,
                 "MoverGlideType" => glide = value.byte()? != 0,
                 "Tag" => tag = Some(value.index()?),
+                "Event" => {
+                    let index = value.index()?;
+                    event = (package.name(index)? != "None").then_some(index);
+                }
+                "bTriggerOnceOnly" => trigger_once = property.boolean.unwrap_or(false),
+                "bDamageTriggered" => damage_triggered = property.boolean.unwrap_or(false),
+                "DamageThreshold" => damage_threshold = value.f32()?,
                 "AttachTag" => {
                     let index = value.index()?;
                     attach_tag = (package.name(index)? != "None").then_some(index);
@@ -378,6 +497,8 @@ impl Brush {
                         "StandOpenTimed" => Activation::Stand,
                         "BumpOpenTimed" => Activation::Bump,
                         "TriggerOpenTimed" => Activation::Trigger,
+                        "TriggerControl" => Activation::Control,
+                        "TriggerToggle" => Activation::Toggle,
                         _ => Activation::Unsupported,
                     };
                 }
@@ -479,6 +600,11 @@ impl Brush {
                 triggers,
                 activation,
                 tag,
+                event,
+                trigger_once,
+                signaled: None,
+                control_sources: 0,
+                damage_threshold: damage_triggered.then_some(damage_threshold),
                 attach_tag,
                 #[cfg(windows)]
                 scene_keys: keys[..key_count].to_vec(),

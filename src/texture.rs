@@ -546,7 +546,7 @@ pub fn load_materials(
             folder.join("../Textures"),
         ]
     });
-    let files: HashMap<_, _> = search_paths
+    let mut files: HashMap<_, _> = search_paths
         .filter_map(|folder| fs::read_dir(folder).ok())
         .flatten()
         .filter_map(Result::ok)
@@ -557,6 +557,20 @@ pub fn load_materials(
             Some((path.file_stem()?.to_str()?.to_ascii_lowercase(), path))
         })
         .collect();
+    if let Some(folder) = path.parent()
+        && let Ok(entries) = fs::read_dir(folder.join("../System"))
+    {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("u"))
+                && let Some(name) = path.file_stem().and_then(|name| name.to_str())
+            {
+                files.entry(name.to_ascii_lowercase()).or_insert(path);
+            }
+        }
+    }
 
     let read = |package: &Package<'_>, item: &Export| {
         let result = match package.object_name(item.class) {

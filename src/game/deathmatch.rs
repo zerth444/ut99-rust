@@ -2,6 +2,7 @@
 
 mod ai;
 mod arsenal;
+mod assault;
 mod guidance;
 mod navigation;
 mod objectives;
@@ -85,6 +86,7 @@ pub struct Fighter {
     pickup: Option<Item>,
     beam_contact: Option<(usize, u16, f32)>,
     beam_last_hit: f32,
+    assault_beam: Option<(crate::assault::Target, f32)>,
     pub last_alt: bool,
     zoom: super::SniperZoom,
     rocket_lock: Option<(usize, u16, f32)>,
@@ -147,6 +149,7 @@ impl Fighter {
             pickup: None,
             beam_contact: None,
             beam_last_hit: f32::NEG_INFINITY,
+            assault_beam: None,
             last_alt: false,
             zoom: super::SniperZoom::default(),
             rocket_lock: None,
@@ -743,12 +746,18 @@ struct ShockTargets<'a> {
 
 impl shock::Targets for ShockTargets<'_> {
     fn trace(&self, owner: usize, start: Vec3, delta: Vec3) -> Option<(shock::Target, f32)> {
-        shock::nearest(
+        let contact = shock::nearest(
             nearest_hit(&self.game.fighters, owner, start, delta, [0.0, 0.0])
                 .map(|(id, at)| (shock::Target::Pawn(id), at)),
             self.game
                 .closest_explosive(self.map, start, delta)
                 .map(|(id, at)| (shock::Target::Projectile(id), at)),
+        );
+        shock::nearest(
+            contact,
+            self.game
+                .assault_target(self.map, owner, start, delta)
+                .map(|(at, target)| (shock::Target::Objective(target), at)),
         )
     }
 
@@ -772,6 +781,11 @@ impl shock::Targets for ShockTargets<'_> {
                 self.game
                     .intercept(self.map, index, owner, self.hits, sounds);
             }
+            shock::Target::Objective(target) => {
+                let scale = self.game.shock_damage_scale(owner);
+                self.game
+                    .damage_objective(self.map, owner, target, damage.saturating_mul(scale));
+            }
         }
         None
     }
@@ -780,6 +794,8 @@ impl shock::Targets for ShockTargets<'_> {
 pub struct Match {
     rules: Rules,
     objectives: objectives::Objectives,
+    assault: Option<assault::Round>,
+    initial_starts: Vec<bool>,
     preferred_start: usize,
     pub time: f32,
     pub fighters: Vec<Fighter>,
@@ -810,11 +826,26 @@ pub struct Match {
     player_frags: (u8, f32),
 }
 
+pub struct AssaultStatus<'a> {
+    pub half: usize,
+    pub attacking: bool,
+    pub completed: usize,
+    pub total: usize,
+    pub objective: Option<&'a str>,
+    pub notice: Option<(&'a str, &'a str)>,
+}
+
 impl Match {
     pub fn new(map: &Map, start: usize, rules: Rules) -> Self {
         let mut game = Self {
             rules,
             objectives: objectives::Objectives::new(map, rules.mode),
+            assault: map
+                .assault
+                .as_ref()
+                .filter(|_| rules.mode == Mode::Assault)
+                .map(|data| assault::Round::new(data, 0, None)),
+            initial_starts: map.starts.iter().map(|start| start.enabled).collect(),
             preferred_start: start,
             time: 0.0,
             fighters: Vec::with_capacity(rules.bots + 1),
@@ -896,13 +927,40 @@ impl Match {
             (self.rules.frag_limit.max(1) as u16).saturating_sub(self.fighters[fighter].deaths)
         })
     }
-    pub(crate) fn objective_markers(
-        &self,
-    ) -> impl Iterator<Item = (Vec3, Marker, Option<usize>)> + '_ {
-        self.objectives.markers(&self.fighters)
+    pub(crate) fn objective_markers<'a>(
+        &'a self,
+        map: &'a Map,
+    ) -> impl Iterator<Item = (Vec3, Marker, Option<usize>)> + 'a {
+        let forts = map
+            .assault
+            .as_ref()
+            .zip(self.assault.as_ref())
+            .into_iter()
+            .flat_map(|(data, round)| {
+                data.forts
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(index, fort)| {
+                        round.active(index).then_some((
+                            fort.volume.position,
+                            Marker::ControlPoint,
+                            Some(1 - round.attack_team),
+                        ))
+                    })
+            });
+        self.objectives.markers(&self.fighters).chain(forts)
     }
 
     fn restart(&mut self, map: &mut Map) {
+        self.assault = map
+            .assault
+            .as_ref()
+            .filter(|_| self.rules.mode == Mode::Assault)
+            .map(|data| assault::Round::new(data, 0, None));
+        self.reset_round(map);
+    }
+
+    fn reset_round(&mut self, map: &mut Map) {
         self.time = 0.0;
         self.finished = false;
         self.overtime = false;
@@ -923,10 +981,15 @@ impl Match {
         self.announcement = None;
         self.first_frag = false;
         self.player_frags = (0, f32::NEG_INFINITY);
+        self.recent_spawns.fill(None);
+        self.spawn_sequence = 0;
         self.spawn_all(map);
     }
 
     pub fn restore_map(&self, map: &mut Map) {
+        for (start, &enabled) in map.starts.iter_mut().zip(&self.initial_starts) {
+            start.enabled = enabled;
+        }
         for (prop, &visible) in map.props.iter_mut().zip(&self.initial_props) {
             prop.visible = visible;
         }
@@ -937,17 +1000,20 @@ impl Match {
 
     fn choose_spawn(&self, map: &Map, fighter: usize, previous: Option<usize>) -> usize {
         let own = self.team_for(fighter);
-        let has_team_start = own.is_some()
+        let spawn_team = self.assault.as_ref().zip(own).map_or(own, |(round, team)| {
+            Some(usize::from(team == round.attack_team))
+        });
+        let has_team_start = spawn_team.is_some()
             && map
                 .start_teams
                 .iter()
                 .enumerate()
-                .any(|(index, &team)| team == own && usable_start(map, index).is_some());
+                .any(|(index, &team)| team == spawn_team && usable_start(map, index).is_some());
         map.starts
             .iter()
             .enumerate()
             .filter_map(|(index, _)| {
-                if has_team_start && map.start_teams.get(index).copied().flatten() != own {
+                if has_team_start && map.start_teams.get(index).copied().flatten() != spawn_team {
                     return None;
                 }
                 let start = usable_start(map, index)?;
@@ -989,7 +1055,37 @@ impl Match {
     }
 
     pub fn remaining(&self) -> u16 {
-        (f32::from(self.rules.seconds) - self.time).ceil().max(0.0) as u16
+        let limit = self
+            .assault
+            .as_ref()
+            .map_or(f32::from(self.rules.seconds), |round| round.limit);
+        (limit - self.time).ceil().max(0.0) as u16
+    }
+
+    pub fn assault_status<'a>(&self, map: &'a Map) -> Option<AssaultStatus<'a>> {
+        let round = self.assault.as_ref()?;
+        let data = map.assault.as_ref()?;
+        let notice = round
+            .notice
+            .filter(|&(_, until)| self.time < until)
+            .map(|(index, _)| {
+                (
+                    data.forts[index].name.as_str(),
+                    data.forts[index].message.as_str(),
+                )
+            });
+        let objective = round
+            .destination(data, self.fighters[0].walker.position)
+            .map(|index| data.forts[index].name.as_str())
+            .filter(|name| !name.trim().is_empty());
+        Some(AssaultStatus {
+            half: 1 + round.attack_team,
+            attacking: round.attack_team == 0,
+            completed: round.completed(),
+            total: data.forts.len(),
+            objective,
+            notice,
+        })
     }
 
     pub fn limits(&self) -> (i16, u16) {
@@ -1381,12 +1477,16 @@ impl Match {
                 .map(|fighter| &mut fighter.walker)
                 .collect();
             for (mover, request) in map.movers.iter_mut().zip(requests) {
-                mover.tick_many(
-                    &mut map.collision,
-                    &mut walkers,
-                    dt,
-                    request.map(|(_, stop)| stop),
-                );
+                let stop = request.map(|(_, stop)| stop);
+                if let Some(round) = &mut self.assault {
+                    if let Some((event, attacker)) =
+                        mover.tick_scripted(&mut map.collision, &mut walkers, dt, stop)
+                    {
+                        round.emit(self.time, event, attacker);
+                    }
+                } else {
+                    mover.tick_many(&mut map.collision, &mut walkers, dt, stop);
+                }
             }
         }
         let mut hits = Vec::new();
@@ -1627,6 +1727,42 @@ impl Match {
         self.decals.follow_movers(&map.movers);
         self.ballistics
             .update(map, None, self.time, dt, &mut sounds);
+        if let Some(round) = &mut self.assault {
+            round.tick(map, &self.fighters, self.time, &mut sounds);
+            let conquered = round.completed_at.filter(|&at| at <= round.limit);
+            if let Some(result_at) = conquered
+                .map(|at| at + 2.0)
+                .or_else(|| (self.time >= round.limit).then_some(round.limit))
+                && self.time >= result_at
+            {
+                if let Some(first) = round.first_attack {
+                    let winner = if conquered.is_some() {
+                        Some(round.attack_team)
+                    } else {
+                        first.map(|_| 1 - round.attack_team)
+                    };
+                    self.finished = true;
+                    if let Some(team) = winner {
+                        self.objectives.scores[team] = 1;
+                        let (sound, text) = if team == 0 {
+                            (3, "MATCH WON")
+                        } else {
+                            (4, "MATCH LOST")
+                        };
+                        self.announce(map, sound, text, &mut sounds);
+                    }
+                } else {
+                    let data = map
+                        .assault
+                        .as_ref()
+                        .expect("Assault round requires map objectives");
+                    self.assault = Some(assault::Round::new(data, 1, Some(conquered)));
+                    self.reset_round(map);
+                    self.announcement = Some(("SWITCHING SIDES", 3.0));
+                }
+            }
+            return sounds;
+        }
         let score_reached = match self.rules.mode {
             Mode::LastManStanding => {
                 self.fighters.len() > 1
@@ -1892,14 +2028,17 @@ impl Match {
             .map_or(0.0, |since| (self.time - since) * 0.75);
         let contact = charge > 1.0
             && map.collision.ray(camera.position, forward * 25.0).is_none()
-            && nearest_hit(
+            && (nearest_hit(
                 &self.fighters,
                 id,
                 camera.position,
                 forward * 25.0,
                 [0.0; 2],
             )
-            .is_some();
+            .is_some()
+                || self
+                    .assault_target(map, id, camera.position, forward * 25.0)
+                    .is_some());
         let fighter = &mut self.fighters[id];
         let art = map.arsenal.get(&Weapon::Hammer);
         if (input.primary && !contact) || (fighter.hammer_charge.is_none() && !alternate) {
@@ -1952,7 +2091,14 @@ impl Match {
             }
         }
         let (start, delta, wall) = super::hammer_trace(map, &camera, alternate);
-        if let Some((victim, at)) = nearest_hit(&self.fighters, id, start, delta, [0.0; 2]) {
+        let pawn = nearest_hit(&self.fighters, id, start, delta, [0.0; 2]);
+        if let Some((at, objective)) = self.assault_target(map, id, start, delta)
+            && pawn.is_none_or(|(_, other)| at < other)
+        {
+            let offset = start + delta * at - camera.position;
+            let damage = super::hammer_damage(alternate, offset.dot(offset).sqrt(), charge);
+            self.damage_objective(map, id, objective, damage * scale);
+        } else if let Some((victim, at)) = pawn {
             let offset = start + delta * at - camera.position;
             let damage = super::hammer_damage(alternate, offset.dot(offset).sqrt(), charge);
             hits.push(Hit {
@@ -2405,9 +2551,40 @@ impl Match {
                 let clipped = end - start;
                 let target = nearest_hit(&self.fighters, id, start, clipped, [0.0, 0.0]);
                 let projectile = self.closest_explosive(map, start, clipped);
-                let intercepted = projectile
-                    .filter(|&(_, at)| target.is_none_or(|(_, victim_at)| at < victim_at));
-                let fraction = if let Some((projectile, at)) = intercepted {
+                let objective = (!pulse_alt)
+                    .then(|| {
+                        self.assault
+                            .as_ref()
+                            .zip(map.assault.as_ref())
+                            .and_then(|(round, data)| {
+                                round.trace(
+                                    data,
+                                    start,
+                                    clipped,
+                                    self.fighters[id].team == Some(round.attack_team),
+                                )
+                            })
+                    })
+                    .flatten()
+                    .filter(|&(at, _)| {
+                        target.is_none_or(|(_, other)| at < other)
+                            && projectile.is_none_or(|(_, other)| at < other)
+                    });
+                let intercepted = projectile.filter(|&(_, at)| {
+                    objective.is_none() && target.is_none_or(|(_, victim_at)| at < victim_at)
+                });
+                let fraction = if let Some((at, objective)) = objective {
+                    let round = self.assault.as_mut().unwrap();
+                    let attacker = self.fighters[id].team == Some(round.attack_team);
+                    round.damage(
+                        map.assault.as_ref().unwrap(),
+                        objective,
+                        damage,
+                        self.time,
+                        attacker,
+                    );
+                    at
+                } else if let Some((projectile, at)) = intercepted {
                     self.intercept(map, projectile, id, hits, sounds);
                     at
                 } else if let Some((victim, at)) = target
@@ -2437,6 +2614,21 @@ impl Match {
                     });
                     at
                 } else {
+                    if !pulse_alt
+                        && let Some(round) = &mut self.assault
+                        && let Some((_, _, hull)) =
+                            map.collision.projectile_contact(start, delta, 0.0, 0.0)
+                        && let Some(event) = map
+                            .movers
+                            .iter()
+                            .find_map(|mover| mover.damage_event(hull, damage))
+                    {
+                        round.emit(
+                            self.time,
+                            event,
+                            self.fighters[id].team == Some(round.attack_team),
+                        );
+                    }
                     1.0
                 };
                 if bullet.is_some() {
@@ -2450,7 +2642,9 @@ impl Match {
                             start,
                             delta,
                             visible: clipped * fraction,
-                            wall: wall.filter(|_| target.is_none() && intercepted.is_none()),
+                            wall: wall.filter(|_| {
+                                target.is_none() && intercepted.is_none() && objective.is_none()
+                            }),
                             case_origin,
                         },
                         &mut self.fighters[id].bullet_cadence,
@@ -2501,24 +2695,31 @@ impl Match {
             let beam = fighter
                 .pulse
                 .filter(|(alternate, _)| *alternate && fighter.health > 0);
-            if beam.is_none() && fighter.beam_contact.is_none() {
+            if beam.is_none() && fighter.beam_contact.is_none() && fighter.assault_beam.is_none() {
                 continue;
             }
             let camera = fighter.camera(map);
-            let target = beam.and_then(|(_, since)| {
-                let beam = PulseBeam::trace(map, &camera, since);
+            let beam = beam.map(|(_, since)| PulseBeam::trace(map, &camera, since));
+            let mut objective = None;
+            let target = beam.as_ref().and_then(|beam| {
                 let delta = beam.end - beam.start;
                 if beam.blocked {
                     return None;
                 }
-                let (victim, at) = nearest_hit(&self.fighters, id, beam.start, delta, [0.0, 0.0])?;
-                if self
+                let block = self
                     .closest_explosive(map, beam.start, delta)
-                    .is_some_and(|(_, fraction)| fraction < at)
+                    .map_or(1.0, |(_, at)| at);
+                let pawn = nearest_hit(&self.fighters, id, beam.start, delta, [0.0, 0.0])
+                    .filter(|&(_, at)| at <= block);
+                if let Some((at, hit)) = self.assault_target(map, id, beam.start, delta)
+                    && at <= block
+                    && pawn.is_none_or(|(_, other)| at < other)
                 {
-                    return None;
+                    objective = Some(hit);
+                    None
+                } else {
+                    pawn.map(|(victim, _)| (victim, self.fighters[victim].deaths))
                 }
-                Some((victim, self.fighters[victim].deaths))
             });
             let boost = if fighter.amp_left(self.time) > 0.0 {
                 3
@@ -2563,11 +2764,39 @@ impl Match {
                 }
                 (victim, life, duration)
             });
+            let previous = fighter.assault_beam;
+            fighter.assault_beam = objective.map(|target| {
+                let prior = previous
+                    .filter(|&(last, _)| last == target)
+                    .map_or(0.0, |(_, duration)| duration);
+                let duration = prior + dt;
+                (target, if duration >= 0.22 { 0.0 } else { duration })
+            });
+            if let Some((last, duration)) = previous {
+                let contact = if Some(last) == objective {
+                    if duration + dt >= 0.22 {
+                        duration + dt
+                    } else {
+                        0.0
+                    }
+                } else {
+                    duration
+                };
+                if contact > 0.0 {
+                    self.damage_objective(
+                        map,
+                        id,
+                        last,
+                        (PulseBeam::DAMAGE_PER_SECOND * contact) as u16 * boost,
+                    );
+                }
+            }
         }
     }
 
-    fn shock_blast(&self, map: &Map, owner: usize, blast: shock::Blast, hits: &mut Vec<Hit>) {
+    fn shock_blast(&mut self, map: &Map, owner: usize, blast: shock::Blast, hits: &mut Vec<Hit>) {
         let scale = self.shock_damage_scale(owner);
+        self.assault_blast(map, owner, &blast, scale);
         for (victim, fighter) in self
             .fighters
             .iter()
@@ -2771,7 +3000,45 @@ impl Match {
                 end - bolt.position,
                 [radius, height],
             );
-            if target.is_none() && !expired {
+            let mut objective_impact = None;
+            if !expired && let Some((round, data)) = self.assault.as_mut().zip(map.assault.as_ref())
+            {
+                let attacker = self.fighters[bolt.owner].team == Some(round.attack_team);
+                if let Some((at, objective)) =
+                    round.trace(data, bolt.position, end - bolt.position, attacker)
+                    && target.is_none_or(|(_, other)| at < other)
+                {
+                    objective_impact = Some(bolt.position + (end - bolt.position) * at);
+                    if payload.blast == 0.0 {
+                        round.damage(data, objective, payload.damage, self.time, attacker);
+                        sounds.extend_at(
+                            art.contact.iter().cloned(),
+                            objective_impact.unwrap(),
+                            CONTACT_SOUND_RADIUS,
+                            1.0,
+                        );
+                        return false;
+                    }
+                }
+            }
+            let target = target.filter(|_| objective_impact.is_none());
+            if target.is_none()
+                && objective_impact.is_none()
+                && !expired
+                && let Some((_, _, hull)) = contact
+                && let Some(round) = &mut self.assault
+                && let Some(event) = map
+                    .movers
+                    .iter()
+                    .find_map(|mover| mover.damage_event(hull, payload.damage))
+            {
+                round.emit(
+                    self.time,
+                    event,
+                    self.fighters[bolt.owner].team == Some(round.attack_team),
+                );
+            }
+            if target.is_none() && objective_impact.is_none() && !expired {
                 if payload.kind.bio()
                     && let Some((point, normal, hull)) = contact
                 {
@@ -2862,8 +3129,10 @@ impl Match {
                     return true;
                 }
             }
-            let position = target.map_or(end, |(_, fraction)| {
-                bolt.position + (end - bolt.position) * fraction
+            let position = objective_impact.unwrap_or_else(|| {
+                target.map_or(end, |(_, fraction)| {
+                    bolt.position + (end - bolt.position) * fraction
+                })
             }) - unit(bolt.velocity) * 0.5;
             if payload.blast > 0.0
                 && !(payload.kind == ordnance::Kind::RazorAlt && target.is_some())
@@ -2871,6 +3140,7 @@ impl Match {
                 if payload.kind == ordnance::Kind::FlakShell
                     && target.is_none()
                     && !expired
+                    && objective_impact.is_none()
                     && let Some((point, normal)) = wall
                 {
                     let chunk = &map.ordnance[ordnance::Kind::Chunk as usize];
@@ -3101,6 +3371,7 @@ impl Match {
             } else {
                 1
             };
+            self.assault_blast(map, owner, &blast, if warhead { damage_scale } else { 1 });
             for (victim, fighter) in self
                 .fighters
                 .iter()
@@ -3373,6 +3644,74 @@ impl Match {
         }
     }
 
+    fn assault_target(
+        &self,
+        map: &Map,
+        owner: usize,
+        start: Vec3,
+        delta: Vec3,
+    ) -> Option<(f32, crate::assault::Target)> {
+        let (round, data) = self.assault.as_ref().zip(map.assault.as_ref())?;
+        round.trace(
+            data,
+            start,
+            delta,
+            self.fighters[owner].team == Some(round.attack_team),
+        )
+    }
+
+    fn damage_objective(
+        &mut self,
+        map: &Map,
+        owner: usize,
+        target: crate::assault::Target,
+        damage: u16,
+    ) {
+        if let Some((round, data)) = self.assault.as_mut().zip(map.assault.as_ref()) {
+            round.damage(
+                data,
+                target,
+                damage,
+                self.time,
+                self.fighters[owner].team == Some(round.attack_team),
+            );
+        }
+    }
+
+    fn assault_blast(&mut self, map: &Map, owner: usize, blast: &shock::Blast, scale: u16) {
+        let Some((round, data)) = self.assault.as_mut().zip(map.assault.as_ref()) else {
+            return;
+        };
+        let attacker = self.fighters[owner].team == Some(round.attack_team);
+        for (index, fort) in data.forts.iter().enumerate() {
+            if !fort.touch
+                && round.active(index)
+                && let Some((damage, _)) = blast.hit_player(&map.collision, fort.volume.position)
+            {
+                round.damage(
+                    data,
+                    crate::assault::Target::Fort(index),
+                    damage.saturating_mul(scale),
+                    self.time,
+                    attacker,
+                );
+            }
+        }
+        for (index, trigger) in data.triggers.iter().enumerate() {
+            if trigger.damage.is_some()
+                && let Some((damage, _)) = blast.hit_player(&map.collision, trigger.volume.position)
+            {
+                round.damage(
+                    data,
+                    crate::assault::Target::Trigger(index),
+                    damage.saturating_mul(scale),
+                    self.time,
+                    attacker,
+                );
+            }
+        }
+    }
+
     fn bot_command(&mut self, map: &Map, id: usize, dt: f32) -> Command {
         let fighter = &self.fighters[id];
         if fighter.health == 0 {
@@ -3381,7 +3720,43 @@ impl Match {
         if let Some(command) = follow_transfer(map, &mut self.fighters[id], self.time, dt) {
             return command;
         }
-        let objective = self.objectives.destination(&self.fighters, id);
+        let fighter = &self.fighters[id];
+        let assault = self
+            .assault
+            .as_ref()
+            .zip(map.assault.as_ref())
+            .and_then(|(round, data)| {
+                round
+                    .destination(data, fighter.walker.position)
+                    .map(|index| (&data.forts[index], fighter.team == Some(round.attack_team)))
+            });
+        let objective = assault
+            .map(|(fort, _)| fort.destination)
+            .or_else(|| self.objectives.destination(&self.fighters, id));
+        if let Some((fort, true)) = assault
+            && !fort.touch
+        {
+            let eye = fighter.camera(map);
+            let delta = fort.volume.position - eye.position;
+            if delta.dot(delta) < 650.0_f32.powi(2)
+                && map.collision.ray(eye.position, delta).is_none()
+            {
+                let turn = self.rules.difficulty.combat().turn * dt;
+                let (yaw, pitch) = aim_error(delta, fighter.yaw, fighter.pitch);
+                let fallback = fighter
+                    .inventory
+                    .usable(Weapon::Enforcer)
+                    .then_some(Weapon::Enforcer);
+                if fallback.is_some() {
+                    return Command {
+                        look: [yaw.clamp(-turn, turn), pitch.clamp(-turn, turn)],
+                        primary: yaw.abs() < 0.035 && pitch.abs() < 0.035,
+                        preferred: fallback,
+                        ..Command::default()
+                    };
+                }
+            }
+        }
         let skill = self.rules.difficulty.combat();
         let fighter = &self.fighters[id];
         if let Some(evading) = &fighter.bot.evasion
@@ -4300,6 +4675,174 @@ mod tests {
 
     #[test]
     #[ignore = "requires local GOTY assets"]
+    fn assault_objective_events_switch_sides_and_reset_for_rematch() {
+        use crate::assault::{AssaultMap, Fort, Relay, RelayAction, Volume};
+
+        let (mut map, _) = flight_fixture();
+        map.start_teams = vec![Some(1), Some(0)];
+        let fort = |position, touch, final_fort, event| Fort {
+            volume: Volume {
+                position,
+                radius: 32.0,
+                height: 60.0,
+            },
+            destination: position,
+            name: "Objective".into(),
+            message: "Complete".into(),
+            health: 1,
+            priority: 0,
+            touch,
+            final_fort,
+            event,
+            fallback: None,
+            tag: None,
+            damage_events: Vec::new(),
+        };
+        let final_point = Vec3(350.0, 0.0, 39.2);
+        map.assault = Some(AssaultMap {
+            seconds: 300,
+            forts: vec![
+                fort(Vec3(180.0, 0.0, 39.2), false, false, Some(1)),
+                fort(final_point, true, true, None),
+            ],
+            relays: vec![
+                Relay {
+                    tag: 1,
+                    action: RelayAction::Dispatch(vec![(0.0, 2), (0.1, 2)]),
+                },
+                Relay {
+                    tag: 2,
+                    action: RelayAction::Count { count: 2, event: 3 },
+                },
+                Relay {
+                    tag: 3,
+                    action: RelayAction::Starts(vec![0]),
+                },
+            ],
+            triggers: Vec::new(),
+        });
+        let mut game = Match::new(
+            &map,
+            0,
+            Rules {
+                mode: Mode::Assault,
+                bots: 1,
+                ..Rules::default()
+            },
+        );
+        let mut sound = SoundEvents::default();
+        let mut hits = Vec::new();
+        game.time = 2.0;
+        game.fighters[1].walker.position = final_point;
+        game.fire_step(
+            &map,
+            0,
+            Command {
+                primary: true,
+                ..Command::default()
+            },
+            1.0 / 120.0,
+            &mut hits,
+            &mut sound,
+        );
+        game.assault
+            .as_mut()
+            .unwrap()
+            .tick(&mut map, &game.fighters, 2.0, &mut sound);
+        assert_eq!(game.assault_status(&map).unwrap().completed, 1);
+        assert!(map.starts[0].enabled);
+        game.assault
+            .as_mut()
+            .unwrap()
+            .tick(&mut map, &game.fighters, 2.2, &mut sound);
+        assert!(!map.starts[0].enabled);
+        game.fighters[0].walker.position = final_point;
+        game.fighters[1].walker.position = map.starts[1].position;
+        game.time = 2.3;
+        game.step(&mut map, Command::default(), 1.0 / 120.0);
+        assert_eq!(game.assault_status(&map).unwrap().completed, 2);
+        game.time = 4.4;
+        game.step(&mut map, Command::default(), 1.0 / 120.0);
+        let status = game.assault_status(&map).unwrap();
+        assert_eq!(
+            (status.half, status.attacking, status.completed),
+            (2, false, 0)
+        );
+        assert!(map.starts[0].enabled);
+        assert_eq!(game.remaining(), 3);
+        assert!(distance_squared(game.fighters[0].walker.position, map.starts[1].position) < 1.0);
+        game.time = 3.0;
+        game.step(&mut map, Command::default(), 1.0 / 120.0);
+        assert!(game.finished);
+        assert_eq!(game.winner(), Some(0));
+        game.step(
+            &mut map,
+            Command {
+                restart: true,
+                ..Command::default()
+            },
+            1.0 / 120.0,
+        );
+        assert_eq!(game.assault_status(&map).unwrap().half, 1);
+        assert!(!game.finished);
+    }
+
+    #[test]
+    #[ignore = "requires the local reference-client map installation"]
+    fn frigate_objective_runs_both_stages_of_the_hydraulic_movers() {
+        let path = std::path::Path::new("local/reference-client/Maps/AS-Frigate.unr");
+        let bytes = std::fs::read(path).unwrap();
+        let package = Package::read(&bytes).unwrap();
+        let mut map = Map::load(&package, Some(path)).unwrap();
+        let name = |index| package.name(index).unwrap();
+        let compressor = map
+            .assault
+            .as_ref()
+            .unwrap()
+            .forts
+            .iter()
+            .position(|fort| fort.event.map(name) == Some("fluid1"))
+            .unwrap();
+        let mut game = Match::new(
+            &map,
+            0,
+            Rules {
+                mode: Mode::Assault,
+                bots: 0,
+                ..Rules::default()
+            },
+        );
+        game.damage_objective(&map, 0, crate::assault::Target::Fort(compressor), 200);
+        assert!(map.assault.as_ref().unwrap().relays.iter().any(|relay| {
+            name(relay.tag) == "fluid1"
+                && matches!(
+                    &relay.action,
+                    crate::assault::RelayAction::Sound { wave: Some(_), .. }
+                )
+        }));
+        assert!(game.step(&mut map, Command::default(), 1.0 / 60.0).len() > 0);
+        for _ in 0..600 {
+            game.step(&mut map, Command::default(), 1.0 / 60.0);
+        }
+        for event in ["fluid1", "fluid2"] {
+            assert!(
+                map.movers
+                    .iter()
+                    .any(|mover| mover.tag.map(name) == Some(event)
+                        && mover.offset.dot(mover.offset) > 1.0),
+                "{event}"
+            );
+        }
+        game.restore_map(&mut map);
+        assert!(
+            map.movers
+                .iter()
+                .all(|mover| mover.offset.dot(mover.offset) == 0.0)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY assets"]
     fn team_frags_survival_and_objectives_use_the_shared_match() {
         let (mut map, _) = flight_fixture();
         map.start_teams = vec![Some(0), Some(1)];
@@ -4367,7 +4910,7 @@ mod tests {
             ) < 0.01
         );
         game.objectives.tick(&map, &game.fighters, 22.0);
-        assert!(distance_squared(game.objective_markers().nth(1).unwrap().0, blue) < 0.01);
+        assert!(distance_squared(game.objective_markers(&map).nth(1).unwrap().0, blue) < 0.01);
 
         map.control_points = vec![red];
         let mut game = new_match(&map, Mode::Domination, 1);
