@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use crate::game::{
+    deathmatch::Marker,
     decals::MODULATED,
     shock::{self, Visual},
 };
@@ -573,6 +574,28 @@ impl Frame {
                 },
             );
         }
+        if game.mode().team_based()
+            && player.health > 0
+            && !game.finished
+            && !scoreboard
+            && !piloting
+        {
+            self.layer(Layer::Hud);
+            for (position, marker, team) in game.objective_markers() {
+                self.match_marker(map, &view, position + Vec3(0.0, 0.0, 34.0), team, marker);
+            }
+            for fighter in &game.fighters[1..] {
+                if fighter.health > 0 && fighter.invis_left(game.time) <= 0.0 {
+                    self.match_marker(
+                        map,
+                        &view,
+                        fighter.walker.position + Vec3(0.0, 0.0, 42.0),
+                        fighter.team,
+                        Marker::Fighter,
+                    );
+                }
+            }
+        }
         self.zoom = 1.0;
         self.roll = 0.0;
         if player.health > 0 && !game.finished {
@@ -1121,6 +1144,51 @@ impl Frame {
                     *pixel = pack(color, 1.0 - coverage / 255.0);
                 }
             }
+        }
+    }
+
+    fn match_marker(
+        &mut self,
+        map: &Map,
+        view: &View,
+        position: Vec3,
+        team: Option<usize>,
+        marker: Marker,
+    ) {
+        let local = view.point(position);
+        if local.2 < 75.0 || map.collision.ray(view.eye, position - view.eye).is_some() {
+            return;
+        }
+        let Vec3(x, y, _) = project(
+            Vertex {
+                position: local,
+                u: 0.0,
+                v: 0.0,
+            },
+            self.width,
+            self.height,
+            self.zoom,
+        )
+        .position;
+        if x < 8.0 || x >= self.width as f32 - 8.0 || y < 8.0 || y >= self.height as f32 - 8.0 {
+            return;
+        }
+        let (x, y) = (x as i32, y as i32);
+        let color = match team {
+            Some(0) => [1.0, 0.29, 0.27],
+            Some(_) => [0.40, 0.66, 1.0],
+            None => [0.89, 0.89, 0.91],
+        };
+        match marker {
+            Marker::Flag => {
+                self.solid([x - 5, y - 5, 2, 13], color);
+                self.solid([x - 3, y - 5, 10, 6], color);
+            }
+            Marker::ControlPoint => {
+                self.solid([x - 5, y - 3, 11, 7], color);
+                self.solid([x - 3, y - 5, 7, 11], color);
+            }
+            Marker::Fighter => self.solid([x - 3, y - 2, 7, 4], color),
         }
     }
 

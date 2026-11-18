@@ -132,7 +132,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|value| value.unwrap_or(default))
         };
         let defaults = game::deathmatch::Rules::default();
-        Some(game::deathmatch::Rules {
+        let mut rules = game::deathmatch::Rules {
+            mode: defaults.mode,
             bots: usize::from(option("Bot count", defaults.bots as u16, 8)?),
             frag_limit: option("Frag limit", defaults.frag_limit as u16, 100)? as i16,
             seconds: option("Time limit in seconds", defaults.seconds, 3600)?,
@@ -141,7 +142,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 defaults.difficulty as u16,
                 3,
             )?)),
-        })
+        };
+        rules.mode = match args.next().as_deref().and_then(|value| value.to_str()) {
+            None | Some("dm") => game::deathmatch::Mode::Deathmatch,
+            Some("tdm") => game::deathmatch::Mode::TeamDeathmatch,
+            Some("ctf") => game::deathmatch::Mode::CaptureTheFlag,
+            Some("dom") => game::deathmatch::Mode::Domination,
+            Some("lms") => game::deathmatch::Mode::LastManStanding,
+            _ => return Err(io::Error::other("Mode must be dm, tdm, ctf, dom, or lms").into()),
+        };
+        Some(rules)
     } else {
         None
     };
@@ -171,6 +181,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     if command != "inspect" {
         let mut map = Map::load(&package, (command != "map-info").then_some(path))?;
+        if let Some(rules) = rules
+            && !map.supports_mode(rules.mode)
+        {
+            return Err(io::Error::other(format!(
+                "Map does not contain the objectives for {}",
+                rules.mode.label()
+            ))
+            .into());
+        }
+        if command == "map-info" {
+            println!(
+                "{} flag bases, {} control points",
+                map.flag_bases.iter().flatten().count(),
+                map.control_points.len()
+            );
+        }
         println!(
             "{} visible BSP faces, {} player starts, {} moving brushes",
             map.faces.len(),
@@ -267,7 +293,7 @@ fn print_usage() {
     println!("ut99-rust [--obs] [--nosound] view <map.unr> [player-start]");
     println!("ut99-rust [--obs] [--nosound] play <map.unr> [player-start]");
     println!(
-        "ut99-rust [--obs] [--nosound] deathmatch <map.unr> [player-start] [bots] [frag-limit] [seconds] [difficulty: 1-3]"
+        "ut99-rust [--obs] [--nosound] deathmatch <map.unr> [player-start] [bots] [goal] [seconds] [difficulty: 1-3] [dm|tdm|ctf|dom|lms]"
     );
     println!("ut99-rust capture <map.unr> <output.bmp> [player-start]");
     println!("ut99-rust capture-practice <map.unr> <output.bmp> [player-start]");

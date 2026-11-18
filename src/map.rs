@@ -85,6 +85,9 @@ pub struct Map {
     pub(crate) smoke: crate::frontend::smoke::Smoke,
     pub faces: Vec<Face>,
     pub starts: Vec<Start>,
+    pub(crate) start_teams: Vec<Option<usize>>,
+    pub(crate) flag_bases: [Option<Vec3>; 2],
+    pub(crate) control_points: Vec<Vec3>,
     pub navigation_points: Vec<Vec3>,
     pub(crate) lift_exits: Vec<LiftExit>,
     pub collision: Collision,
@@ -108,6 +111,14 @@ pub struct Map {
 }
 
 impl Map {
+    pub(crate) fn supports_mode(&self, mode: crate::game::deathmatch::Mode) -> bool {
+        use crate::game::deathmatch::Mode;
+        match mode {
+            Mode::CaptureTheFlag => self.flag_bases.iter().all(Option::is_some),
+            Mode::Domination => !self.control_points.is_empty(),
+            _ => true,
+        }
+    }
     pub fn load(package: &Package<'_>, path: Option<&Path>) -> io::Result<Self> {
         if package.version <= 61 {
             return Err(invalid("BSP preview requires package version 62 or later"));
@@ -183,10 +194,33 @@ impl Map {
         collision.profile = player;
         let teleporters = crate::teleport::load(package, &actors)?;
         let mut starts = Vec::new();
+        let mut start_teams = Vec::new();
+        let mut flag_bases = [None; 2];
+        let mut control_points = Vec::new();
         let mut navigation_points = Vec::new();
         let mut lift_exits = Vec::new();
         for actor in actors {
             let class = package.object_name(actor.class);
+            if matches!(class, Some("FlagBase" | "ControlPoint")) {
+                let mut properties = package.properties(actor)?;
+                let mut position = Vec3::default();
+                let mut team = 0;
+                while let Some((name, mut value)) = properties.next()? {
+                    match name {
+                        "Location" => position = Vec3::read(&mut value)?,
+                        "Team" | "TeamNumber" if class == Some("FlagBase") => {
+                            team = usize::from(value.byte()?)
+                        }
+                        _ => {}
+                    }
+                }
+                if class == Some("ControlPoint") {
+                    control_points.push(position);
+                } else if let Some(base) = flag_bases.get_mut(team) {
+                    *base = Some(position);
+                }
+                navigation_points.push(position);
+            }
             if matches!(
                 class,
                 Some("PathNode" | "LiftExit" | "InventorySpot" | "NavigationPoint")
@@ -217,6 +251,7 @@ impl Map {
                 yaw: 0.0,
                 enabled: true,
             };
+            let mut team = None;
             while let Some(property) = properties.next_tag()? {
                 let mut value = property.value;
                 match property.name {
@@ -226,10 +261,19 @@ impl Map {
                         start.yaw = (value.u32()? as i32) as f32 * std::f32::consts::TAU / 65_536.0;
                     }
                     "bEnabled" => start.enabled = property.boolean.unwrap_or(true),
+                    "TeamNumber" => {
+                        team = Some(usize::from(value.byte()?)).filter(|&team| team < 2)
+                    }
                     _ => {}
                 }
             }
             starts.push(start);
+            start_teams.push(team);
+        }
+        if flag_bases.iter().all(Option::is_some) && start_teams.contains(&Some(1)) {
+            for team in &mut start_teams {
+                team.get_or_insert(0);
+            }
         }
         if starts.is_empty() {
             return Err(invalid("Level has no PlayerStart for the preview camera"));
@@ -297,6 +341,9 @@ impl Map {
             },
             faces,
             starts,
+            start_teams,
+            flag_bases,
+            control_points,
             navigation_points,
             lift_exits,
             collision,

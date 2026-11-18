@@ -185,6 +185,7 @@ impl Settings {
     pub(crate) fn match_rules(&self) -> crate::game::deathmatch::Rules {
         use crate::game::deathmatch::{Difficulty, Rules};
         Rules {
+            mode: crate::game::deathmatch::Mode::Deathmatch,
             bots: self.bot_count as usize,
             frag_limit: self.frag_limit as i16,
             seconds: self.match_minutes as u16 * 60,

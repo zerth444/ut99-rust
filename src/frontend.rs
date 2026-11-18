@@ -12,6 +12,7 @@ use std::{
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
 use crate::{
+    game::deathmatch::Mode,
     hud::Hud,
     map::Map,
     package::Package,
@@ -148,7 +149,9 @@ fn match_catalog<'a>(base: &Path, directories: impl IntoIterator<Item = &'a Path
         {
             let path = entry.path();
             if let Some(name) = key(&path)
-                && name.starts_with("dm-")
+                && ["dm-", "ctf-", "dom-"]
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
                 && name.ends_with(".unr")
                 && base_key.as_deref() != Some(&name)
                 && path.is_file()
@@ -222,7 +225,7 @@ impl MenuArt {
 pub enum Action {
     None,
     Resume,
-    Deathmatch(usize),
+    StartMatch(usize, Mode),
     LeaveMatch,
     Quit,
     Changed,
@@ -303,6 +306,8 @@ const MATCH_BOUNDS: [(u32, u32); 4] = [(1, 3), (0, 8), (0, 100), (0, 60)];
 
 struct MatchSetup {
     map: usize,
+    mode: Mode,
+    maps: Vec<usize>,
     focus: usize,
     values: [u32; 4],
 }
@@ -311,6 +316,8 @@ impl MatchSetup {
     fn new(settings: &Settings) -> Self {
         Self {
             map: 0,
+            mode: Mode::Deathmatch,
+            maps: Vec::new(),
             focus: 0,
             values: [
                 settings.bot_difficulty,
@@ -321,11 +328,54 @@ impl MatchSetup {
         }
     }
 
+    fn read_maps(&mut self, names: &[String]) {
+        self.maps = names
+            .iter()
+            .enumerate()
+            .filter_map(|(index, name)| {
+                name.to_ascii_lowercase()
+                    .starts_with(self.mode.map_prefix())
+                    .then_some(index)
+            })
+            .collect();
+        self.map = 0;
+    }
+
+    fn change_mode(&mut self, names: &[String], step: i32) {
+        let previous = Mode::ALL
+            .iter()
+            .position(|&mode| mode == self.mode)
+            .unwrap() as i32;
+        self.mode = Mode::ALL[(previous + step).rem_euclid(Mode::ALL.len() as i32) as usize];
+        if self.mode == Mode::LastManStanding {
+            self.values[2] = self.values[2].max(1);
+        }
+        self.read_maps(names);
+    }
+
+    fn launch(&self) -> Action {
+        self.maps
+            .get(self.map)
+            .map_or(Action::None, |&index| Action::StartMatch(index, self.mode))
+    }
+
     fn change(&mut self, field: usize, step: i32) {
-        let (min, max) = MATCH_BOUNDS[field];
+        let (min, max) = self.bounds(field);
         self.values[field] = self.values[field]
             .saturating_add_signed(step)
             .clamp(min, max);
+    }
+
+    fn bounds(&self, field: usize) -> (u32, u32) {
+        let (min, max) = MATCH_BOUNDS[field];
+        (
+            if field == 2 && self.mode == Mode::LastManStanding {
+                1
+            } else {
+                min
+            },
+            max,
+        )
     }
 
     fn value(&self, field: usize) -> String {
@@ -525,7 +575,9 @@ impl Menu {
         match (self.session.paused(), item) {
             (true, 0) => Action::Resume,
             (false, 0) => {
-                self.match_setup = Some(MatchSetup::new(settings));
+                let mut setup = MatchSetup::new(settings);
+                setup.read_maps(&self.match_names);
+                self.match_setup = Some(setup);
                 Action::None
             }
             (true, 1) => Action::LeaveMatch,
@@ -543,7 +595,7 @@ impl Menu {
     }
     pub fn key(&mut self, key: u16, settings: &mut Settings) -> Action {
         if let Some(setup) = &mut self.match_setup {
-            let count = self.match_names.len();
+            let count = setup.maps.len();
             match key {
                 VK_UP if setup.focus == 0 && count > 0 => {
                     setup.map = (setup.map + count - 1) % count
@@ -557,9 +609,12 @@ impl Menu {
                 VK_LEFT | VK_RIGHT if setup.focus > 0 => {
                     setup.change(setup.focus - 1, if key == VK_LEFT { -1 } else { 1 })
                 }
+                VK_LEFT | VK_RIGHT => {
+                    setup.change_mode(&self.match_names, if key == VK_LEFT { -1 } else { 1 })
+                }
                 VK_PRIOR | VK_NEXT => setup.turn_page(key == VK_NEXT, count),
                 VK_ESCAPE => self.match_setup = None,
-                VK_RETURN | VK_SPACE if count > 0 => return Action::Deathmatch(setup.map),
+                VK_RETURN | VK_SPACE if count > 0 => return setup.launch(),
                 _ => {}
             }
             self.status.clear();
@@ -663,8 +718,17 @@ impl Menu {
                 self.match_setup = None;
                 return Action::None;
             }
-            let count = self.match_names.len();
+            let count = setup.maps.len();
             self.status.clear();
+            if (26..49).contains(&y) {
+                if (12..32).contains(&x) {
+                    setup.change_mode(&self.match_names, -1);
+                }
+                if (187..209).contains(&x) {
+                    setup.change_mode(&self.match_names, 1);
+                }
+                return Action::None;
+            }
             if (12..209).contains(&x) && (52..196).contains(&y) {
                 let index = setup.page() + ((y - 52) / 18) as usize;
                 if index < count {
@@ -687,7 +751,7 @@ impl Menu {
                 match x {
                     12..89 | 96..173 => setup.turn_page(x >= 96, count),
                     222..305 => self.match_setup = None,
-                    313..416 if count > 0 => return Action::Deathmatch(setup.map),
+                    313..416 if count > 0 => return setup.launch(),
                     _ => {}
                 }
             }
@@ -890,17 +954,21 @@ impl Menu {
         if let Some(setup) = &self.match_setup {
             let rect @ [x, y, _, _] = ui.match_rect(size);
             ui.window(frame, art, rect);
-            label(frame, x + 5, y + 1, "Local Deathmatch");
-            label(frame, x + 12, y + 31, "Maps");
+            label(frame, x + 5, y + 1, "Local match");
+            ui.tile(frame, None, [x + 12, y + 27, 197, 19], FIELD_COLOR);
+            label(frame, x + 16, y + 29, "<");
+            label(frame, x + 37, y + 29, setup.mode.label());
+            label(frame, x + 193, y + 29, ">");
             label(frame, x + 222, y + 31, "Match rules");
             ui.tile(frame, None, [x + 12, y + 52, 197, 144], FIELD_COLOR);
             let page = setup.page();
-            let count = self.match_names.len();
-            for (row, name) in self
-                .match_names
+            let count = setup.maps.len();
+            for (row, name) in setup
+                .maps
                 .iter()
                 .skip(page)
                 .take(MAPS_PER_PAGE)
+                .map(|&index| &self.match_names[index])
                 .enumerate()
             {
                 let top = y + 52 + 18 * row as i32;
@@ -920,14 +988,23 @@ impl Menu {
             }
             for (field, name) in MATCH_FIELDS.into_iter().enumerate() {
                 let top = y + 52 + field as i32 * 36;
-                label(frame, x + 222, top, name);
+                label(
+                    frame,
+                    x + 222,
+                    top,
+                    if field == 2 {
+                        setup.mode.goal_label()
+                    } else {
+                        name
+                    },
+                );
                 let control = [x + 222, top + 12, 194, 18];
                 ui.tile(frame, None, control, FIELD_COLOR);
                 if setup.focus == field + 1 {
                     ui.solid_outline(frame, control);
                 }
                 label(frame, x + 228, top + 14, &setup.value(field));
-                let (min, max) = MATCH_BOUNDS[field];
+                let (min, max) = setup.bounds(field);
                 if setup.values[field] > min {
                     label(frame, x + 340, top + 14, "<");
                 }
@@ -947,7 +1024,7 @@ impl Menu {
                 }
             }
             if count == 0 {
-                label(frame, x + 12, y + 235, "No installed Deathmatch maps");
+                label(frame, x + 12, y + 235, "No maps installed for this mode");
             } else if !self.status.is_empty() {
                 label(frame, x + 12, y + 235, &self.status);
             }
@@ -1354,7 +1431,7 @@ mod tests {
         assert!(menu.match_setup.is_none());
         assert!(click(&mut menu, 0, &mut settings) == Action::None);
         assert!(menu.match_setup.is_some());
-        assert!(menu.key(VK_RETURN, &mut settings) == Action::Deathmatch(0));
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::StartMatch(0, Mode::Deathmatch));
         menu.key(VK_ESCAPE, &mut settings);
 
         assert!(click(&mut menu, 1, &mut settings) == Action::None);
@@ -1410,7 +1487,7 @@ mod tests {
         menu.key(VK_TAB, &mut settings);
         menu.key(VK_RIGHT, &mut settings);
         assert_eq!(settings.bot_difficulty, 2);
-        assert!(menu.key(VK_RETURN, &mut settings) == Action::Deathmatch(1));
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::StartMatch(1, Mode::Deathmatch));
         assert!(menu.key(VK_ESCAPE, &mut settings) == Action::None);
         assert!(menu.match_setup.is_none());
         assert_eq!(settings.bot_difficulty, 2);
@@ -1422,7 +1499,8 @@ mod tests {
         assert!(menu.click(size, x + 400, y + 98, VK_LBUTTON, &mut settings) == Action::None);
         assert_eq!(settings.bot_count, 3);
         assert!(
-            menu.click(size, x + 340, y + 216, VK_LBUTTON, &mut settings) == Action::Deathmatch(1)
+            menu.click(size, x + 340, y + 216, VK_LBUTTON, &mut settings)
+                == Action::StartMatch(1, Mode::Deathmatch)
         );
         assert!(menu.commit_match_settings(&mut settings));
         assert_eq!(settings.match_rules().bots, 4);
@@ -1456,7 +1534,13 @@ mod tests {
         assert!(catalog.contains(&bundled.join("DM-Liandri.unr")));
         assert!(!catalog.contains(&reference.join("DM-Liandri.unr")));
 
-        for path in catalog {
+        for path in catalog.into_iter().filter(|path| {
+            path.file_stem().is_some_and(|name| {
+                name.to_string_lossy()
+                    .to_ascii_lowercase()
+                    .starts_with("dm-")
+            })
+        }) {
             let data = fs::read(&path).unwrap();
             let package = Package::read(&data).unwrap();
             let mut map = Map::load(&package, Some(&path))
@@ -1501,6 +1585,87 @@ mod tests {
                 "{}",
                 path.display()
             );
+        }
+    }
+
+    #[test]
+    fn mode_picker_uses_map_indices_from_the_matching_family() {
+        let mut setup = MatchSetup::new(&Settings::default());
+        let names = [
+            "DM-A".into(),
+            "DOM-A".into(),
+            "CTF-A".into(),
+            "CTF-B".into(),
+        ];
+        setup.read_maps(&names);
+        assert!(setup.launch() == Action::StartMatch(0, Mode::Deathmatch));
+        setup.change_mode(&names, 1);
+        assert!(setup.launch() == Action::StartMatch(0, Mode::TeamDeathmatch));
+        setup.change_mode(&names, 1);
+        setup.map = 1;
+        assert!(setup.launch() == Action::StartMatch(3, Mode::CaptureTheFlag));
+        setup.change_mode(&names, 1);
+        assert!(setup.launch() == Action::StartMatch(1, Mode::Domination));
+        setup.change_mode(&names, 1);
+        assert!(setup.launch() == Action::StartMatch(0, Mode::LastManStanding));
+    }
+
+    #[test]
+    #[ignore = "requires the local reference-client map installation"]
+    fn installed_objective_catalog_loads_and_simulates_each_arena() {
+        use crate::game::deathmatch::{Command, Match, Rules};
+
+        let reference = Path::new("local/reference-client/Maps");
+        let catalog = match_catalog(&reference.join("DM-Deck16][.unr"), [reference]);
+        for (mode, minimum) in [(Mode::CaptureTheFlag, 20), (Mode::Domination, 11)] {
+            let paths = catalog.iter().filter(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .to_ascii_lowercase()
+                        .starts_with(mode.map_prefix())
+                })
+            });
+            let mut count = 0;
+            for path in paths {
+                count += 1;
+                let data = fs::read(path).unwrap();
+                let package = Package::read(&data).unwrap();
+                let mut map = Map::load(&package, Some(path))
+                    .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+                assert!(
+                    map.supports_mode(mode),
+                    "{} has no objectives",
+                    path.display()
+                );
+                assert!(
+                    map.faces.iter().any(|face| face.texture.is_some()),
+                    "{} has no textured faces",
+                    path.display()
+                );
+                assert!(
+                    map.hud.ready() && !map.arsenal.is_empty(),
+                    "{} lacks HUD or weapons",
+                    path.display()
+                );
+                let mut game = Match::new(
+                    &map,
+                    0,
+                    Rules {
+                        mode,
+                        bots: 1,
+                        ..Rules::default()
+                    },
+                );
+                for _ in 0..60 {
+                    game.step(&mut map, Command::default(), 1.0 / 120.0);
+                }
+                assert!(
+                    !game.finished && game.fighters.iter().all(|fighter| fighter.health > 0),
+                    "{} failed to start",
+                    path.display()
+                );
+            }
+            assert!(count >= minimum, "{} has only {count} maps", mode.label());
         }
     }
 

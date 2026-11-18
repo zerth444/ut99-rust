@@ -191,13 +191,16 @@ unsafe fn message_loop(
             obs,
             MenuSession::Main,
         )? {
-            Action::Deathmatch(_) => {
+            Action::StartMatch(_, mode) => {
                 if let Some(arena) = frontend.pending_arena.take() {
                     practice_arena = Some((std::mem::replace(map, arena), start));
                     start = 6.min(map.starts.len() - 1);
                     frame = Frame::hardware(map);
                 }
-                match_rules = Some(settings.match_rules())
+                match_rules = Some(deathmatch::Rules {
+                    mode,
+                    ..settings.match_rules()
+                })
             }
             Action::Quit => return Ok(()),
             _ => {}
@@ -297,7 +300,7 @@ unsafe fn message_loop(
                                         )?;
                                         match action {
                                             Action::Quit => return Ok(()),
-                                            Action::Deathmatch(_) => {
+                                            Action::StartMatch(_, mode) => {
                                                 if let Some(arena) = frontend.pending_arena.take() {
                                                     practice_arena = Some((
                                                         std::mem::replace(map, arena),
@@ -308,7 +311,10 @@ unsafe fn message_loop(
                                                 deathmatch = Some(deathmatch::Match::new(
                                                     map,
                                                     start,
-                                                    settings.match_rules(),
+                                                    deathmatch::Rules {
+                                                        mode,
+                                                        ..settings.match_rules()
+                                                    },
                                                 ));
                                             }
                                             _ => {
@@ -458,7 +464,7 @@ unsafe fn message_loop(
                                     MenuSession::Main,
                                 )? {
                                     Action::Quit => return Ok(()),
-                                    Action::Deathmatch(_) => {
+                                    Action::StartMatch(_, mode) => {
                                         if let Some(arena) = frontend.pending_arena.take() {
                                             practice_arena =
                                                 Some((std::mem::replace(map, arena), start));
@@ -467,7 +473,10 @@ unsafe fn message_loop(
                                         deathmatch = Some(deathmatch::Match::new(
                                             map,
                                             start,
-                                            settings.match_rules(),
+                                            deathmatch::Rules {
+                                                mode,
+                                                ..settings.match_rules()
+                                            },
                                         ));
                                         match_clock.clear();
                                     }
@@ -1101,14 +1110,15 @@ fn run_frontend(
                         frontend.play_menu_sound(audio, sound);
                     }
                     match action {
-                        Action::Deathmatch(index) => match frontend.load_match(index) {
-                            Ok(arena) => {
+                        Action::StartMatch(index, mode) => match frontend.load_match(index) {
+                            Ok(arena) if arena.as_ref().unwrap_or(game_map).supports_mode(mode) => {
                                 if menu.commit_match_settings(settings) {
                                     save_settings(settings, settings_path);
                                 }
                                 frontend.pending_arena = arena;
                                 return Ok(action);
                             }
+                            Ok(_) => menu.status = "Map is missing objectives for this mode".into(),
                             Err(error) => {
                                 eprintln!("Loading Deathmatch map: {error}");
                                 menu.status = "COULD NOT LOAD MAP".into();

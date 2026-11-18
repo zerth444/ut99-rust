@@ -4,6 +4,7 @@ mod ai;
 mod arsenal;
 mod guidance;
 mod navigation;
+mod objectives;
 mod timestep;
 
 use super::{
@@ -23,6 +24,8 @@ pub use ai::Difficulty;
 use arsenal::{ChargeProfile, ChargeShape, Inventory, Path};
 use guidance::Pilot;
 use navigation::{JumpControl, JumpProgress, LiftRide, Navigation, Step, WAYPOINT_RADIUS};
+pub(crate) use objectives::Marker;
+pub use objectives::Mode;
 pub use timestep::Timestep;
 
 const RESPAWN_DELAY: f32 = 1.25;
@@ -31,6 +34,7 @@ const ENVIRONMENT_CREDIT_WINDOW: f32 = 3.0;
 
 #[derive(Clone, Copy)]
 pub struct Rules {
+    pub mode: Mode,
     pub bots: usize,
     pub frag_limit: i16,
     pub seconds: u16,
@@ -40,6 +44,7 @@ pub struct Rules {
 impl Default for Rules {
     fn default() -> Self {
         Self {
+            mode: Mode::Deathmatch,
             bots: 3,
             frag_limit: 10,
             seconds: 300,
@@ -66,6 +71,7 @@ pub struct Command {
 }
 
 pub struct Fighter {
+    pub team: Option<usize>,
     pub walker: Walker,
     pub yaw: f32,
     pitch: f32,
@@ -124,6 +130,7 @@ impl Fighter {
         let start = map.starts[spawn];
         let walker = Walker::spawn(&map.collision, start.position);
         Self {
+            team: None,
             previous_body: (walker.position, start.yaw),
             previous_stair_offset: 0.0,
             gait_transition: None,
@@ -772,6 +779,7 @@ impl shock::Targets for ShockTargets<'_> {
 
 pub struct Match {
     rules: Rules,
+    objectives: objectives::Objectives,
     preferred_start: usize,
     pub time: f32,
     pub fighters: Vec<Fighter>,
@@ -806,6 +814,7 @@ impl Match {
     pub fn new(map: &Map, start: usize, rules: Rules) -> Self {
         let mut game = Self {
             rules,
+            objectives: objectives::Objectives::new(map, rules.mode),
             preferred_start: start,
             time: 0.0,
             fighters: Vec::with_capacity(rules.bots + 1),
@@ -847,12 +856,16 @@ impl Match {
     fn spawn_all(&mut self, map: &Map) {
         self.fighters.clear();
         for id in 0..=self.rules.bots {
-            let spawn = if id == 0 && usable_start(map, self.preferred_start).is_some() {
+            let spawn = if id == 0
+                && !self.rules.mode.team_based()
+                && usable_start(map, self.preferred_start).is_some()
+            {
                 self.preferred_start
             } else {
                 self.choose_spawn(map, id, None)
             };
-            let fighter = self.spawn_at(map, spawn);
+            let mut fighter = self.spawn_at(map, spawn);
+            fighter.team = self.team_for(id);
             self.fighters.push(fighter);
         }
     }
@@ -861,6 +874,32 @@ impl Match {
         self.recent_spawns[start] = Some(self.spawn_sequence);
         self.spawn_sequence += 1;
         Fighter::spawn(map, start, self.time)
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.rules.mode
+    }
+    fn team_for(&self, fighter: usize) -> Option<usize> {
+        self.rules.mode.team_based().then_some(fighter % 2)
+    }
+    pub fn team_scores(&self) -> Option<[i16; 2]> {
+        self.rules
+            .mode
+            .team_based()
+            .then_some(self.objectives.scores)
+    }
+    pub fn flag_status(&self) -> Option<[&'static str; 2]> {
+        self.objectives.flag_status()
+    }
+    pub fn lives_left(&self, fighter: usize) -> Option<u16> {
+        (self.rules.mode == Mode::LastManStanding).then(|| {
+            (self.rules.frag_limit.max(1) as u16).saturating_sub(self.fighters[fighter].deaths)
+        })
+    }
+    pub(crate) fn objective_markers(
+        &self,
+    ) -> impl Iterator<Item = (Vec3, Marker, Option<usize>)> + '_ {
+        self.objectives.markers(&self.fighters)
     }
 
     fn restart(&mut self, map: &mut Map) {
@@ -880,6 +919,7 @@ impl Match {
         self.bolts.clear();
         self.pickups.fill(None);
         self.restore_map(map);
+        self.objectives = objectives::Objectives::new(map, self.rules.mode);
         self.announcement = None;
         self.first_frag = false;
         self.player_frags = (0, f32::NEG_INFINITY);
@@ -896,10 +936,20 @@ impl Match {
     }
 
     fn choose_spawn(&self, map: &Map, fighter: usize, previous: Option<usize>) -> usize {
+        let own = self.team_for(fighter);
+        let has_team_start = own.is_some()
+            && map
+                .start_teams
+                .iter()
+                .enumerate()
+                .any(|(index, &team)| team == own && usable_start(map, index).is_some());
         map.starts
             .iter()
             .enumerate()
             .filter_map(|(index, _)| {
+                if has_team_start && map.start_teams.get(index).copied().flatten() != own {
+                    return None;
+                }
                 let start = usable_start(map, index)?;
                 let mut nearest = 850.0_f32;
                 let mut exposed = 0.0_f32;
@@ -915,7 +965,10 @@ impl Match {
                     nearest = nearest.min(distance);
                     let eye = other.camera(map).position;
                     let sightline = start + Vec3(0.0, 0.0, 12.0) - eye;
-                    if distance < 1050.0 && map.collision.ray(eye, sightline).is_none() {
+                    if !allied(own, other.team)
+                        && distance < 1050.0
+                        && map.collision.ray(eye, sightline).is_none()
+                    {
                         exposed = exposed.max(290.0 * (1.0 - distance / 1050.0));
                     }
                 }
@@ -974,13 +1027,35 @@ impl Match {
 
     pub fn standings(&self) -> Vec<usize> {
         let mut ids: Vec<_> = (0..self.fighters.len()).collect();
-        ids.sort_by_key(|&id| (std::cmp::Reverse(self.fighters[id].score), id));
+        ids.sort_by_key(|&id| {
+            (
+                std::cmp::Reverse(self.lives_left(id).unwrap_or(0)),
+                std::cmp::Reverse(self.fighters[id].score),
+                id,
+            )
+        });
         ids
     }
 
     pub fn winner(&self) -> Option<usize> {
         let standings = self.standings();
+        if let Some([red, blue]) = self.team_scores() {
+            let team = match red.cmp(&blue) {
+                std::cmp::Ordering::Greater => 0,
+                std::cmp::Ordering::Less => 1,
+                std::cmp::Ordering::Equal => return None,
+            };
+            return standings
+                .into_iter()
+                .find(|&id| self.fighters[id].team == Some(team));
+        }
         let first = standings[0];
+        if let Some(lives) = self.lives_left(first) {
+            return standings
+                .get(1)
+                .is_none_or(|&id| self.lives_left(id).unwrap() < lives)
+                .then_some(first);
+        }
         standings
             .get(1)
             .is_none_or(|&second| self.fighters[first].score > self.fighters[second].score)
@@ -1317,6 +1392,9 @@ impl Match {
         let mut hits = Vec::new();
         for (id, input) in inputs.iter().enumerate() {
             if let Some(fell) = self.fighters[id].fell_at {
+                if self.lives_left(id) == Some(0) {
+                    continue;
+                }
                 let extra = if id == 0 {
                     0.0
                 } else {
@@ -1329,6 +1407,7 @@ impl Match {
                     let mut respawned = self.spawn_at(map, spawn);
                     respawned.score = self.fighters[id].score;
                     respawned.deaths = self.fighters[id].deaths;
+                    respawned.team = self.team_for(id);
                     self.fighters[id] = respawned;
                 }
                 continue;
@@ -1541,26 +1620,55 @@ impl Match {
         for hit in hits {
             self.apply_hit(map, hit, &mut sounds);
         }
+        if let Some(message) = self.objectives.tick(map, &self.fighters, self.time) {
+            self.announcement = Some((message, self.time + 2.0));
+        }
         self.decals.update(self.time);
         self.decals.follow_movers(&map.movers);
         self.ballistics
             .update(map, None, self.time, dt, &mut sounds);
-        let limit_reached = self.overtime
-            || (self.rules.seconds > 0 && self.remaining() == 0)
-            || (self.rules.frag_limit > 0
-                && self
-                    .fighters
-                    .iter()
-                    .any(|fighter| fighter.score >= self.rules.frag_limit));
+        let score_reached = match self.rules.mode {
+            Mode::LastManStanding => {
+                self.fighters.len() > 1
+                    && self
+                        .fighters
+                        .iter()
+                        .enumerate()
+                        .filter(|(id, _)| self.lives_left(*id).unwrap() > 0)
+                        .count()
+                        <= 1
+            }
+            Mode::Deathmatch => {
+                self.rules.frag_limit > 0
+                    && self
+                        .fighters
+                        .iter()
+                        .any(|fighter| fighter.score >= self.rules.frag_limit)
+            }
+            _ => {
+                self.rules.frag_limit > 0
+                    && self
+                        .objectives
+                        .scores
+                        .into_iter()
+                        .any(|score| score >= self.rules.frag_limit)
+            }
+        };
+        let limit_reached =
+            self.overtime || (self.rules.seconds > 0 && self.remaining() == 0) || score_reached;
         if limit_reached {
             if let Some(leader) = self.winner() {
                 self.finished = true;
-                let (index, text) = if leader == 0 {
-                    (3, "MATCH WON")
-                } else {
-                    (4, "MATCH LOST")
-                };
+                let (index, text) =
+                    if leader == 0 || allied(self.fighters[0].team, self.fighters[leader].team) {
+                        (3, "MATCH WON")
+                    } else {
+                        (4, "MATCH LOST")
+                    };
                 self.announce(map, index, text, &mut sounds);
+            } else if self.rules.mode == Mode::LastManStanding && score_reached {
+                self.finished = true;
+                self.announcement = Some(("MATCH DRAWN", self.time + 3.0));
             } else if !self.overtime {
                 self.overtime = true;
                 self.announcement = Some(("SUDDEN DEATH", self.time + 3.0));
@@ -1735,6 +1843,7 @@ impl Match {
                 .filter(|&(target, other)| {
                     target != id
                         && other.health > 0
+                        && !allied(fighter.team, other.team)
                         && (other.invis_left(self.time) <= 0.0 || self.time - other.fired_at < 0.42)
                 })
                 .filter_map(|(target, other)| {
@@ -3134,6 +3243,11 @@ impl Match {
     }
 
     fn apply_hit(&mut self, map: &Map, hit: Hit, sounds: &mut SoundEvents) {
+        if hit.owner.is_some_and(|owner| {
+            owner != hit.victim && allied(self.fighters[owner].team, self.fighters[hit.victim].team)
+        }) {
+            return;
+        }
         let victim = &mut self.fighters[hit.victim];
         if victim.health == 0
             || hit.damage == 0
@@ -3226,6 +3340,11 @@ impl Match {
         });
         if let Some(owner) = owner.filter(|&owner| owner != hit.victim) {
             self.fighters[owner].score += 1;
+            if self.rules.mode == Mode::TeamDeathmatch
+                && let Some(team) = self.fighters[owner].team
+            {
+                self.objectives.scores[team] = self.objectives.scores[team].saturating_add(1);
+            }
             if !self.first_frag {
                 self.first_frag = true;
                 self.announce(map, 0, "FIRST FRAG", sounds);
@@ -3246,6 +3365,11 @@ impl Match {
             }
         } else {
             self.fighters[hit.victim].score -= 1;
+            if self.rules.mode == Mode::TeamDeathmatch
+                && let Some(team) = self.fighters[hit.victim].team
+            {
+                self.objectives.scores[team] = self.objectives.scores[team].saturating_sub(1);
+            }
         }
     }
 
@@ -3257,6 +3381,7 @@ impl Match {
         if let Some(command) = follow_transfer(map, &mut self.fighters[id], self.time, dt) {
             return command;
         }
+        let objective = self.objectives.destination(&self.fighters, id);
         let skill = self.rules.difficulty.combat();
         let fighter = &self.fighters[id];
         if let Some(evading) = &fighter.bot.evasion
@@ -3283,7 +3408,9 @@ impl Match {
         let fighter = &self.fighters[id];
         let eye = fighter.camera(map);
         let continuing = fighter.bot.target;
-        let tracked_alive = continuing.is_some_and(|target| self.fighters[target].health > 0);
+        let tracked_alive = continuing.is_some_and(|target| {
+            self.fighters[target].health > 0 && !allied(fighter.team, self.fighters[target].team)
+        });
         let attacker = fighter
             .last_hostile_impulse
             .filter(|&(_, at)| self.time - at < 0.7)
@@ -3293,7 +3420,10 @@ impl Match {
             .iter()
             .enumerate()
             .filter(|(other, fighter)| {
-                *other != id && fighter.health > 0 && self.time >= fighter.protected_until
+                *other != id
+                    && fighter.health > 0
+                    && self.time >= fighter.protected_until
+                    && !allied(self.fighters[id].team, fighter.team)
             })
             .filter_map(|(other, fighter)| {
                 let delta = fighter.walker.position + Vec3(0.0, 0.0, 12.0) - eye.position;
@@ -3612,11 +3742,15 @@ impl Match {
                 .and_then(|point| self.navigation.next_step(&map.collision, position, point));
             let stocked = fighter.inventory.preferred(560.0).switch_priority()
                 > Weapon::Enforcer.switch_priority();
-            bot.goal = if stocked {
+            let objective_step = (!stalled)
+                .then_some(objective)
+                .flatten()
+                .and_then(|point| self.navigation.next_step(&map.collision, position, point));
+            bot.goal = objective_step.or(if stocked {
                 pursue.or(supply)
             } else {
                 supply.or(pursue)
-            };
+            });
             if bot.goal.is_none() {
                 bot.goal = (0..12).find_map(|offset| {
                     let yaw = fighter.yaw
@@ -3671,7 +3805,13 @@ impl Match {
                     .incoming(shock::assets(map).map_or(1000.0, |assets| assets.speed)),
             )
             .filter_map(|(owner, location, velocity, born, blast)| {
-                if owner == id || self.time - born < skill.reaction.min(0.28) {
+                if owner == id
+                    || self
+                        .fighters
+                        .get(owner)
+                        .is_some_and(|other| allied(fighter.team, other.team))
+                    || self.time - born < skill.reaction.min(0.28)
+                {
                     return None;
                 }
                 let relative = velocity - fighter.walker.velocity();
@@ -4085,6 +4225,10 @@ fn distance_squared(a: Vec3, b: Vec3) -> f32 {
     delta.dot(delta)
 }
 
+fn allied(a: Option<usize>, b: Option<usize>) -> bool {
+    a.is_some() && a == b
+}
+
 fn usable_start(map: &Map, index: usize) -> Option<Vec3> {
     let start = map.starts[index];
     let walker = Walker::spawn(&map.collision, start.position);
@@ -4152,6 +4296,89 @@ mod tests {
             .grant_ammo(&map.arsenal, Weapon::Redeemer, 1);
         player.weapon = Weapon::Redeemer;
         (map, game)
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY assets"]
+    fn team_frags_survival_and_objectives_use_the_shared_match() {
+        let (mut map, _) = flight_fixture();
+        map.start_teams = vec![Some(0), Some(1)];
+        let new_match = |map: &Map, mode, bots| {
+            Match::new(
+                map,
+                0,
+                Rules {
+                    mode,
+                    bots,
+                    frag_limit: 1,
+                    ..Rules::default()
+                },
+            )
+        };
+        let mut game = new_match(&map, Mode::TeamDeathmatch, 2);
+        let mut sounds = SoundEvents::default();
+        game.time = 2.0;
+        let hit = |victim| Hit {
+            victim,
+            owner: Some(0),
+            bypass_armor: true,
+            damage: 100,
+            impulse: Vec3::default(),
+        };
+        game.apply_hit(&map, hit(2), &mut sounds);
+        assert_eq!(game.fighters[2].health, 100);
+        game.apply_hit(&map, hit(1), &mut sounds);
+        assert_eq!(game.team_scores(), Some([1, 0]));
+        game.step(&mut map, Command::default(), 1.0 / 120.0);
+        assert!(game.finished);
+        assert_eq!(game.winner(), Some(0));
+
+        let mut game = new_match(&map, Mode::LastManStanding, 1);
+        game.time = 2.0;
+        game.apply_hit(&map, hit(1), &mut sounds);
+        assert_eq!(game.lives_left(1), Some(0));
+        game.step(&mut map, Command::default(), 1.0 / 120.0);
+        assert!(game.finished);
+        assert_eq!(game.winner(), Some(0));
+
+        let red = Vec3(0.0, 0.0, 39.2);
+        let blue = Vec3(240.0, 0.0, 39.2);
+        map.flag_bases = [Some(red), Some(blue)];
+        let mut game = new_match(&map, Mode::CaptureTheFlag, 1);
+        game.fighters[0].walker.position = blue;
+        game.objectives.tick(&map, &game.fighters, 1.0);
+        assert!(
+            distance_squared(game.objectives.destination(&game.fighters, 0).unwrap(), red) < 0.01
+        );
+        game.fighters[0].walker.position = red;
+        game.objectives.tick(&map, &game.fighters, 1.1);
+        assert_eq!(game.team_scores(), Some([1, 0]));
+        game.restart(&mut map);
+        assert_eq!(game.team_scores(), Some([0, 0]));
+        game.fighters[0].walker.position = blue;
+        game.objectives.tick(&map, &game.fighters, 1.0);
+        game.fighters[0].walker.position = Vec3(160.0, 0.0, 39.2);
+        game.fighters[0].health = 0;
+        game.objectives.tick(&map, &game.fighters, 1.1);
+        assert!(
+            distance_squared(
+                game.objectives.destination(&game.fighters, 1).unwrap(),
+                Vec3(160.0, 0.0, 39.2)
+            ) < 0.01
+        );
+        game.objectives.tick(&map, &game.fighters, 22.0);
+        assert!(distance_squared(game.objective_markers().nth(1).unwrap().0, blue) < 0.01);
+
+        map.control_points = vec![red];
+        let mut game = new_match(&map, Mode::Domination, 1);
+        game.objectives.tick(&map, &game.fighters, 1.0);
+        assert_eq!(game.team_scores(), Some([0, 0]));
+        game.objectives.tick(&map, &game.fighters, 2.1);
+        assert_eq!(game.team_scores(), Some([1, 0]));
+        game.fighters[0].walker.position = blue;
+        game.fighters[1].walker.position = red;
+        game.objectives.tick(&map, &game.fighters, 4.1);
+        assert_eq!(game.team_scores(), Some([1, 1]));
     }
 
     #[test]

@@ -54,6 +54,37 @@ impl Hud {
         let player = &game.fighters[0];
         let white = [0.92, 0.96, 1.0];
         let accent = [0.42, 0.87, 0.95];
+        if let Some([red, blue]) = game.team_scores() {
+            let team = if player.team == Some(0) {
+                "Red"
+            } else {
+                "Blue"
+            };
+            self.centered(
+                frame,
+                (22.0 * scale) as i32,
+                scale,
+                &format!("Red {red}   -   {blue} Blue    |    Team {team}"),
+                white,
+            );
+        } else if let Some(lives) = game.lives_left(0) {
+            self.centered(
+                frame,
+                (22.0 * scale) as i32,
+                scale,
+                &format!("Lives {lives}"),
+                white,
+            );
+        }
+        if let Some([red, blue]) = game.flag_status() {
+            self.centered(
+                frame,
+                (45.0 * scale) as i32,
+                0.83 * scale,
+                &format!("Red flag: {red}    Blue flag: {blue}"),
+                white,
+            );
+        }
         if !has_art {
             self.text(
                 frame,
@@ -149,7 +180,9 @@ impl Hud {
                 [0.96, 0.83, 0.45],
             );
         }
-        if let Some(seconds) = game.respawn_left() {
+        if game.lives_left(0) == Some(0) {
+            self.centered(frame, frame.height as i32 / 2, scale, "Eliminated", white);
+        } else if let Some(seconds) = game.respawn_left() {
             self.centered(
                 frame,
                 frame.height as i32 / 2,
@@ -206,15 +239,19 @@ impl Hud {
         let accent = [0.61, 0.84, 0.90];
         frame.shade([left, top, width, height], [0.045, 0.062, 0.078], 0.74);
         frame.solid([left, top, width, px(2.0).max(1)], [0.36, 0.58, 0.65]);
-        let score = game.fighters[standings[0]].score;
         let title = if game.finished {
-            match game.winner() {
-                Some(0) => "You won".to_owned(),
-                Some(winner) => format!("{} wins", Match::label(winner)),
+            match game
+                .winner()
+                .map(|winner| (winner, game.fighters[winner].team))
+            {
+                Some((_, Some(0))) => "Red team wins".to_owned(),
+                Some((_, Some(_))) => "Blue team wins".to_owned(),
+                Some((0, None)) => "You won".to_owned(),
+                Some((winner, None)) => format!("{} wins", Match::label(winner)),
                 None => "Match drawn".to_owned(),
             }
         } else {
-            "Deathmatch".to_owned()
+            game.mode().label().to_owned()
         };
         self.text(
             frame,
@@ -225,16 +262,20 @@ impl Hud {
             white,
         );
         let (frag_limit, time_limit) = game.limits();
-        let details = if game.finished {
-            let reason = if game.overtime {
-                "Sudden death"
-            } else if frag_limit > 0 && score >= frag_limit {
-                "Frag limit"
+        let details = if let Some([red, blue]) = game.team_scores() {
+            let seconds = if game.finished || time_limit == 0 {
+                game.time as u32
             } else {
-                "Time limit"
+                u32::from(game.remaining())
             };
+            format!(
+                "Red {red}   -   {blue} Blue    {:02}:{:02}",
+                seconds / 60,
+                seconds % 60
+            )
+        } else if game.finished {
             let elapsed = game.time as u32;
-            format!("{reason}    {:02}:{:02} played", elapsed / 60, elapsed % 60)
+            format!("{:02}:{:02} played", elapsed / 60, elapsed % 60)
         } else if game.overtime {
             "Sudden death    Next clear lead wins".to_owned()
         } else {
@@ -249,9 +290,10 @@ impl Hud {
                 "Off".into()
             };
             format!(
-                "{:02}:{:02} {label}    Frag limit {frag}",
+                "{:02}:{:02} {label}    {} {frag}",
                 seconds / 60,
-                seconds % 60
+                seconds % 60,
+                game.mode().goal_label(),
             )
         };
         self.text(
@@ -272,7 +314,12 @@ impl Hud {
             [0.22, 0.32, 0.36],
             0.58,
         );
-        for (x, title) in columns.into_iter().zip(["Player", "Frags", "Deaths"]) {
+        let last_column = if game.lives_left(0).is_some() {
+            "Lives"
+        } else {
+            "Deaths"
+        };
+        for (x, title) in columns.into_iter().zip(["Player", "Frags", last_column]) {
             self.text(
                 frame,
                 left + px(x),
@@ -297,7 +344,8 @@ impl Hud {
                     Match::label(id)
                 },
                 fighter.score.to_string(),
-                fighter.deaths.to_string(),
+                game.lives_left(id)
+                    .map_or_else(|| fighter.deaths.to_string(), |lives| lives.to_string()),
             ]) {
                 self.text(
                     frame,
@@ -305,7 +353,12 @@ impl Hud {
                     y + px(4.0),
                     scale,
                     &value,
-                    if id == 0 { accent } else { white },
+                    match fighter.team {
+                        Some(0) => [1.0, 0.48, 0.47],
+                        Some(_) => [0.52, 0.73, 1.0],
+                        None if id == 0 => accent,
+                        None => white,
+                    },
                 );
             }
         }
