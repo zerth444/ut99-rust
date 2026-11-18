@@ -15,6 +15,94 @@ use crate::render::commands::{DrawList, Image, LIGHTMAPS, Layer, Material, Mode,
 
 const CHAIN_FLAGS: DXGI_SWAP_CHAIN_FLAG = DXGI_SWAP_CHAIN_FLAG(0);
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        map::Map,
+        package::Package,
+        render::{Camera, Frame},
+    };
+    use std::{
+        path::Path,
+        ptr::{null, null_mut},
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WS_POPUP};
+
+    #[test]
+    #[ignore = "requires local GOTY data and D3D11"]
+    fn swap_chain_replaces_the_lightmap_atlas_when_resuming_a_match() {
+        let load = |path: &str| {
+            let path = Path::new(path);
+            let bytes = std::fs::read(path).unwrap();
+            Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap()
+        };
+        let deck = load("local/goty/Maps/DM-Deck16][.unr");
+        let logo = load("local/goty/Maps/UT-Logo-Map.unr");
+        let class = [
+            b'S' as u16,
+            b'T' as u16,
+            b'A' as u16,
+            b'T' as u16,
+            b'I' as u16,
+            b'C' as u16,
+            0,
+        ];
+        let window = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                null(),
+                WS_POPUP,
+                0,
+                0,
+                320,
+                200,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null(),
+            )
+        };
+        assert!(!window.is_null());
+        struct Window(windows_sys::Win32::Foundation::HWND);
+        impl Drop for Window {
+            fn drop(&mut self) {
+                unsafe { DestroyWindow(self.0) };
+            }
+        }
+        let window = Window(window);
+        let mut presenter = Presenter::new(window.0, (320, 200), false).unwrap();
+        let mut atlases = Vec::new();
+        let mut atlas_sizes = Vec::new();
+        for map in [&deck, &logo, &deck] {
+            let mut frame = Frame::hardware(map);
+            (frame.width, frame.height) = (320, 200);
+            frame.draw(map, &Camera::from_start(map.starts[0]), 0.0);
+            presenter
+                .draw((320, 200), frame.commands.as_mut().unwrap(), false)
+                .unwrap();
+            let resource = unsafe {
+                presenter.textures[&LIGHTMAPS]
+                    .as_ref()
+                    .unwrap()
+                    .GetResource()
+            }
+            .unwrap();
+            let atlas: ID3D11Texture2D = resource.cast().unwrap();
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { atlas.GetDesc(&mut desc) };
+            atlas_sizes.push((desc.Width, desc.Height));
+            atlases.push(atlas);
+        }
+        assert_ne!(atlases[0], atlases[1]);
+        assert_ne!(atlases[1], atlases[2]);
+        assert_ne!(atlases[0], atlases[2]);
+        assert_ne!(atlas_sizes[0], atlas_sizes[1]);
+        assert_eq!(atlas_sizes[0], atlas_sizes[2]);
+    }
+}
+
 pub struct Presenter {
     chain: IDXGISwapChain1,
     device: ID3D11Device,
@@ -22,6 +110,7 @@ pub struct Presenter {
     pipeline: Pipeline,
     targets: Option<Targets>,
     textures: HashMap<usize, Option<ID3D11ShaderResourceView>>,
+    scene_id: u64,
     vertices: Option<ID3D11Buffer>,
     capacity: usize,
     batches: Vec<(usize, Material, u32, u32)>,
@@ -91,6 +180,7 @@ impl Presenter {
             pipeline,
             targets,
             textures: HashMap::new(),
+            scene_id: 0,
             vertices: None,
             capacity: 0,
             batches: Vec::new(),
@@ -101,6 +191,11 @@ impl Presenter {
 
     pub fn draw(&mut self, size: (u32, u32), commands: &mut DrawList, vsync: bool) -> Result<bool> {
         self.resize(size)?;
+        if self.scene_id != commands.scene_id {
+            // Texture addresses and the lightmap atlas only identify assets within this scene.
+            self.textures.clear();
+            self.scene_id = commands.scene_id;
+        }
         for (id, image, mips) in commands.uploads.drain(..) {
             let texture = self.upload(&image, mips)?;
             self.textures.insert(id, Some(texture));

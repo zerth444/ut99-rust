@@ -25,6 +25,7 @@ impl Hud {
         game: &crate::game::deathmatch::Match,
         scoreboard: bool,
         captured: bool,
+        has_art: bool,
     ) {
         use crate::game::deathmatch::Match;
         frame.begin_ui(false);
@@ -47,22 +48,24 @@ impl Hud {
             ),
             accent,
         );
-        self.text(
-            frame,
-            16,
-            frame.height as i32 - (36.0 * scale) as i32,
-            scale,
-            &format!(
-                "HEALTH {}   ARMOR {}   {}   {}",
-                player.health,
-                player.armor(),
-                player.weapon.label(),
-                player
-                    .ammo()
-                    .map_or_else(|| "MELEE".to_owned(), |ammo| format!("AMMO {ammo}"))
-            ),
-            white,
-        );
+        if !has_art {
+            self.text(
+                frame,
+                16,
+                frame.height as i32 - (36.0 * scale) as i32,
+                scale,
+                &format!(
+                    "HEALTH {}   ARMOR {}   {}   {}",
+                    player.health,
+                    player.armor(),
+                    player.weapon.label(),
+                    player
+                        .ammo()
+                        .map_or_else(|| "MELEE".to_owned(), |ammo| format!("AMMO {ammo}"))
+                ),
+                white,
+            );
+        }
         let mut active = Vec::new();
         if player.boot_charges() > 0 {
             active.push(format!("BOOTS {}", player.boot_charges()));
@@ -77,7 +80,11 @@ impl Hud {
             self.text(
                 frame,
                 16,
-                frame.height as i32 - (61.0 * scale) as i32,
+                if has_art {
+                    (66.0 * scale) as i32
+                } else {
+                    frame.height as i32 - (61.0 * scale) as i32
+                },
                 scale,
                 &active.join("   "),
                 accent,

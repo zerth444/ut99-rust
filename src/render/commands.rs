@@ -114,6 +114,7 @@ impl Pass {
 }
 
 pub struct DrawList {
+    pub scene_id: u64,
     pub passes: [Pass; 5],
     pub uploads: Vec<(usize, Image, bool)>,
     pub lightmap_updates: Vec<LightmapUpdate>,
@@ -124,8 +125,11 @@ pub struct DrawList {
 
 impl DrawList {
     pub(super) fn new(map: &Map) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_SCENE: AtomicU64 = AtomicU64::new(1);
         let (atlas, image) = lightmaps(map);
         Self {
+            scene_id: NEXT_SCENE.fetch_add(1, Ordering::Relaxed),
             passes: Default::default(),
             uploads: vec![
                 (
@@ -221,18 +225,21 @@ fn encode_light(color: [f32; 3]) -> u32 {
 }
 
 fn lightmaps(map: &Map) -> (Atlas, Image) {
-    let mut maps = HashMap::new();
+    let mut seen = HashSet::new();
+    let mut maps = Vec::new();
     for face in map
         .faces
         .iter()
         .chain(map.movers.iter().flat_map(|mover| &mover.faces))
     {
         if let Some(lightmap) = face.lightmap.as_deref() {
-            maps.insert(lightmap as *const Lightmap as usize, lightmap);
+            let id = lightmap as *const Lightmap as usize;
+            if seen.insert(id) {
+                maps.push((id, lightmap));
+            }
         }
     }
-    let mut maps: Vec<_> = maps.into_iter().collect();
-    maps.sort_unstable_by_key(|(_, map)| std::cmp::Reverse(map.gpu_data().1));
+    maps.sort_by_key(|(_, map)| std::cmp::Reverse(map.gpu_data().1));
     let width = 2048;
     let mut x = 0;
     let mut y = 0;

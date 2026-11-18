@@ -373,6 +373,15 @@ impl Frame {
         self.draw(map, camera, game.time);
         self.layer(Layer::Effects);
         let view = self.camera_view(camera);
+        if game.show_decals {
+            for mark in game.decals.visible() {
+                self.draw_faces_in_view(mark, &view, game.time, false, None, None);
+            }
+        }
+        game.ballistics
+            .visuals(&map.ballistics, game.time, |visual| {
+                self.draw_world_effect(&view, game.time, visual);
+            });
         for (id, fighter) in game
             .fighters
             .iter()
@@ -474,50 +483,109 @@ impl Frame {
                 && !piloting
                 && let Some(weapon) = map.arsenal.get(&player.weapon)
             {
-                let fire = if player.last_alt && !weapon.alternate_motion.frames.is_empty() {
-                    &weapon.alternate_motion
-                } else {
-                    &weapon.primary_motion
-                };
-                let pose = player
-                    .charge_age(game.time)
-                    .and_then(|age| {
-                        weapon
-                            .load
-                            .sample(age.min((weapon.load.duration() - 0.001).max(0.0)))
-                    })
-                    .or_else(|| fire.sample(game.time - player.fired_at))
-                    .or_else(|| weapon.select_motion.sample(game.time - player.selected_at));
-                let faces = pose
-                    .as_ref()
-                    .map_or(weapon.view.as_slice(), |pose| pose.current);
-                self.layer(Layer::Weapon);
-                self.depth.fill(0.0);
-                let view = View::camera(&Camera {
-                    position: Vec3::default(),
-                    yaw: 0.0,
-                    pitch: 0.0,
-                });
+                let pose = player.weapon_pose(weapon, game.time);
                 let skin = if player.amp_left(game.time) > 0.0 {
                     map.powerups.amp_skin.as_deref()
+                } else if player.invis_left(game.time) > 0.0 {
+                    map.powerups.invis_skin.as_deref()
                 } else {
                     None
                 };
-                self.draw_lit_faces(
-                    faces,
-                    &view,
-                    game.time,
-                    false,
-                    pose,
-                    skin.map(|_| 1.0),
-                    &[],
-                    None,
-                    skin,
-                );
+                let muzzle = weapon
+                    .flash
+                    .as_ref()
+                    .is_some_and(|flash| game.time - player.fired_at < flash.length)
+                    .then_some(player.fired_count as usize);
+                self.draw_weapon_view(weapon, pose, game.time, muzzle, skin);
             }
-            self.layer(Layer::Hud);
+        }
+        self.layer(Layer::Hud);
+        self.draw_hit_tint(
+            0.20 - (game.time - player.hurt_at),
+            0.16 - (game.time - player.shield_at),
+        );
+        let hud = game.hud_state(map, game.hud_scale);
+        map.hud.draw(self, &hud, &map.arsenal);
+        if player.zoomed && !piloting && player.health > 0 && !game.finished {
+            self.draw_scope(map, player.weapon);
+        } else if (hud.crosshair_visible && map.hud.crosshair.is_none()) || piloting {
             self.draw_crosshair();
         }
+    }
+
+    fn draw_weapon_view(
+        &mut self,
+        weapon: &crate::game::WeaponAssets,
+        pose: crate::game::Pose<'_>,
+        time: f32,
+        flash_index: Option<usize>,
+        skin: Option<&crate::texture::Texture>,
+    ) {
+        let view = Camera {
+            position: Vec3::default(),
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        if let Some(index) = flash_index
+            && let Some(flash) = &weapon.flash
+        {
+            let texture = &flash.textures[index % flash.textures.len()];
+            let (w, h) = texture.size();
+            let scale = flash.scale * self.width as f32 / 640.0;
+            let [x, y] = weapon.muzzle_position(pose).map_or_else(
+                || {
+                    [
+                        (0.5 + flash.x) * self.width as f32,
+                        (0.5 + flash.y) * self.height as f32,
+                    ]
+                },
+                |position| {
+                    let muzzle = project(
+                        Vertex {
+                            position: View::camera(&view).point(position),
+                            u: 0.0,
+                            v: 0.0,
+                        },
+                        self.width,
+                        self.height,
+                        self.zoom,
+                    )
+                    .position;
+                    [muzzle.0, muzzle.1]
+                },
+            );
+            let offset = if flash.half_offset > 0.0 {
+                [flash.half_offset; 2]
+            } else {
+                [w * 0.5, h * 0.5]
+            };
+            self.blit_tile(
+                texture.image(0.0),
+                [
+                    (x - offset[0] * scale).round() as i32,
+                    (y - offset[1] * scale).round() as i32,
+                    (w * scale).round() as i32,
+                    (h * scale).round() as i32,
+                ],
+                [0.0, 0.0, w, h],
+                [1.0; 3],
+                true,
+                None,
+            );
+        }
+        self.depth.fill(0.0);
+        self.layer(Layer::Weapon);
+        self.draw_lit_faces(
+            pose.current,
+            &View::camera(&view),
+            time,
+            false,
+            Some(pose),
+            skin.map(|_| 1.0),
+            &[],
+            None,
+            skin,
+        );
     }
 
     pub fn draw_practice(
@@ -593,15 +661,7 @@ impl Frame {
                 self.draw_faces_in_view(pose.current, &model, time, false, Some(pose), None);
             }
         }
-        let mut draw_effect = |visual| match visual {
-            crate::game::ordnance::Visual::Sprite(position, image, scale, glow) => {
-                self.world_sprite(&view, position, image, scale, glow)
-            }
-            crate::game::ordnance::Visual::Mesh(position, direction, pose, scale, glow) => {
-                let model = view.in_model(position, direction, scale);
-                self.draw_faces_in_view(pose.current, &model, time, false, Some(pose), glow);
-            }
-        };
+        let mut draw_effect = |visual| self.draw_world_effect(&view, time, visual);
         game.ordnance
             .visuals(&map.ordnance, game.time, &mut draw_effect);
         game.ballistics
@@ -692,61 +752,6 @@ impl Frame {
             && !game.scoped()
             && let Some(weapon) = map.arsenal.get(&game.weapon)
         {
-            let view = Camera {
-                position: Vec3::default(),
-                yaw: 0.0,
-                pitch: 0.0,
-            };
-            let pose = game.pose(weapon);
-            if game.muzzle > game.time
-                && let Some(flash) = &weapon.flash
-            {
-                let texture = &flash.textures[game.shots as usize % flash.textures.len()];
-                let (w, h) = texture.size();
-                let scale = flash.scale * self.width as f32 / 640.0;
-                let [x, y] = weapon.muzzle_position(pose).map_or_else(
-                    || {
-                        [
-                            (0.5 + flash.x) * self.width as f32,
-                            (0.5 + flash.y) * self.height as f32,
-                        ]
-                    },
-                    |position| {
-                        let muzzle = project(
-                            Vertex {
-                                position: View::camera(&view).point(position),
-                                u: 0.0,
-                                v: 0.0,
-                            },
-                            self.width,
-                            self.height,
-                            self.zoom,
-                        )
-                        .position;
-                        [muzzle.0, muzzle.1]
-                    },
-                );
-                let offset = if flash.half_offset > 0.0 {
-                    [flash.half_offset; 2]
-                } else {
-                    [w * 0.5, h * 0.5]
-                };
-                self.blit_tile(
-                    texture.image(0.0),
-                    [
-                        (x - offset[0] * scale).round() as i32,
-                        (y - offset[1] * scale).round() as i32,
-                        (w * scale).round() as i32,
-                        (h * scale).round() as i32,
-                    ],
-                    [0.0, 0.0, w, h],
-                    [1.0; 3],
-                    true,
-                    None,
-                );
-            }
-            self.depth.fill(0.0);
-            self.layer(Layer::Weapon);
             let skin = if game.damage_amp_active() {
                 map.powerups.amp_skin.as_deref()
             } else if game.invisible() {
@@ -754,15 +759,11 @@ impl Frame {
             } else {
                 None
             };
-            self.draw_lit_faces(
-                pose.current,
-                &View::camera(&view),
+            self.draw_weapon_view(
+                weapon,
+                game.pose(weapon),
                 time,
-                false,
-                Some(pose),
-                skin.map(|_| 1.0),
-                &[],
-                None,
+                (game.muzzle > game.time).then_some(game.shots as usize),
                 skin,
             );
         }
@@ -816,8 +817,27 @@ impl Frame {
                 return;
             }
         }
-        let red = ((game.hit_flash_until - game.time) / 0.20).clamp(0.0, 1.0) * 0.22;
-        let shield = ((game.shield_flash_until - game.time) / 0.16).clamp(0.0, 1.0) * 0.18;
+        self.draw_hit_tint(
+            game.hit_flash_until - game.time,
+            game.shield_flash_until - game.time,
+        );
+        map.hud.draw(
+            self,
+            &crate::hud_art::State::practice(game, &map.arsenal),
+            &map.arsenal,
+        );
+        if game.death.is_some() {
+            return;
+        } else if game.scoped() {
+            self.draw_scope(map, game.weapon);
+        } else if map.hud.crosshair.is_none() {
+            self.draw_crosshair();
+        }
+    }
+
+    fn draw_hit_tint(&mut self, red_left: f32, shield_left: f32) {
+        let red = (red_left / 0.20).clamp(0.0, 1.0) * 0.22;
+        let shield = (shield_left / 0.16).clamp(0.0, 1.0) * 0.18;
         if red > 0.0 || shield > 0.0 {
             let tint = [red.max(shield), shield, shield * 0.6];
             if let Some(commands) = &mut self.commands {
@@ -838,34 +858,47 @@ impl Frame {
                 }
             }
         }
-        map.hud.draw(self, game, &map.arsenal);
-        if game.death.is_some() {
-            return;
-        } else if game.scoped() {
-            if let Some(scope) = map
-                .arsenal
-                .get(&game.weapon)
-                .and_then(|weapon| weapon.scope.as_ref())
-            {
-                let (w, h) = scope.size();
-                let scale = (self.width as f32 / 640.0).min(self.height as f32 / 256.0);
-                let (dw, dh) = ((w * scale).round() as i32, (h * scale).round() as i32);
-                self.translucent_tile(
-                    scope.image(0.0),
-                    [
-                        (self.width as i32 - dw) / 2,
-                        (self.height as i32 - dh) / 2,
-                        dw,
-                        dh,
-                    ],
-                    [0.0, 0.0, w, h],
-                    [1.0; 3],
-                );
-            } else {
-                self.draw_crosshair();
-            }
-        } else if map.hud.crosshair.is_none() {
+    }
+
+    fn draw_scope(&mut self, map: &Map, weapon: crate::game::Weapon) {
+        let Some(scope) = map
+            .arsenal
+            .get(&weapon)
+            .and_then(|weapon| weapon.scope.as_ref())
+        else {
             self.draw_crosshair();
+            return;
+        };
+        let (w, h) = scope.size();
+        let scale = (self.width as f32 / 640.0).min(self.height as f32 / 256.0);
+        let (dw, dh) = ((w * scale).round() as i32, (h * scale).round() as i32);
+        self.translucent_tile(
+            scope.image(0.0),
+            [
+                (self.width as i32 - dw) / 2,
+                (self.height as i32 - dh) / 2,
+                dw,
+                dh,
+            ],
+            [0.0, 0.0, w, h],
+            [1.0; 3],
+        );
+    }
+
+    fn draw_world_effect(
+        &mut self,
+        view: &View,
+        time: f32,
+        visual: crate::game::ordnance::Visual<'_>,
+    ) {
+        match visual {
+            crate::game::ordnance::Visual::Sprite(position, image, scale, glow) => {
+                self.world_sprite(view, position, image, scale, glow)
+            }
+            crate::game::ordnance::Visual::Mesh(position, direction, pose, scale, glow) => {
+                let model = view.in_model(position, direction, scale);
+                self.draw_faces_in_view(pose.current, &model, time, false, Some(pose), glow);
+            }
         }
     }
 

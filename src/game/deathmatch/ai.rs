@@ -28,9 +28,10 @@ impl Difficulty {
     pub(super) fn combat(self) -> Combat {
         match self {
             Self::Easy => Combat {
-                reaction: 0.55,
+                reaction: 0.68,
                 turn: 2.65,
-                error: 0.075,
+                error: 0.14,
+                fire_pause: 0.34,
                 lead: 0.25,
                 strafe: 0.3,
                 rush_health: 23,
@@ -38,11 +39,12 @@ impl Difficulty {
                 dodge: false,
             },
             Self::Standard => Combat {
-                reaction: 0.25,
-                turn: 3.8,
-                error: 0.028,
+                reaction: 0.40,
+                turn: 3.2,
+                error: 0.087,
+                fire_pause: 0.20,
                 lead: 0.72,
-                strafe: 0.53,
+                strafe: 0.43,
                 rush_health: 36,
                 evade_window: 0.36,
                 dodge: true,
@@ -50,7 +52,8 @@ impl Difficulty {
             Self::Hard => Combat {
                 reaction: 0.13,
                 turn: 5.4,
-                error: 0.011,
+                error: 0.032,
+                fire_pause: 0.08,
                 lead: 1.0,
                 strafe: 0.72,
                 rush_health: 48,
@@ -65,11 +68,26 @@ pub(super) struct Combat {
     pub reaction: f32,
     pub turn: f32,
     pub error: f32,
+    pub fire_pause: f32,
     pub lead: f32,
     pub strafe: f32,
     pub rush_health: u16,
     pub evade_window: f32,
     pub dodge: bool,
+}
+
+pub(super) fn shot_bias(id: usize, shots: u32) -> [f32; 2] {
+    let hash = |axis: u32| {
+        let mut seed =
+            (id as u32).wrapping_mul(0x9e37_79b9) ^ shots.wrapping_mul(0x85eb_ca6b) ^ axis;
+        seed ^= seed >> 16;
+        seed = seed.wrapping_mul(0x7feb_352d);
+        seed ^= seed >> 15;
+        seed = seed.wrapping_mul(0x846c_a68b);
+        seed ^= seed >> 16;
+        ((seed >> 8) as f32 / 8_388_608.0) - 1.0
+    };
+    [hash(0xc01d_2941), hash(0x136f_2aa9)]
 }
 
 pub(super) fn intercept(delta: Vec3, velocity: Vec3, speed: f32) -> Vec3 {

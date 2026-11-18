@@ -8,6 +8,51 @@ const BLUE: [f32; 3] = [0.0, 0.0, 254.0 / 255.0];
 const WHITE: [f32; 3] = [1.0; 3];
 const GOLD: [f32; 3] = [1.0, 1.0, 0.0];
 
+pub struct State {
+    pub hud_scale: f32,
+    pub time: f32,
+    pub pickup_time: f32,
+    pub score: i16,
+    pub health: u16,
+    pub armor: [u16; 3],
+    pub boots: bool,
+    pub amplified: bool,
+    pub rocket_locked: bool,
+    pub crosshair_visible: bool,
+    pub weapon: Weapon,
+    pub pending: Weapon,
+    pub ammo: Option<u16>,
+    pub owned: [bool; Weapon::ALL.len()],
+    pub fractions: [Option<f32>; Weapon::ALL.len()],
+}
+
+impl State {
+    pub fn practice(game: &Practice, arsenal: &HashMap<Weapon, WeaponAssets>) -> Self {
+        let mut owned = [false; Weapon::ALL.len()];
+        for weapon in game.owned() {
+            owned[weapon as usize] = true;
+        }
+        Self {
+            hud_scale: game.hud_scale,
+            time: game.time,
+            pickup_time: game.pickup_time,
+            score: game.score,
+            health: game.health,
+            armor: [ArmorKind::Belt, ArmorKind::Chest, ArmorKind::Thigh]
+                .map(|kind| game.armor_charge(kind)),
+            boots: game.has_jump_boots(),
+            amplified: game.damage_amp_active(),
+            rocket_locked: game.rocket_locked,
+            crosshair_visible: game.death.is_none() && !game.scoped(),
+            weapon: game.weapon,
+            pending: game.pending_weapon(),
+            ammo: game.ammo(),
+            owned,
+            fractions: Weapon::ALL.map(|weapon| game.ammo_fraction(weapon, arsenal)),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Art {
     pub elements: Option<Arc<Texture>>,
@@ -23,12 +68,7 @@ impl Art {
         self.elements.is_some() && self.weapons.is_some()
     }
 
-    pub fn draw(
-        &self,
-        frame: &mut Frame,
-        game: &Practice,
-        arsenal: &HashMap<Weapon, WeaponAssets>,
-    ) {
+    pub fn draw(&self, frame: &mut Frame, game: &State, arsenal: &HashMap<Weapon, WeaponAssets>) {
         let width = frame.width as f32;
         let height = frame.height as f32;
         let scale = game.hud_scale * width / 1280.0;
@@ -52,7 +92,7 @@ impl Art {
                 [128.0, 192.0, 128.0, 64.0],
                 BLUE,
             );
-            if let Some(ammo) = game.ammo() {
+            if let Some(ammo) = game.ammo {
                 number(
                     frame,
                     elements,
@@ -98,8 +138,7 @@ impl Art {
         } else {
             self.crosshair.as_ref()
         };
-        if game.death.is_none()
-            && !game.scoped()
+        if game.crosshair_visible
             && let Some(crosshair) = crosshair
         {
             let (w, h) = crosshair.size();
@@ -127,7 +166,7 @@ impl Art {
     fn status(
         &self,
         frame: &mut Frame,
-        game: &Practice,
+        game: &State,
         elements: &TextureImage,
         width: f32,
         scale: f32,
@@ -148,9 +187,15 @@ impl Art {
                 BLUE,
             );
             for (y, amount) in [
-                (0.0, f32::from(game.armor_charge(ArmorKind::Chest)) / 100.0),
-                (64.0, f32::from(game.armor_charge(ArmorKind::Thigh)) / 50.0),
-                (128.0, f32::from(game.has_jump_boots())),
+                (
+                    0.0,
+                    f32::from(game.armor[ArmorKind::Chest as usize]) / 100.0,
+                ),
+                (
+                    64.0,
+                    f32::from(game.armor[ArmorKind::Thigh as usize]) / 50.0,
+                ),
+                (128.0, f32::from(game.boots)),
             ] {
                 if amount > 0.0 {
                     art(
@@ -164,7 +209,7 @@ impl Art {
             }
         }
         if show_doll
-            && game.armor_charge(ArmorKind::Belt) > 0
+            && game.armor[ArmorKind::Belt as usize] > 0
             && let Some(belt) = &self.belt
         {
             let (w, h) = belt.size();
@@ -177,7 +222,7 @@ impl Art {
             );
         }
         let x = doll_x - 140.0 * scale;
-        if game.damage_amp_active()
+        if game.amplified
             && let Some(amp) = &self.amp
         {
             let (w, h) = amp.size();
@@ -227,7 +272,7 @@ impl Art {
         number(
             frame,
             elements,
-            i32::from(game.armor().min(150)),
+            i32::from(game.armor.iter().sum::<u16>().min(150)),
             x + 4.0 * scale,
             16.0 * scale,
             scale,
@@ -247,7 +292,7 @@ impl Art {
 
 fn weapon_bar(
     frame: &mut Frame,
-    game: &Practice,
+    game: &State,
     arsenal: &HashMap<Weapon, WeaponAssets>,
     elements: &TextureImage,
     atlas: &TextureImage,
@@ -257,9 +302,12 @@ fn weapon_bar(
     let base = (frame.width as f32 - row_width) * 0.5;
     let y = frame.height as f32 - 63.5 * scale;
     let current = game.weapon;
-    let pending = game.pending_weapon();
+    let pending = game.pending;
     let mut slots = [None; 10];
-    for weapon in game.owned() {
+    for weapon in Weapon::ALL
+        .into_iter()
+        .filter(|weapon| game.owned[*weapon as usize])
+    {
         let slot = &mut slots[slot_index(weapon)];
         if slot.is_none() || weapon == current || (weapon == pending && *slot != Some(current)) {
             *slot = Some(weapon);
@@ -338,7 +386,7 @@ fn weapon_bar(
             [digit as f32 * 25.0, 0.0, 25.0, 64.0],
             GOLD,
         );
-        if let Some(fraction) = game.ammo_fraction(weapon, arsenal) {
+        if let Some(fraction) = game.fractions[weapon as usize] {
             art(
                 frame,
                 elements,

@@ -554,6 +554,7 @@ pub struct Practice {
     pub rocket_locked: bool,
     pub minigun_firing: bool,
     enforcer_alt_accuracy: f32,
+    bullet_cadence: ballistics::Cadence,
     pulse_contact_time: f32,
     pulse_last_contact: f32,
     pulse_contact: bool,
@@ -617,6 +618,7 @@ impl Practice {
             rocket_locked: false,
             minigun_firing: false,
             enforcer_alt_accuracy: 0.4,
+            bullet_cadence: ballistics::Cadence::default(),
             pulse_contact_time: 0.0,
             pulse_last_contact: -1.0,
             pulse_contact: false,
@@ -2000,46 +2002,16 @@ impl Practice {
         alternate: bool,
         sounds: &mut SoundEvents,
     ) -> Option<shock::Blast> {
-        let (cooldown, accuracy, damage, side, height) = match (weapon, alternate) {
-            (Weapon::Enforcer, false) => (0.32, 0.2, 17, 5.5, -4.4),
-            (Weapon::Enforcer, true) => {
-                let accuracy = self.enforcer_alt_accuracy;
-                if accuracy < 3.0 {
-                    self.enforcer_alt_accuracy += 0.5;
-                }
-                let cooldown = map
-                    .arsenal
-                    .get(&weapon)
-                    .map_or(0.0, |art| art.alternate_motion.duration());
-                (
-                    if cooldown > 0.0 { cooldown } else { 0.19 },
-                    accuracy,
-                    17,
-                    5.5,
-                    -4.4,
-                )
-            }
-            (Weapon::Minigun, alt) => {
-                let random_damage = 9 + (((self.jitter() + 1.0) * 3.0) as i32).min(5);
-                if alt {
-                    (0.08, 0.95, random_damage, 5.0, -4.0)
-                } else {
-                    (0.13, 0.2, random_damage, 5.0, -4.0)
-                }
-            }
-            (Weapon::Sniper, _) => (0.67, 0.0, 45, 0.0, 0.0),
-            _ => return None,
-        };
-        self.next_shot = self.time + cooldown;
-        let forward = camera.look_direction();
-        let right = camera.right();
-        let up = forward.cross(right);
-        let mut start = camera.position + right * side + up * height;
-        if weapon == Weapon::Enforcer {
-            start = start + forward * 3.3;
-        }
-        let delta =
-            forward * 10_000.0 + (right * self.jitter() + up * self.jitter()) * (500.0 * accuracy);
+        let profile = ballistics::BulletProfile::for_weapon(
+            map,
+            weapon,
+            alternate,
+            &mut self.enforcer_alt_accuracy,
+            || ballistics::jitter(&mut self.rng),
+        )?;
+        self.next_shot = self.time + profile.interval;
+        let damage = profile.damage;
+        let (start, delta) = profile.ray(camera, || self.jitter());
         let mut wall = map.collision.ray_surface(start, delta);
         let mut visible = wall.map_or(delta, |(point, _)| point - start);
         let projectile = self.ordnance.trace_target(&map.ordnance, start, visible);
@@ -2057,7 +2029,7 @@ impl Practice {
             self.ordnance.damage_target(
                 &map.ordnance,
                 index,
-                damage as u16 * self.damage_scale(),
+                damage * self.damage_scale(),
                 self.time,
                 sounds,
             )
@@ -2070,7 +2042,7 @@ impl Practice {
         {
             let point = start + visible * fraction;
             let headshot = weapon == Weapon::Sniper && point.2 - target.position.2 > 0.62 * 39.0;
-            target.damage(if headshot { 100 } else { damage as u16 });
+            target.damage(if headshot { 100 } else { damage });
             sounds.extend_at(
                 map.ballistics.flesh.iter().cloned(),
                 point,
@@ -2080,95 +2052,34 @@ impl Practice {
             visible = point - start;
             wall = None;
         }
-        if weapon == Weapon::Minigun {
-            self.ballistics.rounds = (self.ballistics.rounds + 1) % 4;
-            if self.ballistics.rounds == 0 && visible.dot(visible) > 250.0_f32.powi(2) {
-                self.ballistics.tracer.push(ballistics::Moving {
-                    position: start + forward * 96.0,
-                    velocity: crate::mover::unit(delta) * 4000.0,
-                    born: self.time,
-                    style: 0,
-                    scale: 1.0,
-                    bounces: 0,
-                });
-            }
-        }
-        if weapon != Weapon::Minigun || self.time - self.ballistics.last_case > 0.125 {
-            let (ahead, side, height) = match weapon {
-                Weapon::Enforcer => (20.0, 3.5, 1.0),
-                Weapon::Minigun => (30.0, 5.0, -5.0),
-                _ => (30.0, 5.0, -1.0),
-            };
-            let case_origin = map
-                .arsenal
-                .get(&weapon)
-                .and_then(|art| self.pose(art).edge_center(art.case_triangle?))
-                .filter(|point| point.0 > 0.0);
-            let offset =
-                case_origin.map_or(forward * ahead + right * side + up * height, |point| {
-                    // Keep the ejection distance while matching the projected viewmodel.
-                    (forward * point.0 + right * point.1 + up * point.2) * (ahead / point.0)
-                });
-            if map.collision.ray(camera.position, offset).is_none() {
-                let velocity = (forward * (0.55 + 0.15 * self.jitter())
-                    + right * (0.3 + 0.1 * self.jitter())
-                    + up * (1.15 + 0.15 * self.jitter()))
-                    * 160.0;
-                self.ballistics.cases.push(ballistics::Moving {
-                    position: camera.position + offset,
-                    velocity,
-                    born: self.time,
-                    style: usize::from(weapon == Weapon::Minigun),
-                    scale: if weapon == Weapon::Sniper { 2.0 } else { 1.0 },
-                    bounces: 0,
-                });
-            }
-            if weapon == Weapon::Minigun {
-                self.ballistics.last_case = self.time;
-            }
-        }
-        if let Some((point, normal)) = wall {
-            let pock = ((self.jitter() + 1.0) * 1.5) as usize;
-            let expires = self.time + 19.0 + (self.jitter() + 1.0) * 2.5;
-            if let Some(texture) = &map.ballistics.pock[pock] {
-                self.decals.project(
-                    &map.faces,
-                    point,
-                    normal,
-                    texture,
-                    map.ballistics.pock_scale,
-                    expires,
-                );
-            }
-            let sound = (((self.jitter() + 1.0) * 2.0) as usize).min(3);
-            if let Some(sound) = map.ballistics.wall_sounds.get(sound) {
-                sounds.extend_at(sound.iter().cloned(), point, CONTACT_SOUND_RADIUS, 1.0);
-            }
-            let origin = point + normal * if weapon == Weapon::Enforcer { 1.0 } else { 9.0 };
-            let style = (((self.jitter() + 1.0) * 2.0) as usize).min(3);
-            self.ballistics.smoke.push((origin, self.time, style));
-            let count = if weapon == Weapon::Minigun { 2 } else { 3 };
-            let sparks = ((self.jitter() + 1.0) * 0.5 * count as f32) as u8;
-            for _ in 0..sparks {
-                let direction =
-                    crate::mover::unit(Vec3(self.jitter(), self.jitter(), self.jitter()));
-                let velocity = (normal + direction) * (100.0 * (self.jitter() + 1.0));
-                self.ballistics.sparks.push(ballistics::Moving {
-                    position: point + normal * 9.0,
-                    velocity,
-                    born: self.time,
-                    style: 0,
-                    scale: 1.0,
-                    bounces: 0,
-                });
-            }
-        }
+        let case_origin = map
+            .arsenal
+            .get(&weapon)
+            .and_then(|art| self.pose(art).edge_center(art.case_triangle?))
+            .filter(|point| point.0 > 0.0);
+        let seed = &mut self.rng;
+        self.ballistics.bullet(
+            map,
+            &mut self.decals,
+            camera,
+            weapon,
+            self.time,
+            ballistics::Bullet {
+                start,
+                delta,
+                visible,
+                wall,
+                case_origin,
+            },
+            &mut self.bullet_cadence,
+            sounds,
+            || ballistics::jitter(seed),
+        );
         blast
     }
 
     fn jitter(&mut self) -> f32 {
-        self.rng = self.rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        ((self.rng >> 16) as f32 / 32768.0) - 1.0
+        ballistics::jitter(&mut self.rng)
     }
 }
 

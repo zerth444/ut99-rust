@@ -154,6 +154,7 @@ pub(super) enum Path {
 }
 
 pub(super) fn shot(weapon: Weapon, alt: bool) -> Shot {
+    let bullet = || trace(0, 0.0, 1, super::ballistics::BulletProfile::RANGE, 1, 0.0);
     fn trace(damage: u16, interval: f32, ammo: u16, range: f32, rays: u8, spread: f32) -> Shot {
         Shot {
             damage,
@@ -193,8 +194,7 @@ pub(super) fn shot(weapon: Weapon, alt: bool) -> Shot {
     match (weapon, alt) {
         (Weapon::Hammer, false) => trace(44, 0.58, 0, 96.0, 1, 0.0),
         (Weapon::Hammer, true) => trace(28, 0.34, 0, 78.0, 1, 0.0),
-        (Weapon::Enforcer, false) => trace(26, 0.32, 1, 4800.0, 1, 0.018),
-        (Weapon::Enforcer, true) => trace(20, 0.22, 1, 3200.0, 1, 0.055),
+        (Weapon::Enforcer, _) => bullet(),
         (Weapon::Bio, false) => missile(28, 0.36, 1, Gel, 44.0, 0.72, 0),
         (Weapon::Bio, true) => missile(42, 0.88, 1, Glob, 76.0, 0.8, 0),
         (Weapon::Shock, false) => trace(39, 0.59, 1, 6500.0, 1, 0.0),
@@ -203,13 +203,12 @@ pub(super) fn shot(weapon: Weapon, alt: bool) -> Shot {
         (Weapon::Pulse, true) => trace(12, 0.13, 1, 690.0, 1, 0.0),
         (Weapon::Ripper, false) => missile(33, 0.41, 1, Razor, 0.0, 0.0, 3),
         (Weapon::Ripper, true) => missile(42, 0.58, 1, RazorAlt, 115.0, 0.0, 0),
-        (Weapon::Minigun, false) => trace(11, 0.13, 1, 4700.0, 1, 0.034),
-        (Weapon::Minigun, true) => trace(9, 0.08, 1, 3900.0, 1, 0.076),
+        (Weapon::Minigun, _) => bullet(),
         (Weapon::Flak, false) => trace(12, 0.66, 1, 1100.0, 8, 0.16),
         (Weapon::Flak, true) => missile(86, 0.85, 1, FlakShell, 170.0, 0.8, 0),
         (Weapon::Rocket, false) => missile(83, 0.92, 1, Rocket, 207.0, 0.0, 0),
         (Weapon::Rocket, true) => missile(80, 0.98, 1, Grenade, 190.0, 0.87, 2),
-        (Weapon::Sniper, false) => trace(65, 0.9, 1, 11000.0, 1, 0.0),
+        (Weapon::Sniper, false) => bullet(),
         (Weapon::Sniper, true) => Shot {
             damage: 0,
             interval: 0.0,

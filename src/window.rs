@@ -271,6 +271,7 @@ unsafe fn message_loop(
                                     {
                                         return Ok(());
                                     }
+                                    frame = Frame::hardware(map);
                                     tick = Instant::now();
                                     raw = (0, 0);
                                     primary = false;
@@ -564,8 +565,16 @@ unsafe fn message_loop(
                         }
                     };
                     (frame.width, frame.height) = (size.0 as usize, size.1 as usize);
+                    game.hud_scale = settings.hud_scale as f32 / 100.0;
+                    game.show_decals = settings.show_decals;
                     frame.draw_deathmatch(map, &view, game, settings.field_of_view as f32);
-                    hud.draw_deathmatch(&mut frame, game, active && key(VK_TAB), mouse.captured);
+                    hud.draw_deathmatch(
+                        &mut frame,
+                        game,
+                        active && key(VK_TAB),
+                        mouse.captured,
+                        map.hud.ready(),
+                    );
                     if settings.show_fps {
                         let label = stats.label(window, size, presenter.software);
                         hud.text(&mut frame, 16, 35, 0.8, &label, [0.72, 0.95, 0.78]);

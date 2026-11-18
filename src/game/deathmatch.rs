@@ -7,7 +7,7 @@ mod navigation;
 mod timestep;
 
 use super::{
-    Item, Powerup, Weapon, WeaponAssets,
+    Item, Pose, Powerup, Weapon, WeaponAssets, ballistics, decals,
     liquid::{Impact, LiquidState},
     shock::cylinder_hit,
 };
@@ -74,6 +74,7 @@ pub struct Fighter {
     inventory: Inventory,
     pub weapon: Weapon,
     pub selected_at: f32,
+    pickup_time: f32,
     pub last_alt: bool,
     pub zoomed: bool,
     alt_held: bool,
@@ -83,8 +84,12 @@ pub struct Fighter {
     pub score: i16,
     pub deaths: u16,
     pub fired_at: f32,
+    pub(crate) fired_count: u32,
+    enforcer_accuracy: f32,
+    bullet_cadence: ballistics::Cadence,
     pub fell_at: Option<f32>,
-    hurt_at: f32,
+    pub(crate) hurt_at: f32,
+    pub(crate) shield_at: f32,
     landed_at: f32,
     stride_time: f32,
     protected_until: f32,
@@ -109,6 +114,7 @@ impl Fighter {
             inventory: Inventory::new(map),
             weapon: Weapon::Enforcer,
             selected_at: f32::NEG_INFINITY,
+            pickup_time: f32::NEG_INFINITY,
             last_alt: false,
             zoomed: false,
             alt_held: false,
@@ -118,8 +124,12 @@ impl Fighter {
             score: 0,
             deaths: 0,
             fired_at: f32::NEG_INFINITY,
+            fired_count: 0,
+            enforcer_accuracy: 0.4,
+            bullet_cadence: ballistics::Cadence::default(),
             fell_at: None,
             hurt_at: f32::NEG_INFINITY,
+            shield_at: f32::NEG_INFINITY,
             landed_at: f32::NEG_INFINITY,
             stride_time: 0.0,
             protected_until: time + SPAWN_PROTECTION,
@@ -160,8 +170,24 @@ impl Fighter {
         ))
     }
 
-    pub(crate) fn charge_age(&self, time: f32) -> Option<f32> {
-        self.charge.map(|charge| time - charge.since)
+    pub(crate) fn weapon_pose<'a>(&self, art: &'a WeaponAssets, time: f32) -> Pose<'a> {
+        let fire = if self.last_alt && !art.alternate_motion.frames.is_empty() {
+            &art.alternate_motion
+        } else {
+            &art.primary_motion
+        };
+        self.charge
+            .and_then(|charge| {
+                let age = (time - charge.since).min((art.load.duration() - 0.001).max(0.0));
+                art.load.sample(age)
+            })
+            .or_else(|| fire.sample(time - self.fired_at))
+            .or_else(|| art.select_motion.sample(time - self.selected_at))
+            .unwrap_or(Pose {
+                current: &art.view,
+                next: &art.view,
+                fraction: 0.0,
+            })
     }
 
     pub fn armor(&self) -> u16 {
@@ -368,6 +394,10 @@ pub struct Match {
     pub time: f32,
     pub fighters: Vec<Fighter>,
     pub finished: bool,
+    pub hud_scale: f32,
+    pub show_decals: bool,
+    pub decals: decals::Marks,
+    pub ballistics: ballistics::Effects,
     pub traces: Vec<Trace>,
     bolts: Vec<Bolt>,
     initial_props: Vec<bool>,
@@ -386,6 +416,10 @@ impl Match {
             time: 0.0,
             fighters: Vec::with_capacity(rules.bots + 1),
             finished: false,
+            hud_scale: 1.0,
+            show_decals: true,
+            decals: decals::Marks::default(),
+            ballistics: ballistics::Effects::default(),
             traces: Vec::new(),
             bolts: Vec::new(),
             initial_props: map.props.iter().map(|prop| prop.visible).collect(),
@@ -418,6 +452,8 @@ impl Match {
         self.time = 0.0;
         self.finished = false;
         self.traces.clear();
+        self.decals = decals::Marks::default();
+        self.ballistics = ballistics::Effects::default();
         self.bolts.clear();
         self.pickups.fill(None);
         for (prop, &visible) in map.props.iter_mut().zip(&self.initial_props) {
@@ -454,6 +490,35 @@ impl Match {
 
     pub fn remaining(&self) -> u16 {
         (f32::from(self.rules.seconds) - self.time).ceil().max(0.0) as u16
+    }
+
+    pub(crate) fn hud_state(&self, map: &Map, scale: f32) -> crate::hud_art::State {
+        let player = &self.fighters[0];
+        crate::hud_art::State {
+            hud_scale: scale,
+            time: self.time,
+            pickup_time: player.pickup_time,
+            score: player.score,
+            health: player.health,
+            armor: player.armor,
+            boots: player.boot_charges() > 0 || player.power.boosted_airborne,
+            amplified: player.amp_left(self.time) > 0.0,
+            rocket_locked: false,
+            crosshair_visible: player.health > 0
+                && !player.zoomed
+                && !self.finished
+                && self.pilot_index().is_none(),
+            weapon: player.weapon,
+            pending: player.weapon,
+            ammo: player.ammo(),
+            owned: Weapon::ALL.map(|weapon| player.inventory.owns(weapon)),
+            fractions: Weapon::ALL.map(|weapon| {
+                (weapon != Weapon::Hammer).then(|| {
+                    f32::from(player.inventory.ammo(weapon))
+                        / f32::from(super::max_ammo(&map.arsenal, weapon).max(1))
+                })
+            }),
+        }
     }
 
     pub fn difficulty(&self) -> Difficulty {
@@ -760,6 +825,10 @@ impl Match {
         for hit in hits {
             self.apply_hit(map, hit, &mut sounds);
         }
+        self.decals.update(self.time);
+        self.decals.follow_movers(&map.movers);
+        self.ballistics
+            .update(map, None, self.time, dt, &mut sounds);
         self.finished = self.remaining() == 0
             || self
                 .fighters
@@ -837,6 +906,7 @@ impl Match {
                     continue;
                 }
                 prop.visible = false;
+                fighter.pickup_time = self.time;
                 self.pickups[index] = Some(self.time + prop.respawn_time.unwrap_or(25.0));
                 sounds.extend_at(
                     prop.pickup_sound.iter().cloned(),
@@ -877,6 +947,9 @@ impl Match {
         }
         let pressed_alt = input.alternate && !fighter.alt_held;
         fighter.alt_held = input.alternate;
+        if fighter.weapon != Weapon::Enforcer || !input.alternate || input.primary {
+            fighter.enforcer_accuracy = 0.4;
+        }
         let requested = input.preferred.or_else(|| {
             fighter
                 .inventory
@@ -977,9 +1050,38 @@ impl Match {
             return;
         }
         fighter.fired_at = self.time;
+        fighter.fired_count = fighter.fired_count.wrapping_add(1);
         fighter.last_alt = alt;
-        fighter.ready_at = self.time + shot.interval;
+        let mut seed = self.time.to_bits().rotate_left(5) ^ (id as u32).wrapping_mul(0x9e37_79b9);
+        let mut jitter = || ballistics::jitter(&mut seed);
+        let bullet = ballistics::BulletProfile::for_weapon(
+            map,
+            weapon,
+            alt,
+            &mut fighter.enforcer_accuracy,
+            &mut jitter,
+        );
+        let pause = if id == 0 {
+            0.0
+        } else {
+            self.rules.difficulty.combat().fire_pause
+                * (0.8 + 0.2 * ai::shot_bias(id, fighter.fired_count)[0])
+        };
+        let interval = bullet
+            .as_ref()
+            .map_or(shot.interval, |bullet| bullet.interval);
+        fighter.ready_at = self.time + interval + pause;
         let aim = fighter.camera(map);
+        let case_origin = bullet
+            .is_some()
+            .then(|| map.arsenal.get(&weapon))
+            .flatten()
+            .and_then(|art| {
+                fighter
+                    .weapon_pose(art, self.time)
+                    .edge_center(art.case_triangle?)
+            })
+            .filter(|point| point.0 > 0.0);
         let start = aim.position;
         let direction = aim.look_direction();
         let boosted = fighter.amp_left(self.time) > 0.0;
@@ -988,9 +1090,10 @@ impl Match {
         let damage = if grow {
             (f32::from(shot.damage) * (1.0 + 0.38 * extra)).round() as u16
         } else {
-            shot.damage
+            bullet.as_ref().map_or(shot.damage, |bullet| bullet.damage)
         };
-        let damage = damage.saturating_mul(if boosted { 3 } else { 1 });
+        let base_damage = damage;
+        let damage = base_damage.saturating_mul(if boosted { 3 } else { 1 });
         let wave = super::shot_sound(&map.arsenal, weapon, alt);
         if id == 0 {
             sounds.extend(wave);
@@ -1060,17 +1163,17 @@ impl Match {
             } => {
                 let right = aim.right();
                 let up = direction.cross(right);
-                let mut seed =
-                    self.time.to_bits().rotate_left(5) ^ (id as u32).wrapping_mul(0x9e37_79b9);
-                let mut jitter = || {
-                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-                    ((seed >> 8) as f32 / 8_388_608.0) - 1.0
-                };
                 for ray in 0..rays {
                     let spread = if ray == 0 && rays > 1 { 0.0 } else { spread };
-                    let delta =
-                        unit(direction + (right * jitter() + up * jitter()) * spread) * range;
-                    let end = map.collision.ray(start, delta).unwrap_or(start + delta);
+                    let (start, delta) = match &bullet {
+                        Some(profile) => profile.ray(&aim, &mut jitter),
+                        None => (
+                            start,
+                            unit(direction + (right * jitter() + up * jitter()) * spread) * range,
+                        ),
+                    };
+                    let wall = map.collision.ray_surface(start, delta);
+                    let end = wall.map_or(start + delta, |(point, _)| point);
                     let clipped = end - start;
                     let target = nearest_hit(&self.fighters, id, start, clipped, [0.0, 0.0]);
                     let projectile = self.closest_explosive(map, start, clipped);
@@ -1090,18 +1193,52 @@ impl Match {
                         );
                         at
                     } else if let Some((victim, at)) = target {
+                        let point = start + clipped * at;
+                        if bullet.is_some() {
+                            sounds.extend_at(
+                                map.ballistics.flesh.iter().cloned(),
+                                point,
+                                CONTACT_SOUND_RADIUS,
+                                1.0,
+                            );
+                        }
+                        let headshot = weapon == Weapon::Sniper
+                            && point.2 - self.fighters[victim].walker.position.2
+                                > 0.62 * PLAYER_HEIGHT;
                         hits.push(Hit {
                             bypass_armor: false,
                             victim,
                             owner: Some(id),
-                            damage,
-                            impulse: unit(delta) * (f32::from(shot.damage) * 3.4),
+                            damage: if headshot {
+                                if boosted { 300 } else { 100 }
+                            } else {
+                                damage
+                            },
+                            impulse: unit(delta) * (f32::from(base_damage) * 3.4),
                         });
                         at
                     } else {
                         1.0
                     };
-                    if ray == 0 && weapon != Weapon::Hammer {
+                    if ray == 0 && bullet.is_some() {
+                        self.ballistics.bullet(
+                            map,
+                            &mut self.decals,
+                            &aim,
+                            weapon,
+                            self.time,
+                            ballistics::Bullet {
+                                start,
+                                delta,
+                                visible: clipped * fraction,
+                                wall: wall.filter(|_| target.is_none() && intercepted.is_none()),
+                                case_origin,
+                            },
+                            &mut self.fighters[id].bullet_cadence,
+                            sounds,
+                            &mut jitter,
+                        );
+                    } else if ray == 0 && weapon != Weapon::Hammer {
                         self.traces.push(Trace {
                             start,
                             end: start + clipped * fraction,
@@ -1286,6 +1423,7 @@ impl Match {
             super::absorb_damage(&mut victim.armor, hit.damage)
         };
         if shield {
+            victim.shield_at = self.time;
             sounds.extend_at(
                 map.powerups.shield_hit.iter().cloned(),
                 victim.walker.position,
@@ -1456,11 +1594,12 @@ impl Match {
                 Path::Trace { range, .. } => range,
                 Path::Zoom => 0.0,
             };
-            let strafe = (self.time * 2.1 + id as f32).sin().signum();
-            let error = range * skill.error;
+            let strafe = (self.time * 1.75 + id as f32 * 1.7).sin();
+            let error = range.max(370.0) * skill.error;
+            let [side_error, height_error] = ai::shot_bias(id, fighter.fired_count);
             delta = delta
-                + eye.right() * ((self.time * 4.2 + id as f32).sin() * error)
-                + Vec3(0.0, 0.0, (self.time * 3.4 + id as f32).cos() * error * 0.43);
+                + eye.right() * (side_error * error)
+                + Vec3(0.0, 0.0, height_error * error * 0.55);
             let (turn, pitch) = aim_error(delta, fighter.yaw, fighter.pitch);
             let yaw = turn.clamp(-skill.turn * dt, skill.turn * dt);
             let tilt = pitch.clamp(-skill.turn * dt * 0.75, skill.turn * dt * 0.75);
@@ -1479,15 +1618,13 @@ impl Match {
                     self.time - charge.since >= charge.profile.period * (wanted - 0.85)
                 });
             let hold_trigger = firing && !release_charge && fighter.charge_locked != Some(alt);
+            let advance = if weapon == Weapon::Hammer {
+                ((range - 49.0) / 120.0).clamp(0.0, 0.85)
+            } else {
+                ((range - (attack_range * 0.58).min(360.0)) / 450.0).clamp(-0.28, 0.65)
+            };
             return Command {
-                movement: [
-                    if weapon == Weapon::Hammer || range > (attack_range * 0.75).min(480.0) {
-                        0.8
-                    } else {
-                        -0.22
-                    },
-                    strafe * skill.strafe,
-                ],
+                movement: [advance, strafe * skill.strafe],
                 look: [yaw, tilt],
                 primary: hold_trigger && !alt,
                 alternate: hold_trigger && alt,
@@ -3005,6 +3142,110 @@ mod tests {
 
     #[test]
     #[ignore = "requires local GOTY data"]
+    fn standard_bot_has_an_opening_and_misses_in_a_close_duel() {
+        let (mut map, _) = flight_fixture();
+        map.starts[1].position = Vec3(260.0, 0.0, 39.2);
+        let mut game = Match::new(
+            &map,
+            0,
+            Rules {
+                bots: 1,
+                difficulty: Difficulty::Standard,
+                ..Rules::default()
+            },
+        );
+        let mut shots = Vec::new();
+        let mut hits = 0;
+        for _ in 0..(60 * 8) {
+            let before = game.fighters[0].health;
+            game.step(&mut map, Command::default(), 1.0 / 60.0);
+            let bot = &game.fighters[1];
+            if bot.fired_count as usize > shots.len() {
+                shots.push(bot.fired_at);
+                hits += usize::from(game.fighters[0].health < before);
+                game.fighters[0].health = 100;
+            }
+        }
+        assert!(shots.len() >= 6, "shots: {shots:?}");
+        assert!(shots[0] >= 0.4, "first shot: {}", shots[0]);
+        assert!(
+            shots.windows(2).all(|s| s[1] - s[0] >= 0.38),
+            "shots: {shots:?}"
+        );
+        assert!(
+            hits > 0 && hits < shots.len(),
+            "{hits}/{} hits",
+            shots.len()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY data"]
+    fn match_renders_shared_hud_and_reuploads_deck16_after_logo() {
+        use crate::render::{Frame, commands::LIGHTMAPS};
+
+        let logo_path = std::path::Path::new("local/goty/Maps/UT-Logo-Map.unr");
+        let logo_bytes = std::fs::read(logo_path).unwrap();
+        let logo = Map::load(&Package::read(&logo_bytes).unwrap(), Some(logo_path)).unwrap();
+        let map = arena();
+        let mut game = Match::new(
+            &map,
+            6,
+            Rules {
+                bots: 0,
+                ..Rules::default()
+            },
+        );
+        game.time = 1.0;
+        let mut sounds = SoundEvents::default();
+        game.fire(
+            &map,
+            0,
+            Command {
+                primary: true,
+                ..Command::default()
+            },
+            &mut Vec::new(),
+            &mut sounds,
+        );
+        assert_eq!(game.fighters[0].ammo(), Some(29));
+        assert_eq!(game.fighters[0].ready_at, game.time + 0.32);
+        assert_eq!(game.ballistics.cases.len(), 1);
+        assert!(game.traces.is_empty());
+        let camera = game.fighters[0].camera(&map);
+        let mut frame = Frame::hardware(&map);
+        frame.draw_deathmatch(&map, &camera, &game, 90.0);
+        let first = frame.commands.take().unwrap();
+        let menu = Frame::hardware(&logo).commands.unwrap();
+        let mut frame = Frame::hardware(&map);
+        frame.draw_deathmatch(&map, &camera, &game, 90.0);
+        let resumed = frame.commands.unwrap();
+        assert_ne!(first.scene_id, menu.scene_id);
+        assert_ne!(menu.scene_id, resumed.scene_id);
+        assert_ne!(first.scene_id, resumed.scene_id);
+        let atlas = |commands: &crate::render::commands::DrawList| {
+            let (_, image, _) = commands
+                .uploads
+                .iter()
+                .find(|(key, _, _)| *key == LIGHTMAPS)
+                .unwrap();
+            (image.width, image.height, image.pixels.len())
+        };
+        assert_eq!(atlas(&first), atlas(&resumed));
+        assert!(resumed.passes[1].batches().next().is_some());
+        assert!(resumed.passes[3].batches().next().is_some());
+        for texture in [&map.hud.elements, &map.hud.weapons] {
+            let key = std::ptr::from_ref(texture.as_ref().unwrap().image(0.0)) as usize;
+            assert!(
+                resumed.passes[4]
+                    .batches()
+                    .any(|(material, _)| material.texture == key)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY data"]
     fn wounded_bot_leaves_combat_to_collect_health() {
         let mut map = arena();
         let mut game = Match::new(
@@ -3252,7 +3493,13 @@ mod tests {
             let mut frame = crate::render::Frame::new();
             frame.draw_deathmatch(&map, &camera, &game, 90.0);
             let scene = frame.pixels.clone();
-            crate::hud::Hud::new().draw_deathmatch(&mut frame, &game, false, false);
+            crate::hud::Hud::new().draw_deathmatch(
+                &mut frame,
+                &game,
+                false,
+                false,
+                map.hud.ready(),
+            );
             let center = frame.width * (frame.height / 2) + frame.width / 2;
             assert_ne!(
                 frame.pixels[center], scene[center],
