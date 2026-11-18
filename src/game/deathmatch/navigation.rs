@@ -1,5 +1,5 @@
 use crate::{
-    collision::Collision,
+    collision::{Collision, Walker},
     map::{Map, Vec3},
     mover::LiftStop,
 };
@@ -8,6 +8,8 @@ use super::distance_squared;
 
 const EDGE_LIMIT: f32 = 620.0;
 pub(super) const WAYPOINT_RADIUS: f32 = 34.0;
+const JUMP_PROBE_SECONDS: f32 = 1.4;
+const LAND_RADIUS: f32 = 48.0;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct LiftRide {
@@ -22,6 +24,166 @@ pub(super) enum Step {
     Walk(Vec3),
     Teleport(Vec3),
     Lift(LiftRide),
+    Jump(Jump),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Jump {
+    pub start: Vec3,
+    pub end: Vec3,
+    direction: Vec3,
+    runup: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum JumpPhase {
+    #[default]
+    Approach,
+    Runup,
+    Air,
+}
+
+#[derive(Default)]
+pub(super) struct JumpProgress(JumpPhase);
+
+pub(super) enum JumpControl {
+    Drive { movement: Vec3, jump: bool },
+    Landed,
+    Failed,
+}
+
+impl Jump {
+    fn probe(world: &Collision, from: Vec3, to: Vec3) -> Option<Self> {
+        let offset = to - from;
+        if !(58.0..=330.0).contains(&offset.0.hypot(offset.1))
+            || !(-95.0..=64.0).contains(&offset.2)
+        {
+            return None;
+        }
+        let arrival = Walker::spawn(world, to);
+        let departure = Walker::spawn(world, from);
+        if !departure.grounded
+            || !arrival.grounded
+            || !safe(world, departure.position)
+            || !safe(world, arrival.position)
+        {
+            return None;
+        }
+        let start = departure.position;
+        let end = arrival.position;
+        let direction = unit_horizontal(end - start);
+        for runup in [58.0, 33.0, 12.0, 0.0] {
+            let jump = Self {
+                start,
+                end,
+                direction,
+                runup,
+            };
+            if jump.can_land(world, from, 60) && jump.can_land(world, from, 240) {
+                return Some(jump);
+            }
+        }
+        None
+    }
+
+    fn can_land(self, world: &Collision, from: Vec3, frequency: u32) -> bool {
+        let mut walker = Walker::spawn(world, from);
+        let mut progress = JumpProgress::default();
+        let dt = 1.0 / frequency as f32;
+        for _ in 0..(JUMP_PROBE_SECONDS * frequency as f32).ceil() as u32 {
+            match progress.command(self, &walker) {
+                JumpControl::Drive { movement, jump } => {
+                    walker.advance(
+                        world,
+                        movement * world.profile.ground_speed,
+                        jump.then_some(world.profile.jump_speed),
+                        dt,
+                    );
+                    if !safe(world, walker.position) {
+                        return false;
+                    }
+                }
+                JumpControl::Landed => return true,
+                JumpControl::Failed => return false,
+            }
+        }
+        false
+    }
+}
+
+impl JumpProgress {
+    pub(super) fn command(&mut self, jump: Jump, walker: &Walker) -> JumpControl {
+        let position = walker.position;
+        let velocity = walker.velocity();
+        if self.0 == JumpPhase::Approach {
+            let offset = jump.start - position;
+            let distance = offset.0.hypot(offset.1);
+            if !walker.grounded
+                || distance > 11.0
+                || offset.2.abs() > 23.0
+                || velocity.0.hypot(velocity.1) > 38.0
+            {
+                let movement = if distance <= 8.0 {
+                    Vec3::default()
+                } else {
+                    unit_horizontal(offset) * (distance / 92.0).min(0.65)
+                };
+                return JumpControl::Drive {
+                    movement,
+                    jump: false,
+                };
+            }
+            self.0 = JumpPhase::Runup;
+        }
+        match self.0 {
+            JumpPhase::Runup => {
+                if !walker.grounded {
+                    return JumpControl::Failed;
+                }
+                if (position - jump.start).dot(jump.direction) < jump.runup - 3.0 {
+                    return JumpControl::Drive {
+                        movement: jump.direction,
+                        jump: false,
+                    };
+                }
+                self.0 = JumpPhase::Air;
+                JumpControl::Drive {
+                    movement: jump.direction,
+                    jump: true,
+                }
+            }
+            JumpPhase::Air if walker.grounded => {
+                let offset = jump.end - position;
+                if offset.0.hypot(offset.1) <= LAND_RADIUS && offset.2.abs() <= 24.0 {
+                    JumpControl::Landed
+                } else {
+                    JumpControl::Failed
+                }
+            }
+            JumpPhase::Air => {
+                if position.2 < jump.end.2 - 32.0 && velocity.2 <= 0.0 {
+                    return JumpControl::Failed;
+                }
+                let correction = (jump.end - position) * 7.0 - velocity * 0.36;
+                JumpControl::Drive {
+                    movement: unit_horizontal(correction),
+                    jump: false,
+                }
+            }
+            JumpPhase::Approach => {
+                unreachable!("approach either returns a ground command or starts the runup")
+            }
+        }
+    }
+}
+
+fn unit_horizontal(vector: Vec3) -> Vec3 {
+    crate::mover::unit(Vec3(vector.0, vector.1, 0.0))
+}
+
+fn safe(world: &Collision, position: Vec3) -> bool {
+    let zone = world.regions.at(position);
+    !zone.water && !zone.pain
 }
 
 #[derive(Clone, Copy)]
@@ -37,6 +199,17 @@ pub(super) struct Navigation {
 }
 
 impl Navigation {
+    #[cfg(test)]
+    pub(super) fn jumps(&self) -> impl Iterator<Item = Jump> + '_ {
+        self.edges
+            .iter()
+            .flatten()
+            .filter_map(|edge| match edge.step {
+                Step::Jump(jump) => Some(jump),
+                _ => None,
+            })
+    }
+
     pub(super) fn new(map: &Map) -> Self {
         let mut points = Vec::new();
         for point in map
@@ -110,7 +283,10 @@ impl Navigation {
         for (index, &from) in points.iter().enumerate() {
             for (next, &to) in points.iter().enumerate().skip(index + 1) {
                 let distance = distance_squared(from, to);
-                if distance <= EDGE_LIMIT.powi(2) && walk_link(&map.collision, from, to) {
+                if distance > EDGE_LIMIT.powi(2) {
+                    continue;
+                }
+                if walk_link(&map.collision, from, to) {
                     let cost = distance.sqrt();
                     edges[index].push(Edge {
                         to: next,
@@ -122,6 +298,18 @@ impl Navigation {
                         cost,
                         step: Step::Walk(from),
                     });
+                } else {
+                    for (source, target) in [(index, next), (next, index)] {
+                        if let Some(jump) =
+                            Jump::probe(&map.collision, points[source], points[target])
+                        {
+                            edges[source].push(Edge {
+                                to: target,
+                                cost: distance.sqrt() + 190.0,
+                                step: Step::Jump(jump),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -206,7 +394,7 @@ fn walk_link(world: &Collision, from: Vec3, to: Vec3) -> bool {
         return false;
     }
     // Probe several places along the ground so a clear line through a gap is not a walk edge.
-    let probes = (horizontal / 100.0).ceil().max(1.0) as u32;
+    let probes = (horizontal / 48.0).ceil().max(1.0) as u32;
     (1..=probes).all(|i| {
         let position = from + delta * (i as f32 / probes as f32);
         !world.regions.at(position).pain

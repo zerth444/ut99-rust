@@ -36,6 +36,15 @@ struct Hit {
 }
 
 impl Collision {
+    #[cfg(test)]
+    pub(crate) fn test_world() -> Self {
+        Self {
+            hulls: Vec::new(),
+            profile: Profile::default(),
+            regions: Regions::default(),
+        }
+    }
+
     pub fn read(
         planes: &[Plane],
         offsets: impl Iterator<Item = i32>,

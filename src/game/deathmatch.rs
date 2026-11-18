@@ -14,7 +14,7 @@ use crate::{
 };
 pub use ai::Difficulty;
 use arsenal::{Inventory, Path};
-use navigation::{LiftRide, Navigation, Step, WAYPOINT_RADIUS};
+use navigation::{JumpControl, JumpProgress, LiftRide, Navigation, Step, WAYPOINT_RADIUS};
 
 const RESPAWN_DELAY: f32 = 1.25;
 const SPAWN_PROTECTION: f32 = 0.75;
@@ -43,6 +43,7 @@ impl Default for Rules {
 pub struct Command {
     pub movement: [f32; 2],
     pub jump: bool,
+    pub normal_jump: bool,
     pub primary: bool,
     pub alternate: bool,
     pub restart: bool,
@@ -246,6 +247,8 @@ struct Bot {
     plan_origin: Option<Vec3>,
     retreat: Option<Retreat>,
     retreat_retry_at: f32,
+    jump: JumpProgress,
+    jump_until: Option<f32>,
 }
 
 struct Retreat {
@@ -504,14 +507,15 @@ impl Match {
                 + aim.right() * strafe
                 + Vec3(0.0, 0.0, f32::from(input.jump));
             let base_jump = map.collision.profile.jump_speed;
-            let has_boots = fighter.power.boot_charges > 0;
-            let jump_speed = if has_boots {
+            let use_boots = !input.normal_jump && fighter.power.boot_charges > 0;
+            let jump_speed = if use_boots {
                 base_jump * 3.0
             } else {
                 base_jump
             };
-            fighter.walker.air_control_override =
-                (has_boots || fighter.power.boosted_airborne).then_some(1.0);
+            fighter.walker.air_control_override = (!input.normal_jump
+                && (use_boots || fighter.power.boosted_airborne))
+                .then_some(1.0);
             let motion = fighter.walker.advance_with_swim(
                 &map.collision,
                 walk * speed,
@@ -523,11 +527,11 @@ impl Match {
             fighter.stride_time += dt * (velocity.0.hypot(velocity.1) / 285.0).clamp(0.0, 2.0);
             let swimming = map.collision.regions.at(fighter.walker.position).water;
             if motion.jump {
-                if has_boots {
+                if use_boots {
                     fighter.power.boot_charges -= 1;
                     fighter.power.boosted_airborne = true;
                 }
-                let sound = if has_boots {
+                let sound = if use_boots {
                     map.powerups
                         .boots_jump
                         .as_ref()
@@ -586,6 +590,7 @@ impl Match {
                 fighter.power.boosted_airborne = false;
                 fighter.bot.goal = None;
                 fighter.bot.lift = None;
+                fighter.bot.jump_until = None;
                 fighter.bot.rethink_at = self.time;
             }
             let zone = map.collision.regions.at(fighter.walker.position);
@@ -1375,6 +1380,31 @@ fn follow_transfer(map: &Map, fighter: &mut Fighter, time: f32, dt: f32) -> Opti
     if fighter.bot.lift.is_none() {
         match fighter.bot.goal? {
             Step::Walk(_) => return None,
+            Step::Jump(maneuver) => {
+                if fighter.bot.jump_until.is_none() {
+                    fighter.bot.jump_until = Some(time + 2.8);
+                    fighter.bot.jump = JumpProgress::default();
+                }
+                let landed = if fighter.bot.jump_until.is_some_and(|until| time < until) {
+                    match fighter.bot.jump.command(maneuver, &fighter.walker) {
+                        JumpControl::Drive { movement, jump } => {
+                            return Some(Command {
+                                jump,
+                                normal_jump: true,
+                                ..drive(fighter, movement, dt)
+                            });
+                        }
+                        JumpControl::Landed => true,
+                        JumpControl::Failed => false,
+                    }
+                } else {
+                    false
+                };
+                fighter.bot.jump_until = None;
+                fighter.bot.goal = None;
+                fighter.bot.rethink_at = time + if landed { 0.0 } else { 0.4 };
+                return Some(Command::default());
+            }
             Step::Teleport(position) => {
                 if time >= fighter.bot.rethink_at {
                     fighter.bot.goal = None;
@@ -1450,10 +1480,22 @@ fn steer(fighter: &Fighter, point: Vec3, dt: f32) -> Command {
     if distance < 10.0 {
         return Command::default();
     }
-    let (turn, _) = aim_error(delta, fighter.yaw, fighter.pitch);
+    let speed = (distance / 145.0).clamp(0.19, 0.8);
+    drive(
+        fighter,
+        Vec3(delta.0, delta.1, 0.0) * (speed / distance),
+        dt,
+    )
+}
+
+fn drive(fighter: &Fighter, movement: Vec3, dt: f32) -> Command {
+    let speed = movement.0.hypot(movement.1);
+    if speed < 0.001 {
+        return Command::default();
+    }
+    let (turn, _) = aim_error(movement, fighter.yaw, fighter.pitch);
     let yaw_change = turn.clamp(-4.6 * dt, 4.6 * dt);
     let (side, forward) = (turn - yaw_change).sin_cos();
-    let speed = (distance / 145.0).clamp(0.19, 0.8);
     Command {
         movement: [forward * speed, side * speed],
         look: [yaw_change, -fighter.pitch * (dt * 4.0).min(1.0)],
@@ -1530,6 +1572,126 @@ mod tests {
         let path = std::path::Path::new("local/goty/Maps/DM-Deck16][.unr");
         let bytes = std::fs::read(path).unwrap();
         Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY map"]
+    fn deck16_bot_executes_a_planned_jump() {
+        let mut map = arena();
+        let mut game = Match::new(
+            &map,
+            6,
+            Rules {
+                bots: 1,
+                ..Rules::default()
+            },
+        );
+        let route = game
+            .navigation
+            .jumps()
+            .filter(|jump| {
+                jump.end.2 >= jump.start.2 - 12.0
+                    && distance_squared(jump.start, game.fighters[0].walker.position)
+                        > 220.0_f32.powi(2)
+            })
+            .find_map(|jump| {
+                match game
+                    .navigation
+                    .next_step(&map.collision, jump.start, jump.end)
+                {
+                    Some(Step::Jump(first)) if distance_squared(first.end, jump.end) < 1.0 => {
+                        Some(first)
+                    }
+                    _ => None,
+                }
+            })
+            .expect("the stock map has a usable directed jump");
+        game.fighters[0].protected_until = f32::INFINITY;
+        let bot = &mut game.fighters[1];
+        bot.walker = Walker::spawn(&map.collision, route.start);
+        bot.bot.goal = Some(Step::Jump(route));
+        let mut airborne = false;
+        for _ in 0..360 {
+            game.step(&mut map, Command::default(), 1.0 / 144.0);
+            airborne |= !game.fighters[1].walker.grounded;
+            if game.fighters[1].bot.goal.is_none() {
+                break;
+            }
+        }
+        let bot = &game.fighters[1];
+        assert!(airborne && bot.walker.grounded);
+        assert!(
+            bot.bot.goal.is_none()
+                && distance_squared(bot.walker.position, route.end) < 56.0_f32.powi(2),
+            "bot stopped at {:?}, expected {:?}",
+            bot.walker.position,
+            route.end
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY asset fixtures"]
+    fn bot_runs_up_jumps_and_lands_across_a_gap_without_spending_boots() {
+        let mut map = arena();
+        map.collision = crate::collision::Collision::test_world();
+        map.movers.clear();
+        map.teleporters.clear();
+        map.lift_exits.clear();
+        map.props.clear();
+        let entry = Vec3(0.0, 0.0, 39.2);
+        let exit = Vec3(231.0, 0.0, 39.2);
+        map.starts = vec![crate::map::Start {
+            position: Vec3(-175.0, 0.0, 39.2),
+            yaw: 0.0,
+        }];
+        map.navigation_points = vec![entry, exit];
+        map.collision
+            .add_box(Vec3(-270.0, -105.0, -95.0), Vec3(73.0, 105.0, 0.0));
+        map.collision
+            .add_box(Vec3(160.0, -105.0, -95.0), Vec3(400.0, 105.0, 0.0));
+        for dt in [1.0 / 60.0, 1.0 / 240.0] {
+            let mut game = Match::new(
+                &map,
+                0,
+                Rules {
+                    bots: 1,
+                    ..Rules::default()
+                },
+            );
+            game.fighters[0].protected_until = f32::INFINITY;
+            let bot = &mut game.fighters[1];
+            bot.walker = Walker::spawn(&map.collision, entry);
+            bot.yaw = 1.0;
+            bot.power.boot_charges = 3;
+            let from = bot.walker.position;
+            let route = game.navigation.next_step(&map.collision, from, exit);
+            assert!(matches!(route, Some(Step::Jump(_))), "{route:?}");
+            bot.bot.goal = route;
+            let mut rose = false;
+            for _ in 0..(2.7 / dt) as usize {
+                game.step(&mut map, Command::default(), dt);
+                let bot = &game.fighters[1];
+                rose |= bot.walker.position.2 > from.2 + 28.0;
+                if bot.bot.goal.is_none() {
+                    break;
+                }
+            }
+            let bot = &game.fighters[1];
+            assert!(rose, "crossing must leave the platform with an upward jump");
+            assert!(
+                bot.walker.grounded && bot.walker.position.0 > 178.0,
+                "failed to land at {dt}s: {:?}",
+                bot.walker.position
+            );
+            assert_eq!(bot.boot_charges(), 3);
+        }
+        map.collision
+            .add_box(Vec3(117.0, -115.0, -100.0), Vec3(128.0, 115.0, 180.0));
+        let navigation = Navigation::new(&map);
+        assert!(
+            navigation.next_step(&map.collision, entry, exit).is_none(),
+            "a solid wall must invalidate the edge"
+        );
     }
 
     #[test]
