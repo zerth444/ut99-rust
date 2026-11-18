@@ -1,5 +1,8 @@
 use std::ptr::null_mut;
-use windows_sys::Win32::{Foundation::RECT, Graphics::Gdi::*};
+use windows_sys::Win32::{
+    Foundation::{RECT, SIZE},
+    Graphics::Gdi::*,
+};
 
 use crate::{
     game::{ArmorKind, Item, Powerup, Practice, Weapon, deathmatch::Match},
@@ -8,13 +11,18 @@ use crate::{
     texture::TextureImage,
 };
 
-const CELL_W: usize = 12;
-const CELL_H: usize = 20;
+const CELL_W: usize = 42;
+const CELL_H: usize = 44;
 const COLUMNS: usize = 16;
 const ROWS: usize = 6;
 
 pub struct Hud {
-    glyphs: Option<TextureImage>,
+    glyphs: Option<GlyphAtlas>,
+}
+
+struct GlyphAtlas {
+    image: TextureImage,
+    advance: [i32; 95],
 }
 
 impl Hud {
@@ -199,7 +207,13 @@ impl Hud {
                 Item::Power(Powerup::Damage, _) => "Damage Amplifier".to_owned(),
                 Item::Power(Powerup::Invisibility, _) => "Invisibility".to_owned(),
             };
-            self.centered(frame, (112.0 * scale) as i32, scale, &name, accent);
+            self.centered(
+                frame,
+                (111.0 * scale) as i32,
+                scale,
+                &format!("Picked up {name}"),
+                white,
+            );
         }
     }
 
@@ -326,7 +340,7 @@ impl Hud {
                 left + px(19.0),
                 top + height - px(27.0),
                 scale * 0.8,
-                "Enter for rematch    Esc to leave",
+                "Enter for rematch    Esc for menu",
                 white,
             );
         }
@@ -423,7 +437,13 @@ impl Hud {
     }
 
     fn centered(&self, frame: &mut Frame, y: i32, scale: f32, text: &str, color: [f32; 3]) {
-        let width = text.chars().count() as f32 * CELL_W as f32 * scale;
+        let width = self.glyphs.as_ref().map_or(0.0, |atlas| {
+            text.chars()
+                .map(|ch| atlas.advance[glyph_index(ch)])
+                .sum::<i32>() as f32
+                * scale
+                * 0.5
+        });
         self.text(
             frame,
             (frame.width as f32 * 0.5 - width * 0.5).round() as i32,
@@ -446,20 +466,19 @@ impl Hud {
         let Some(glyphs) = &self.glyphs else {
             return;
         };
-        for (i, ch) in text.chars().enumerate() {
+        let scale = scale * 0.5;
+        let mut advance = 0;
+        for ch in text.chars() {
+            let index = glyph_index(ch);
+            let left = x + (advance as f32 * scale).round() as i32;
+            advance += glyphs.advance[index];
             if ch == ' ' {
                 continue;
             }
-            let index = if ch.is_ascii_graphic() {
-                ch as usize - 32
-            } else {
-                usize::from(b'?' - 32)
-            };
-            let dx = (i as f32 * CELL_W as f32 * scale).round() as i32;
             frame.translucent_tile(
-                glyphs,
+                &glyphs.image,
                 [
-                    x + dx,
+                    left,
                     y,
                     (CELL_W as f32 * scale).round() as i32,
                     (CELL_H as f32 * scale).round() as i32,
@@ -476,7 +495,15 @@ impl Hud {
     }
 }
 
-fn glyph_atlas() -> Option<TextureImage> {
+fn glyph_index(ch: char) -> usize {
+    if (' '..='~').contains(&ch) {
+        ch as usize - 32
+    } else {
+        usize::from(b'?' - 32)
+    }
+}
+
+fn glyph_atlas() -> Option<GlyphAtlas> {
     let (width, height) = (CELL_W * COLUMNS, CELL_H * ROWS);
     let bitmap = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
@@ -502,13 +529,13 @@ fn glyph_atlas() -> Option<TextureImage> {
             return None;
         }
         let previous_bitmap = SelectObject(dc, dib);
-        let face: Vec<_> = "Consolas\0".encode_utf16().collect();
+        let face: Vec<_> = "Segoe UI\0".encode_utf16().collect();
         let font = CreateFontW(
-            -18,
+            -36,
             0,
             0,
             0,
-            FW_BOLD as i32,
+            FW_SEMIBOLD as i32,
             0,
             0,
             0,
@@ -516,13 +543,14 @@ fn glyph_atlas() -> Option<TextureImage> {
             OUT_DEFAULT_PRECIS.into(),
             CLIP_DEFAULT_PRECIS.into(),
             ANTIALIASED_QUALITY.into(),
-            (FF_MODERN | FIXED_PITCH).into(),
+            (FF_SWISS | VARIABLE_PITCH).into(),
             face.as_ptr(),
         );
         let previous_font = SelectObject(dc, font);
         std::ptr::write_bytes(bits.cast::<u32>(), 0, width * height);
         SetTextColor(dc, 0xffffff);
         SetBkMode(dc, TRANSPARENT as i32);
+        let mut advance = [0; 95];
         for (index, character) in (32u16..=126).enumerate() {
             let x = (index % COLUMNS * CELL_W) as i32;
             let y = (index / COLUMNS * CELL_H) as i32;
@@ -532,6 +560,9 @@ fn glyph_atlas() -> Option<TextureImage> {
                 right: x + CELL_W as i32,
                 bottom: y + CELL_H as i32,
             };
+            let mut size = SIZE::default();
+            GetTextExtentPoint32W(dc, &character, 1, &mut size);
+            advance[index] = size.cx.max(1);
             ExtTextOutW(
                 dc,
                 x,
@@ -553,6 +584,9 @@ fn glyph_atlas() -> Option<TextureImage> {
         DeleteObject(font);
         DeleteObject(dib);
         DeleteDC(dc);
-        Some(TextureImage::glyph_mask(width, height, pixels))
+        Some(GlyphAtlas {
+            image: TextureImage::glyph_mask(width, height, pixels),
+            advance,
+        })
     }
 }

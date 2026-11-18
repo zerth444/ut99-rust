@@ -1012,6 +1012,14 @@ impl Practice {
         self.hammer_since.is_some()
     }
 
+    pub fn bio_charging(&self) -> bool {
+        self.health > 0
+            && self
+                .charge
+                .as_ref()
+                .is_some_and(|charge| charge.weapon == Weapon::Bio)
+    }
+
     pub fn place_training_target(&mut self, map: &Map, camera: &Camera) {
         let forward = camera.forward();
         let distance = map
@@ -1833,7 +1841,7 @@ impl Practice {
                     sounds.extend(animations.and_then(|art| art.rotate_sound.clone()));
                 }
             } else {
-                sounds.extend(load_sound());
+                sounds.bio_charge(load_sound(), 0, None);
                 return true;
             }
         }
@@ -2451,6 +2459,7 @@ mod tests {
         }
         let charge = game.charge.as_ref().unwrap();
         assert!((charge.bio_size - 4.1).abs() < 0.001);
+        assert!(game.bio_charging());
         assert_eq!(charge.loaded, 10);
         assert_eq!(game.ammo(), Some(10));
         assert!(std::ptr::eq(
@@ -2466,6 +2475,7 @@ mod tests {
             &mut blasts,
         );
         assert_eq!(game.ordnance.active_count(), 1);
+        assert!(!game.bio_charging());
         assert_eq!(sounds.len(), 1);
         assert!(Arc::ptr_eq(
             sounds.waves().next().unwrap(),

@@ -42,14 +42,11 @@ struct MenuArt {
 #[derive(Default)]
 struct SkinArt {
     bar: Option<Texture>,
-    bar_ends: [Option<Texture>; 2],
-    bar_item: [[Option<Texture>; 3]; 2],
     window: Option<Texture>,
     button: Option<Texture>,
     panel: Option<Texture>,
-    pulldown: [Option<Texture>; 9],
+    dropdown: Option<Texture>,
     highlight: Option<Texture>,
-    separator: Option<Texture>,
 }
 
 impl Frontend {
@@ -164,16 +161,16 @@ impl MenuArt {
         let skins = GUI_SKINS.map(|(_, prefix)| {
             let themed = |name: &str| texture(&format!("{prefix}{name}"));
             let gold = prefix == "Gold";
-            let bar = |name: &str| if gold { texture(name) } else { themed(name) };
             let menu = |part: &str| {
                 let prefix = if gold { "B" } else { prefix };
                 texture(&format!("{prefix}Menu{part}"))
             };
             SkinArt {
-                bar: bar("BarTile"),
-                bar_ends: [bar("BarL"), bar("BarWin")],
-                bar_item: ["In", "Out"]
-                    .map(|state| ["L", "M", "R"].map(|part| bar(&format!("Bar{state}{part}")))),
+                bar: if gold {
+                    texture("BarTile")
+                } else {
+                    themed("BarTile")
+                },
                 window: themed("ActiveFrame"),
                 button: themed("Button"),
                 panel: if gold {
@@ -181,13 +178,8 @@ impl MenuArt {
                 } else {
                     themed("ClientArea")
                 },
-                pulldown: ["TL", "T", "TR", "L", "Area", "R", "BL", "B", "BR"].map(menu),
+                dropdown: menu("Area"),
                 highlight: menu("HM"),
-                separator: if gold {
-                    texture("MenuLine")
-                } else {
-                    menu("Line")
-                },
             }
         });
         Self {
@@ -207,7 +199,8 @@ impl MenuArt {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     None,
-    Play,
+    Resume,
+    Practice,
     Deathmatch(usize),
     LeaveMatch,
     Quit,
@@ -223,7 +216,7 @@ pub enum MenuSound {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct MenuState {
     window: bool,
-    pulldown: Option<Pulldown>,
+    focus: usize,
 }
 
 impl MenuState {
@@ -234,7 +227,7 @@ impl MenuState {
             } else {
                 MenuSound::Close
             })
-        } else if self.pulldown != next.pulldown || action == Action::Changed {
+        } else if self.focus != next.focus || action == Action::Changed {
             Some(MenuSound::Select)
         } else {
             None
@@ -254,6 +247,14 @@ impl MenuSession {
     pub fn paused(self) -> bool {
         self != Self::Main
     }
+
+    fn entries(self) -> &'static [&'static str] {
+        if self.paused() {
+            &["Resume", "Main Menu", "Settings", "Quit Game"]
+        } else {
+            &["Play", "Match Setup", "Practice", "Settings", "Quit Game"]
+        }
+    }
 }
 
 #[derive(Default)]
@@ -264,10 +265,9 @@ pub struct Menu {
     preferences: bool,
     tab: usize,
     selected: usize,
-    bar_focus: usize,
-    bar_hover: Option<usize>,
+    nav_focus: usize,
+    nav_hover: Option<usize>,
     waiting: Option<usize>,
-    pulldown: Option<(Pulldown, usize)>,
     quit: Option<bool>,
     choice: Option<(Choice, usize)>,
     panel_offset: [i32; 2],
@@ -415,7 +415,7 @@ const CONTROLS: [&str; 8] = [
     "Alt Fire",
 ];
 const INPUT: [&str; 2] = ["Mouse Sensitivity", "Invert Mouse"];
-const HUD: [&str; 1] = ["HUD Scale"];
+const HUD: [&str; 2] = ["HUD Scale", "Context Help"];
 const GAME: [&str; 7] = [
     "Dodging",
     "Game Speed",
@@ -425,103 +425,12 @@ const GAME: [&str; 7] = [
     "Frag Limit",
     "Time Limit",
 ];
-const TOP_ITEMS: [i32; 5] = [0, 56, 103, 159, 201];
-const MENU_ROW: i32 = 18;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Pulldown {
-    Game,
-    Options,
-    Help,
-}
-
-impl Pulldown {
-    fn from_index(index: usize) -> Option<Self> {
-        [
-            None,
-            Some(Self::Game),
-            Some(Self::Options),
-            Some(Self::Help),
-        ][index]
-    }
-
-    fn index(self) -> usize {
-        match self {
-            Self::Game => 1,
-            Self::Options => 2,
-            Self::Help => 3,
-        }
-    }
-
-    fn entries(self, session: MenuSession) -> &'static [(&'static str, &'static str)] {
-        match self {
-            Self::Game if session == MenuSession::Match => &[
-                ("Return to Current Game", "Return to the current game."),
-                ("Leave Match", "End this match and return to the main menu."),
-                ("Quit", "Exit Unreal Tournament."),
-            ],
-            Self::Game if session.paused() => &[
-                ("Return to Current Game", "Return to the current game."),
-                ("Quit", "Exit Unreal Tournament."),
-            ],
-            Self::Game => &[
-                (
-                    "Start Practice Session",
-                    "Start a practice session on Deck16][.",
-                ),
-                ("Quit", "Exit Unreal Tournament."),
-                (
-                    "Deathmatch with Bots",
-                    "Start an offline match with the configured rules.",
-                ),
-            ],
-            Self::Options => &[("Preferences", "Configure settings.")],
-            Self::Help => &[("Context Help", "Show help for the selected menu item.")],
-        }
-    }
-
-    fn rect(self, session: MenuSession) -> [i32; 4] {
-        let width = match self {
-            Self::Game => 190,
-            Self::Options => 120,
-            Self::Help => 132,
-        };
-        let count = self.entries(session).len();
-        [
-            TOP_ITEMS[self.index()],
-            16,
-            width,
-            8 + self.row_offset(count - 1) + MENU_ROW,
-        ]
-    }
-
-    fn row_offset(self, index: usize) -> i32 {
-        MENU_ROW * index as i32
-            + if self == Self::Game && index > 0 {
-                6
-            } else {
-                0
-            }
-    }
-
-    fn item_at(self, [x, y]: [i32; 2], session: MenuSession) -> Option<usize> {
-        let [left, top, width, height] = self.rect(session);
-        if !(left + 4..left + width - 4).contains(&x) || !(top + 4..top + height - 4).contains(&y) {
-            return None;
-        }
-        let y = y - top - 4;
-        (0..self.entries(session).len()).find(|&index| {
-            let offset = self.row_offset(index);
-            (offset..offset + MENU_ROW).contains(&y)
-        })
-    }
-}
-
+const MENU_BUTTON_HEIGHT: i32 = 32;
 impl Menu {
     pub fn state(&self) -> MenuState {
         MenuState {
             window: self.preferences || self.quit.is_some() || self.match_setup.is_some(),
-            pulldown: self.pulldown.map(|(section, _)| section),
+            focus: self.nav_focus,
         }
     }
 
@@ -554,18 +463,7 @@ impl Menu {
         {
             *highlight = index;
         }
-        self.bar_hover = Self::top_item([x, y]);
-        if let Some((open, item)) = &mut self.pulldown {
-            if let Some(section) = self.bar_hover.and_then(Pulldown::from_index)
-                && section != *open
-            {
-                self.bar_focus = section.index();
-                *open = section;
-                *item = 0;
-            } else if let Some(index) = open.item_at([x, y], self.session) {
-                *item = index;
-            }
-        }
+        self.nav_hover = layout.nav_item(size, x, y, self.session);
     }
 
     pub fn start_drag(&mut self, size: [i32; 2], x: i32, y: i32) -> bool {
@@ -587,16 +485,6 @@ impl Menu {
         self.drag_offset.take().is_some()
     }
 
-    fn top_item([x, y]: [i32; 2]) -> Option<usize> {
-        if (0..16).contains(&y) {
-            TOP_ITEMS
-                .windows(2)
-                .position(|edges| (edges[0]..edges[1]).contains(&x))
-        } else {
-            None
-        }
-    }
-
     fn rows(&self) -> &[&str] {
         match self.tab {
             0 => &VIDEO,
@@ -608,32 +496,29 @@ impl Menu {
         }
     }
 
-    fn activate(&mut self, section: Pulldown, item: usize, settings: &mut Settings) -> Action {
-        self.pulldown = None;
-        match section {
-            Pulldown::Game if item == 0 => Action::Play,
-            Pulldown::Game if item == 1 && self.session == MenuSession::Match => Action::LeaveMatch,
-            Pulldown::Game if item == 2 && !self.session.paused() => {
+    fn activate(&mut self, item: usize, settings: &Settings) -> Action {
+        self.status.clear();
+        match (self.session.paused(), item) {
+            (true, 0) => Action::Resume,
+            (false, 0) if !self.match_names.is_empty() => Action::Deathmatch(0),
+            (false, 0 | 1) => {
                 self.match_setup = Some(MatchSetup::new(settings));
-                self.status.clear();
                 Action::None
             }
-            Pulldown::Game => {
-                self.quit = Some(true);
-                Action::None
-            }
-            Pulldown::Options => {
+            (true, 1) => Action::LeaveMatch,
+            (false, 2) => Action::Practice,
+            (true, 2) | (false, 3) => {
                 self.preferences = true;
                 self.selected = 0;
                 Action::None
             }
-            Pulldown::Help => {
-                settings.context_help = !settings.context_help;
-                Action::Changed
+            (true, 3) | (false, 4) => {
+                self.quit = Some(true);
+                Action::None
             }
+            _ => Action::None,
         }
     }
-
     pub fn key(&mut self, key: u16, settings: &mut Settings) -> Action {
         if let Some(setup) = &mut self.match_setup {
             let count = self.match_names.len();
@@ -721,32 +606,13 @@ impl Menu {
             }
             return Action::None;
         }
-        if let Some((section, item)) = self.pulldown {
-            let len = section.entries(self.session).len();
-            match key {
-                VK_ESCAPE => self.pulldown = None,
-                VK_UP => self.pulldown = Some((section, (item + len - 1) % len)),
-                VK_DOWN => self.pulldown = Some((section, (item + 1) % len)),
-                VK_RETURN | VK_SPACE => return self.activate(section, item, settings),
-                VK_LEFT | VK_RIGHT => {
-                    self.bar_focus = (self.bar_focus + if key == VK_LEFT { 3 } else { 1 }) % 4;
-                    self.pulldown = Pulldown::from_index(self.bar_focus).map(|next| (next, 0));
-                }
-                _ => {}
-            }
-            return Action::None;
-        }
+        let count = self.session.entries().len();
         match key {
-            VK_LEFT => self.bar_focus = (self.bar_focus + 3) % 4,
-            VK_RIGHT | VK_TAB => self.bar_focus = (self.bar_focus + 1) % 4,
-            VK_RETURN | VK_SPACE | VK_DOWN => {
-                if let Some(section) = Pulldown::from_index(self.bar_focus) {
-                    self.pulldown = Some((section, 0));
-                } else if key != VK_DOWN {
-                    return Action::Play;
-                }
-            }
-            VK_ESCAPE if self.session.paused() => return Action::Play,
+            VK_UP | VK_LEFT => self.nav_focus = (self.nav_focus + count - 1) % count,
+            VK_DOWN | VK_RIGHT | VK_TAB => self.nav_focus = (self.nav_focus + 1) % count,
+            VK_RETURN | VK_SPACE => return self.activate(self.nav_focus, settings),
+            VK_ESCAPE if self.session.paused() => return Action::Resume,
+            0x4d if self.session.paused() => return Action::LeaveMatch,
             _ => {}
         }
         Action::None
@@ -817,19 +683,9 @@ impl Menu {
             return Action::None;
         }
         if !self.preferences {
-            let open = self.pulldown.take().map(|(section, _)| section);
-            if let Some(section) = open
-                && let Some(item) = section.item_at([x, y], self.session)
-            {
-                return self.activate(section, item, settings);
-            }
-            if let Some(index) = Self::top_item([x, y]) {
-                self.bar_focus = index;
-                if let Some(section) = Pulldown::from_index(index) {
-                    self.pulldown = (open != Some(section)).then_some((section, 0));
-                } else {
-                    return Action::Play;
-                }
+            if let Some(index) = ui.nav_item(size, x, y, self.session) {
+                self.nav_focus = index;
+                return self.activate(index, settings);
             }
         } else {
             let [left, top] = ui.panel_position(size, self.panel_offset);
@@ -916,6 +772,7 @@ impl Menu {
             (3, 0) => adjust(&mut settings.sensitivity, 10, 10, 250),
             (3, 1) => settings.invert_mouse = !settings.invert_mouse,
             (4, 0) => adjust(&mut settings.hud_scale, 10, 50, 150),
+            (4, 1) => settings.context_help = !settings.context_help,
             (5, 0) => settings.dodging = !settings.dodging,
             (5, 1) => adjust(&mut settings.game_speed, 5, 50, 200),
             (5, 2) => adjust(&mut settings.view_bob, 1, 0, 8),
@@ -940,7 +797,7 @@ impl Menu {
             .map(|font| (font, 1.0 + font_index as f32 * 0.25))
             .or_else(|| resources.fonts[1].as_ref().map(|font| (font, 1.25)));
         let art = &resources.skins[settings.gui_skin];
-        let art = if art.bar.is_some() {
+        let art = if art.window.is_some() {
             art
         } else {
             &resources.skins[0]
@@ -1059,132 +916,53 @@ impl Menu {
             text(frame, 12, 236, 0.63, status, [1.0, 0.70, 0.56]);
             return;
         }
-        let width = (frame.width as f32 / ui.scale).ceil() as i32;
-        ui.tile(
-            frame,
-            art.bar.as_ref(),
-            [0, 0, width, 16],
-            [0.24, 0.27, 0.31],
-        );
-        for (index, texture) in art.bar_ends.iter().enumerate() {
-            if let Some(texture) = texture {
-                ui.tile(
-                    frame,
-                    Some(texture),
-                    [if index == 0 { 0 } else { width - 16 }, 0, 16, 16],
-                    [0.24, 0.27, 0.31],
-                );
-            }
-        }
-        for (index, label) in [
-            if self.session.paused() {
-                "Resume"
-            } else {
-                "Play"
-            },
-            "Game",
-            "Options",
-            "Help",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let x = TOP_ITEMS[index];
-            let item_width = TOP_ITEMS[index + 1] - x;
-            if (self.bar_focus == index || self.bar_hover == Some(index))
-                && !self.preferences
-                && self.quit.is_none()
-            {
-                let pressed = self
-                    .pulldown
-                    .is_some_and(|(section, _)| section.index() == index);
-                let parts = &art.bar_item[usize::from(!pressed)];
-                for (texture, (left, width)) in
-                    parts
-                        .iter()
-                        .zip([(x, 1), (x + 1, item_width - 2), (x + item_width - 1, 1)])
-                {
-                    ui.tile(
-                        frame,
-                        texture.as_ref(),
-                        [left, 0, width, 16],
-                        [0.25, 0.38, 0.55],
-                    );
-                }
-            }
-            ui.label(frame, font, menu_font, x + 6, 1, label);
-        }
-        if frontend.logo.is_none() && !frontend.has_desktop() {
-            label(frame, (width - 160) / 2, 65, "UNREAL TOURNAMENT");
-        }
         if !self.preferences {
-            if let Some((section, selected)) = self.pulldown {
-                let [x, y, w, h] = section.rect(self.session);
-                let columns = [(x, 4), (x + 4, w - 8), (x + w - 4, 4)];
-                let rows = [(y, 4), (y + 4, h - 8), (y + h - 4, 4)];
-                for (row, (top, height)) in rows.into_iter().enumerate() {
-                    for (col, (left, width)) in columns.into_iter().enumerate() {
-                        ui.tile(
-                            frame,
-                            art.pulldown[row * 3 + col].as_ref(),
-                            [left, top, width, height],
-                            [0.65, 0.68, 0.79],
-                        );
-                    }
-                }
-                if section == Pulldown::Game {
-                    ui.tile(
-                        frame,
-                        art.separator.as_ref(),
-                        [x + 4, y + 4 + MENU_ROW + 2, w - 8, 2],
-                        [0.31, 0.40, 0.56],
-                    );
-                }
-                for (index, &(caption, _)) in section.entries(self.session).iter().enumerate() {
-                    let row = y + 4 + section.row_offset(index);
-                    if index == selected {
-                        ui.tile(
-                            frame,
-                            art.highlight.as_ref(),
-                            [x + 4, row, w - 8, MENU_ROW],
-                            [0.31, 0.46, 0.63],
-                        );
-                    }
-                    if section == Pulldown::Help {
-                        ui.tile(
-                            frame,
-                            resources.checkbox[usize::from(settings.context_help)].as_ref(),
-                            [x + 7, row + 3, 12, 12],
-                            [0.84; 3],
-                        );
-                    }
-                    label(frame, x + 23, row + 1, caption);
-                }
-            }
-            if settings.context_help {
-                let bottom = (frame.height as f32 / ui.scale) as i32 - 16;
+            let rect @ [x, y, width, _] = ui.nav_rect(size, self.session);
+            let text = |frame: &mut Frame, xx, yy, scale, label: &str, color| {
+                font.text(
+                    frame,
+                    (xx as f32 * ui.scale).round() as i32,
+                    (yy as f32 * ui.scale).round() as i32,
+                    scale * ui.scale,
+                    label,
+                    color,
+                );
+            };
+            let title = match self.session {
+                MenuSession::Main => "Local play",
+                MenuSession::Practice => "Practice paused",
+                MenuSession::Match => "Match paused",
+            };
+            ui.tile(frame, None, rect, [0.08, 0.10, 0.13]);
+            ui.tile(frame, None, [x, y, width, 2], [0.28, 0.56, 0.58]);
+            text(frame, x + 14, y + 9, 1.1, title, [0.94, 0.97, 1.0]);
+            for (item, label) in self.session.entries().iter().enumerate() {
+                let row = y + 42 + item as i32 * MENU_BUTTON_HEIGHT;
+                let selected = self.nav_hover.unwrap_or(self.nav_focus) == item;
                 ui.tile(
                     frame,
-                    art.bar.as_ref(),
-                    [0, bottom, width, 16],
-                    [0.24, 0.27, 0.31],
+                    None,
+                    [x + 10, row, width - 20, 29],
+                    if selected {
+                        [0.22, 0.40, 0.44]
+                    } else {
+                        [0.13, 0.18, 0.22]
+                    },
                 );
-                let help = if let Some((open, selected)) = self.pulldown {
-                    open.entries(self.session)[selected].1
-                } else {
-                    [
-                        if self.session.paused() {
-                            "Return to the current game."
-                        } else {
-                            "Start a practice session on Deck16][."
-                        },
-                        "Start a game or quit.",
-                        "Configure settings.",
-                        "Enable or disable help.",
-                    ][self.bar_hover.unwrap_or(self.bar_focus)]
-                };
-                label(frame, 7, bottom + 1, help);
+                text(frame, x + 18, row + 4, 0.91, label, [0.94, 0.97, 1.0]);
             }
+            if settings.context_help && self.session.paused() {
+                text(
+                    frame,
+                    x + 14,
+                    y + 176,
+                    0.72,
+                    "Esc to resume    M for main menu",
+                    [0.70, 0.76, 0.81],
+                );
+            }
+            let label =
+                |frame: &mut Frame, x, y, label| ui.label(frame, font, menu_font, x, y, label);
             if let Some(yes) = self.quit {
                 let rect = ui.quit_rect(size);
                 let [x, y, ..] = rect;
@@ -1274,7 +1052,10 @@ impl Menu {
                 format!("{}%", settings.sensitivity),
                 enabled(settings.invert_mouse),
             ],
-            4 => vec![format!("{}%", settings.hud_scale)],
+            4 => vec![
+                format!("{}%", settings.hud_scale),
+                enabled(settings.context_help),
+            ],
             _ => vec![
                 enabled(settings.dodging),
                 format!("{}%", settings.game_speed),
@@ -1304,6 +1085,7 @@ impl Menu {
                 (0, 5) => Some(settings.intro),
                 (0, 6) => Some(settings.show_decals),
                 (3, 1) => Some(settings.invert_mouse),
+                (4, 1) => Some(settings.context_help),
                 (5, 0) => Some(settings.dodging),
                 _ => None,
             };
@@ -1389,7 +1171,7 @@ impl Menu {
             let top = y + row_y(self.selected) + 22;
             ui.tile(
                 frame,
-                art.pulldown[4].as_ref(),
+                art.dropdown.as_ref(),
                 [left, top, CHOICE_WIDTH, choice.len() as i32 * CHOICE_HEIGHT],
                 [0.65, 0.68, 0.79],
             );
@@ -1415,6 +1197,22 @@ struct Layout {
 }
 
 impl Layout {
+    fn nav_rect(&self, size: [i32; 2], session: MenuSession) -> [i32; 4] {
+        let [w, h] = self.local(size[0], size[1]);
+        let height = if session.paused() { 204 } else { 212 };
+        [(w - 272) / 2, (h - height) / 2, 272, height]
+    }
+
+    fn nav_item(&self, size: [i32; 2], x: i32, y: i32, session: MenuSession) -> Option<usize> {
+        let [left, top, width, _] = self.nav_rect(size, session);
+        let row = y - top - 42;
+        if !(left + 10..left + width - 10).contains(&x) || row < 0 || row % MENU_BUTTON_HEIGHT >= 29
+        {
+            return None;
+        }
+        let item = (row / MENU_BUTTON_HEIGHT) as usize;
+        (item < session.entries().len()).then_some(item)
+    }
     fn match_rect(&self, size: [i32; 2]) -> [i32; 4] {
         let [w, h] = self.local(size[0], size[1]);
         [(w - 428) / 2, (h - 258) / 2, 428, 258]
@@ -1563,14 +1361,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn play_is_the_direct_action_and_preferences_return_to_it() {
+    fn home_play_and_practice_are_distinct_and_pause_has_a_direct_return_to_menu() {
         let mut settings = Settings::default();
         let mut menu = Menu::default();
-        assert!(menu.key(VK_RETURN, &mut settings) == Action::Play);
-        menu.key(VK_RIGHT, &mut settings);
-        menu.key(VK_RIGHT, &mut settings);
-        menu.key(VK_RETURN, &mut settings);
-        menu.key(VK_RETURN, &mut settings);
+        menu.match_names = vec!["DM-Deck16][".into()];
+        let size = [900, 600];
+        let click = |menu: &mut Menu, item, settings: &mut Settings| {
+            let [x, y, ..] = Layout::new(size, menu.dpi).nav_rect(size, menu.session);
+            menu.click(
+                size,
+                x + 23,
+                y + 50 + item * MENU_BUTTON_HEIGHT,
+                VK_LBUTTON,
+                settings,
+            )
+        };
+
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::Deathmatch(0));
+        assert!(click(&mut menu, 1, &mut settings) == Action::None);
+        assert!(menu.match_setup.is_some());
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::Deathmatch(0));
+        menu.key(VK_ESCAPE, &mut settings);
+        assert!(click(&mut menu, 2, &mut settings) == Action::Practice);
+
+        assert!(click(&mut menu, 3, &mut settings) == Action::None);
         assert!(menu.preferences);
         menu.key(VK_TAB, &mut settings);
         assert!(menu.key(VK_LEFT, &mut settings) == Action::Changed);
@@ -1580,115 +1394,46 @@ mod tests {
         assert!(menu.key(b'I' as u16, &mut settings) == Action::Changed);
         assert_eq!(settings.bindings[0], b'I' as u16);
         menu.key(VK_ESCAPE, &mut settings);
-        assert!(!menu.preferences);
+
+        for session in [MenuSession::Match, MenuSession::Practice] {
+            menu.session = session;
+            assert!(click(&mut menu, 0, &mut settings) == Action::Resume);
+            assert!(click(&mut menu, 1, &mut settings) == Action::LeaveMatch);
+            assert!(menu.key(b'M' as u16, &mut settings) == Action::LeaveMatch);
+            assert!(menu.key(VK_ESCAPE, &mut settings) == Action::Resume);
+        }
+        assert!(click(&mut menu, 3, &mut settings) == Action::None);
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::Quit);
+    }
+
+    #[test]
+    fn preference_controls_still_save_tab_values_and_choose_resolution() {
+        let mut settings = Settings::default();
+        let mut menu = Menu::default();
         let size = [900, 600];
-        menu.click(size, 125, 8, VK_LBUTTON, &mut settings);
-        assert!(matches!(menu.pulldown, Some((Pulldown::Options, 0))));
-        menu.click(size, 125, 25, VK_LBUTTON, &mut settings);
-        assert!(menu.preferences);
         let [x, y] = Layout::new(size, menu.dpi).panel;
-        menu.click(size, x + 90, y + 22, VK_LBUTTON, &mut settings);
-        assert!(menu.click(size, x + 408, y + 60, VK_LBUTTON, &mut settings) == Action::Changed);
-        assert_eq!(settings.music_volume, 100);
-        menu.click(size, x + 380, y + 321, VK_LBUTTON, &mut settings);
-        assert!(!menu.preferences);
-        menu.tab = 0;
-        menu.click(size, 125, 8, VK_LBUTTON, &mut settings);
-        menu.click(size, 125, 25, VK_LBUTTON, &mut settings);
-        let combo_x = x + CHOICE_LEFT + 10;
+        assert!(menu.activate(3, &settings) == Action::None);
         let resolution_y = y + 16 + row_y(1);
-        let settings_before = settings.resolution;
+        let combo_x = x + CHOICE_LEFT + 10;
         menu.click(size, combo_x, resolution_y + 8, VK_LBUTTON, &mut settings);
-        menu.key(VK_DOWN, &mut settings);
-        menu.key(VK_ESCAPE, &mut settings);
-        assert_eq!(settings.resolution, settings_before);
-        menu.click(size, combo_x, resolution_y + 8, VK_LBUTTON, &mut settings);
-        assert!(
-            menu.click(
-                size,
-                combo_x,
-                resolution_y + 22 + 5 * CHOICE_HEIGHT,
-                VK_LBUTTON,
-                &mut settings
-            ) == Action::Changed
-        );
-        assert_eq!(settings.resolution, 5);
-        let skin_y = y + 16 + row_y(7);
-        menu.click(size, combo_x, skin_y + 8, VK_LBUTTON, &mut settings);
         menu.key(VK_DOWN, &mut settings);
         assert!(menu.key(VK_RETURN, &mut settings) == Action::Changed);
-        assert_eq!(settings.gui_skin, 1);
-        menu.click(size, x + 350, y + 22, VK_LBUTTON, &mut settings);
-        assert!(
-            menu.click(
-                size,
-                x + 408,
-                y + 16 + row_y(1) + 8,
-                VK_LBUTTON,
-                &mut settings
-            ) == Action::Changed
-        );
-        assert_eq!(settings.game_speed, 200);
-        assert!(menu.key(VK_LEFT, &mut settings) == Action::Changed);
-        assert_eq!(settings.game_speed, 195);
-        assert!(
-            menu.click(
-                size,
-                x + 279,
-                y + 16 + row_y(2) + 8,
-                VK_LBUTTON,
-                &mut settings
-            ) == Action::Changed
-        );
-        assert_eq!(settings.view_bob, 0);
-        menu.key(VK_DOWN, &mut settings);
+        assert_eq!(settings.resolution, 3);
+        menu.tab = 5;
+        menu.selected = 3;
         assert!(menu.key(VK_RIGHT, &mut settings) == Action::Changed);
         assert_eq!(settings.bot_difficulty, 3);
         menu.key(VK_ESCAPE, &mut settings);
-        assert!(menu.click([900, 600], 40, 13, VK_LBUTTON, &mut settings) == Action::Play);
-
-        menu.click(size, 70, 8, VK_LBUTTON, &mut settings);
-        assert!(menu.click(size, 72, 25, VK_LBUTTON, &mut settings) == Action::Play);
-        menu.click(size, 70, 8, VK_LBUTTON, &mut settings);
-        menu.key(VK_DOWN, &mut settings);
-        assert!(menu.key(VK_RETURN, &mut settings) == Action::None);
-        assert_eq!(menu.quit, Some(true));
-        menu.key(VK_ESCAPE, &mut settings);
-        assert!(menu.quit.is_none());
-        menu.click(size, 70, 8, VK_LBUTTON, &mut settings);
-        menu.click(size, 72, 48, VK_LBUTTON, &mut settings);
-        assert!(menu.key(VK_RETURN, &mut settings) == Action::Quit);
-
-        menu.quit = None;
-        menu.match_names = vec!["DM-Deck16][".into()];
-        menu.click(size, 70, 8, VK_LBUTTON, &mut settings);
-        menu.key(VK_DOWN, &mut settings);
-        menu.key(VK_DOWN, &mut settings);
-        assert!(menu.key(VK_RETURN, &mut settings) == Action::None);
-        assert!(menu.key(VK_RETURN, &mut settings) == Action::Deathmatch(0));
-        assert!(!menu.commit_match_settings(&mut settings));
-
-        menu.click(size, 180, 8, VK_LBUTTON, &mut settings);
-        assert!(menu.click(size, 180, 25, VK_LBUTTON, &mut settings) == Action::Changed);
-        assert!(!settings.context_help);
-        menu.session = MenuSession::Match;
-        menu.click(size, 70, 8, VK_LBUTTON, &mut settings);
-        assert!(menu.click(size, 72, 25, VK_LBUTTON, &mut settings) == Action::Play);
-        menu.click(size, 70, 8, VK_LBUTTON, &mut settings);
-        menu.key(VK_DOWN, &mut settings);
-        assert!(menu.key(VK_RETURN, &mut settings) == Action::LeaveMatch);
-        assert!(menu.quit.is_none());
-        menu.click(size, 70, 8, VK_LBUTTON, &mut settings);
-        assert!(menu.click(size, 72, 48, VK_LBUTTON, &mut settings) == Action::LeaveMatch);
+        assert!(!menu.preferences);
     }
-
     #[test]
     fn deathmatch_setup_applies_draft_rules_only_after_successful_launch() {
         let mut settings = Settings::default();
         let mut menu = Menu::default();
         menu.match_names = vec!["DM-Deck16][".into(), "DM-Liandri".into()];
-        assert!(menu.key(VK_RETURN, &mut settings) == Action::Play);
-        assert!(menu.activate(Pulldown::Game, 2, &mut settings) == Action::None);
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::Deathmatch(0));
+        assert!(menu.activate(1, &settings) == Action::None);
+        assert!(menu.match_setup.is_some());
         menu.key(VK_DOWN, &mut settings);
         menu.key(VK_TAB, &mut settings);
         menu.key(VK_RIGHT, &mut settings);
@@ -1698,7 +1443,7 @@ mod tests {
         assert!(menu.match_setup.is_none());
         assert_eq!(settings.bot_difficulty, 2);
 
-        menu.activate(Pulldown::Game, 2, &mut settings);
+        menu.activate(1, &settings);
         let size = [900, 600];
         let [x, y, ..] = Layout::new(size, menu.dpi).match_rect(size);
         assert!(menu.click(size, x + 25, y + 74, VK_LBUTTON, &mut settings) == Action::None);

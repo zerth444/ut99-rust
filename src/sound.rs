@@ -21,6 +21,7 @@ struct SoundEvent {
     wave: Arc<Wave>,
     gain: f32,
     source: Option<SoundSource>,
+    bio_owner: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -55,6 +56,7 @@ impl SoundEvents {
             wave,
             gain: 1.0,
             source: None,
+            bio_owner: None,
         });
     }
 
@@ -74,7 +76,27 @@ impl SoundEvents {
             wave,
             gain,
             source: Some(SoundSource { position, radius }),
+            bio_owner: None,
         }));
+    }
+
+    pub(crate) fn bio_charge(
+        &mut self,
+        wave: Option<Arc<Wave>>,
+        owner: usize,
+        position: Option<Vec3>,
+    ) {
+        if let Some(wave) = wave {
+            self.0.push(SoundEvent {
+                wave,
+                gain: if position.is_some() { 0.75 } else { 1.0 },
+                source: position.map(|position| SoundSource {
+                    position,
+                    radius: CONTACT_SOUND_RADIUS,
+                }),
+                bio_owner: Some(owner),
+            });
+        }
     }
 }
 
@@ -406,6 +428,10 @@ impl Mixer {
         if !event.gain.is_finite() || event.gain <= 0.0 {
             return;
         }
+        if let Some(owner) = event.bio_owner {
+            self.voices
+                .retain(|voice| voice.event.bio_owner != Some(owner));
+        }
         if self.voices.len() == 24 {
             if let Some(index) = self
                 .voices
@@ -420,6 +446,11 @@ impl Mixer {
             }
         }
         self.voices.push(Voice { event, cursor: 0.0 });
+    }
+
+    fn keep_bio_charges(&mut self, mut active: impl FnMut(usize) -> bool) {
+        self.voices
+            .retain(|voice| voice.event.bio_owner.is_none_or(&mut active));
     }
 
     fn mix_effects(
@@ -514,6 +545,7 @@ mod tests {
             wave: wave.clone(),
             gain,
             source: None,
+            bio_owner: None,
         });
     }
 
@@ -599,6 +631,38 @@ mod tests {
         mixer.set_world_loops(std::iter::empty());
         mixer.mix_effects(2, &[], Vec3::default(), right, false);
         assert_eq!(mixer.mix, [[0.0, 0.0]; 2]);
+    }
+
+    #[test]
+    fn releasing_bio_charge_removes_only_the_releasing_fighters_charge_audio() {
+        let mut mixer = Mixer::new();
+        let mut events = SoundEvents::default();
+        let load = wave(1024);
+        let shot = wave(64);
+        events.bio_charge(Some(load.clone()), 0, None);
+        events.bio_charge(Some(load.clone()), 1, Some(Vec3(10.0, 0.0, 0.0)));
+        for event in events.0 {
+            mixer.play(event);
+        }
+        mixer.mix_effects(8, &[], Vec3::default(), Vec3(1.0, 0.0, 0.0), false);
+        play(&mut mixer, &shot, 1.0);
+        mixer.keep_bio_charges(|owner| owner == 1);
+        assert_eq!(mixer.voices.len(), 2);
+        assert!(
+            mixer
+                .voices
+                .iter()
+                .any(|voice| voice.event.bio_owner == Some(1) && voice.cursor == 8.0)
+        );
+        assert!(
+            mixer
+                .voices
+                .iter()
+                .any(|voice| Arc::ptr_eq(&voice.event.wave, &shot))
+        );
+        mixer.keep_bio_charges(|_| false);
+        assert_eq!(mixer.voices.len(), 1);
+        assert!(Arc::ptr_eq(&mixer.voices[0].event.wave, &shot));
     }
 
     #[test]
@@ -764,6 +828,7 @@ pub mod device {
                 wave,
                 gain,
                 source: None,
+                bio_owner: None,
             });
         }
 
@@ -771,6 +836,10 @@ pub mod device {
             for event in events.0 {
                 self.mixer.play(event);
             }
+        }
+
+        pub fn keep_bio_charges(&mut self, active: impl FnMut(usize) -> bool) {
+            self.mixer.keep_bio_charges(active);
         }
 
         pub fn set_weapon_loop(&mut self, wave: Option<&Arc<Wave>>) {

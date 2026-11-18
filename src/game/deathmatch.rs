@@ -1016,6 +1016,13 @@ impl Match {
         (age < 0.9).then_some((hit.health, hit.armor, age))
     }
 
+    pub fn bio_charging(&self, owner: usize) -> bool {
+        !self.finished
+            && self.fighters.get(owner).is_some_and(|fighter| {
+                fighter.health > 0 && fighter.weapon == Weapon::Bio && fighter.charge.is_some()
+            })
+    }
+
     fn pilot_index(&self) -> Option<usize> {
         if self.finished || self.fighters[0].health == 0 {
             return None;
@@ -2036,7 +2043,9 @@ impl Match {
                         art.load_sound.clone()
                     }
                 });
-                if id == 0 {
+                if weapon == Weapon::Bio {
+                    sounds.bio_charge(wave, id, (id != 0).then_some(fighter.walker.position));
+                } else if id == 0 {
                     sounds.extend(wave);
                 } else {
                     sounds.extend_at(wave, fighter.walker.position, CONTACT_SOUND_RADIUS, 0.75);
@@ -5157,10 +5166,11 @@ mod tests {
         };
         game.fire(&map, 0, held, &mut hits, &mut sounds);
         for tick in 1..=5 {
-            game.time = tick as f32;
+            game.time = tick as f32 * 0.015;
             game.fire(&map, 0, held, &mut hits, &mut sounds);
         }
         assert!(game.bolts.is_empty());
+        assert!(game.bio_charging(0));
         assert_eq!(
             sounds
                 .waves()
@@ -5178,6 +5188,7 @@ mod tests {
         game.fire(&map, 0, Command::default(), &mut hits, &mut sounds);
         game.fire(&map, 0, Command::default(), &mut hits, &mut sounds);
         assert_eq!(game.bolts.len(), 1);
+        assert!(!game.bio_charging(0));
         assert_eq!(
             sounds
                 .waves()

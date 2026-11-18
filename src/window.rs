@@ -427,7 +427,7 @@ unsafe fn message_loop(
                     match key {
                         VK_ESCAPE if let Some(frontend) = frontend.as_deref_mut() => {
                             mouse.release();
-                            if run_frontend(
+                            let action = run_frontend(
                                 window,
                                 map,
                                 frontend,
@@ -439,9 +439,53 @@ unsafe fn message_loop(
                                 &mut windowed,
                                 obs,
                                 MenuSession::Practice,
-                            )? == Action::Quit
-                            {
+                            )?;
+                            if action == Action::Quit {
                                 return Ok(());
+                            }
+                            if action == Action::LeaveMatch {
+                                match run_frontend(
+                                    window,
+                                    map,
+                                    frontend,
+                                    &hud,
+                                    &mut presenter,
+                                    &mut audio,
+                                    settings,
+                                    settings_path,
+                                    &mut windowed,
+                                    obs,
+                                    MenuSession::Main,
+                                )? {
+                                    Action::Quit => return Ok(()),
+                                    Action::Deathmatch(_) => {
+                                        if let Some(arena) = frontend.pending_arena.take() {
+                                            practice_arena =
+                                                Some((std::mem::replace(map, arena), start));
+                                            start = 6.min(map.starts.len() - 1);
+                                        }
+                                        deathmatch = Some(deathmatch::Match::new(
+                                            map,
+                                            start,
+                                            settings.match_rules(),
+                                        ));
+                                        match_clock.clear();
+                                    }
+                                    _ => {
+                                        game = Practice::new(map);
+                                        walker = Walker::spawn(
+                                            &map.collision,
+                                            map.starts[start].position,
+                                        );
+                                        camera = Camera::from_start(map.starts[start]);
+                                        fly = false;
+                                        occupied_portal = None;
+                                        pilot_view = None;
+                                    }
+                                }
+                                if let Some(audio) = &mut audio {
+                                    audio.set_track(map.music.as_ref());
+                                }
                             }
                             frame = Frame::hardware(map);
                             tick = Instant::now();
@@ -595,6 +639,7 @@ unsafe fn message_loop(
                 };
                 let view = game.render_view(map, blend, 0.004 * settings.view_bob as f32);
                 if let Some(audio) = &mut audio {
+                    audio.keep_bio_charges(|owner| game.bio_charging(owner));
                     audio.set_weapon_loop(game.weapon_loop(map));
                     audio.set_world_loops(game.world_loops(map));
                     audio.set_volume(settings.effects_volume, settings.music_volume);
@@ -830,6 +875,7 @@ unsafe fn message_loop(
                     }
                 }
                 audio.play_events(sound_events);
+                audio.keep_bio_charges(|owner| owner == 0 && game.bio_charging());
                 use crate::game::Weapon;
                 let weapon_loop = if game.ordnance.guided_view().is_some() {
                     map.arsenal
@@ -967,6 +1013,7 @@ fn run_frontend(
     let mut tick = Instant::now();
     let mut time = 0.0;
     if let Some(audio) = audio {
+        audio.keep_bio_charges(|_| false);
         audio.set_weapon_loop(None);
         audio.set_world_loops(std::iter::empty());
         if !resume {
@@ -1067,7 +1114,7 @@ fn run_frontend(
                                 menu.status = "COULD NOT LOAD MAP".into();
                             }
                         },
-                        Action::Play | Action::LeaveMatch => {
+                        Action::Resume | Action::Practice | Action::LeaveMatch => {
                             return Ok(action);
                         }
                         Action::Quit => {
