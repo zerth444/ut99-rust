@@ -13,7 +13,7 @@ use crate::{
     sound::{BLAST_SOUND_RADIUS, CONTACT_SOUND_RADIUS, SoundEvents},
 };
 pub use ai::Difficulty;
-use arsenal::{Inventory, Path};
+use arsenal::{ChargeProfile, ChargeShape, Inventory, Path};
 use navigation::{JumpControl, JumpProgress, LiftRide, Navigation, Step, WAYPOINT_RADIUS};
 
 const RESPAWN_DELAY: f32 = 1.25;
@@ -51,6 +51,7 @@ pub struct Command {
     pub slot: Option<u8>,
     pub cycle: i8,
     pub preferred: Option<Weapon>,
+    pub release_charge: bool,
 }
 
 pub struct Fighter {
@@ -66,6 +67,8 @@ pub struct Fighter {
     pub last_alt: bool,
     pub zoomed: bool,
     alt_held: bool,
+    charge: Option<Charge>,
+    charge_locked: Option<bool>,
     pub score: i16,
     pub deaths: u16,
     pub fired_at: f32,
@@ -98,6 +101,8 @@ impl Fighter {
             last_alt: false,
             zoomed: false,
             alt_held: false,
+            charge: None,
+            charge_locked: None,
             score: 0,
             deaths: 0,
             fired_at: f32::NEG_INFINITY,
@@ -129,6 +134,24 @@ impl Fighter {
         (self.weapon != Weapon::Hammer).then(|| self.inventory.ammo(self.weapon))
     }
 
+    pub fn charge_status(&self, time: f32) -> Option<(u16, f32)> {
+        let charge = self.charge?;
+        let elapsed = time - charge.since;
+        let cost = arsenal::shot(self.weapon, charge.alternate).ammo;
+        let units = charge
+            .profile
+            .units(elapsed, self.inventory.ammo(self.weapon), cost);
+        Some((
+            units,
+            (elapsed / (charge.profile.period * f32::from(charge.profile.max_units - 1)))
+                .clamp(0.0, 1.0),
+        ))
+    }
+
+    pub(crate) fn charge_age(&self, time: f32) -> Option<f32> {
+        self.charge.map(|charge| time - charge.since)
+    }
+
     pub fn armor(&self) -> u16 {
         self.armor.iter().sum::<u16>().min(150)
     }
@@ -157,6 +180,8 @@ impl Fighter {
             return;
         }
         self.weapon = weapon;
+        self.charge = None;
+        self.charge_locked = None;
         self.zoomed = false;
         self.fired_at = f32::NEG_INFINITY;
         self.selected_at = time;
@@ -216,6 +241,13 @@ impl Fighter {
             map.player_idle.sample(0.0)
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct Charge {
+    since: f32,
+    alternate: bool,
+    profile: ChargeProfile,
 }
 
 #[derive(Default)]
@@ -285,6 +317,7 @@ struct ProjectilePayload {
     blast: f32,
     gravity: f32,
     rebounds: u8,
+    scale: f32,
 }
 
 struct Detonation {
@@ -298,6 +331,7 @@ pub struct Trace {
     pub end: Vec3,
     pub explosion: Option<super::ordnance::Kind>,
     pub born: f32,
+    pub scale: f32,
     expires: f32,
 }
 
@@ -426,13 +460,14 @@ impl Match {
 
     pub(crate) fn bolts(
         &self,
-    ) -> impl Iterator<Item = (super::ordnance::Kind, Vec3, Vec3, f32)> + '_ {
+    ) -> impl Iterator<Item = (super::ordnance::Kind, Vec3, Vec3, f32, f32)> + '_ {
         self.bolts.iter().map(|bolt| {
             (
                 bolt.payload.kind,
                 bolt.position,
                 unit(bolt.velocity),
                 self.time - bolt.born,
+                bolt.payload.scale,
             )
         })
     }
@@ -735,23 +770,79 @@ impl Match {
             fighter.equip(map.arsenal.get(&weapon), weapon, self.time, sounds, id == 0);
             return;
         }
-        if self.time < fighter.ready_at || !(input.primary || input.alternate) {
-            return;
-        }
-
         let weapon = fighter.weapon;
-        let mut alt = input.alternate && !input.primary;
-        let mut shot = arsenal::shot(weapon, alt);
-        if matches!(shot.path, Path::Zoom) {
-            if pressed_alt {
-                fighter.zoomed = !fighter.zoomed;
+        let input_holds = |alt: bool| {
+            if alt {
+                input.alternate && !input.primary
+            } else {
+                input.primary
             }
-            return;
+        };
+        if fighter.charge_locked.is_some_and(|alt| !input_holds(alt)) {
+            fighter.charge_locked = None;
         }
-        if fighter.inventory.ammo(weapon) < shot.ammo {
-            alt = false;
-            shot = arsenal::shot(weapon, false);
-        }
+        let ammo = fighter.inventory.ammo(weapon);
+        let (alt, mut shot, units, shape) = if let Some(charge) = fighter.charge {
+            let alt = charge.alternate;
+            let shot = arsenal::shot(weapon, alt);
+            let held = input_holds(alt);
+            let units = charge
+                .profile
+                .units(self.time - charge.since, ammo, shot.ammo);
+            let cap = charge.profile.max_units.min(ammo / shot.ammo.max(1));
+            if held && units < cap {
+                return;
+            }
+            fighter.charge = None;
+            if id != 0 && !held && !input.release_charge {
+                return; // The bot lost its shot and deliberately aborted.
+            }
+            if units == 0 {
+                return;
+            }
+            fighter.charge_locked = held.then_some(alt);
+            (alt, shot, units, Some(charge.profile.shape))
+        } else {
+            if self.time < fighter.ready_at || !(input.primary || input.alternate) {
+                return;
+            }
+            let mut alt = input.alternate && !input.primary;
+            let mut shot = arsenal::shot(weapon, alt);
+            if matches!(shot.path, Path::Zoom) {
+                if pressed_alt {
+                    fighter.zoomed = !fighter.zoomed;
+                }
+                return;
+            }
+            if ammo < shot.ammo {
+                alt = false;
+                shot = arsenal::shot(weapon, false);
+            }
+            if ammo >= shot.ammo
+                && let Some(profile) = arsenal::charge_profile(weapon, alt)
+            {
+                if fighter.charge_locked == Some(alt) {
+                    return;
+                }
+                fighter.charge = Some(Charge {
+                    since: self.time,
+                    alternate: alt,
+                    profile,
+                });
+                let wave = map
+                    .arsenal
+                    .get(&weapon)
+                    .and_then(|art| art.load_sound.clone());
+                if id == 0 {
+                    sounds.extend(wave);
+                } else {
+                    sounds.extend_at(wave, fighter.walker.position, CONTACT_SOUND_RADIUS, 0.75);
+                }
+                return;
+            }
+            (alt, shot, 1, None)
+        };
+        shot.ammo = shot.ammo.saturating_mul(units);
         if !fighter.inventory.spend(weapon, shot.ammo) {
             let fallback = fighter.inventory.preferred(560.0);
             fighter.equip(
@@ -770,7 +861,14 @@ impl Match {
         let start = aim.position;
         let direction = aim.look_direction();
         let boosted = fighter.amp_left(self.time) > 0.0;
-        let damage = shot.damage.saturating_mul(if boosted { 3 } else { 1 });
+        let extra = f32::from(units.saturating_sub(1));
+        let grow = matches!(shape, Some(ChargeShape::Grow));
+        let damage = if grow {
+            (f32::from(shot.damage) * (1.0 + 0.38 * extra)).round() as u16
+        } else {
+            shot.damage
+        };
+        let damage = damage.saturating_mul(if boosted { 3 } else { 1 });
         let wave = super::shot_sound(&map.arsenal, weapon, alt);
         if id == 0 {
             sounds.extend(wave);
@@ -795,25 +893,39 @@ impl Match {
                 rebounds,
             } => {
                 let speed = arsenal::velocity(map, kind);
-                self.bolts.push(Bolt {
-                    owner: id,
-                    position: start,
-                    velocity: direction * speed + Vec3(0.0, 0.0, gravity * 115.0),
-                    born: self.time,
-                    expires: self.time
-                        + if rebounds > 0 && gravity > 0.0 {
-                            2.35
-                        } else {
-                            4.0
+                let count = if matches!(shape, Some(ChargeShape::Volley)) {
+                    units
+                } else {
+                    1
+                };
+                for index in 0..count {
+                    let spread = (f32::from(index) - f32::from(count - 1) * 0.5) * 0.055;
+                    let aim_direction = unit(direction + aim.right() * spread);
+                    self.bolts.push(Bolt {
+                        owner: id,
+                        position: start,
+                        velocity: aim_direction * speed + Vec3(0.0, 0.0, gravity * 115.0),
+                        born: self.time,
+                        expires: self.time
+                            + if rebounds > 0 && gravity > 0.0 {
+                                2.35
+                            } else {
+                                4.0
+                            },
+                        payload: ProjectilePayload {
+                            kind,
+                            damage,
+                            blast: if grow {
+                                blast * (1.0 + 0.17 * extra)
+                            } else {
+                                blast
+                            },
+                            gravity,
+                            rebounds,
+                            scale: if grow { 1.0 + 0.20 * extra } else { 1.0 },
                         },
-                    payload: ProjectilePayload {
-                        kind,
-                        damage,
-                        blast,
-                        gravity,
-                        rebounds,
-                    },
-                });
+                    });
+                }
             }
             Path::Trace {
                 range,
@@ -868,6 +980,7 @@ impl Match {
                             end: start + clipped * fraction,
                             explosion: None,
                             born: self.time,
+                            scale: 1.0,
                             expires: self.time + 0.065,
                         });
                     }
@@ -887,8 +1000,8 @@ impl Match {
                 let at = cylinder_hit(
                     start - bolt.position,
                     delta,
-                    art.collision_radius.max(4.0),
-                    art.collision_height.max(4.0),
+                    art.collision_radius.max(4.0) * bolt.payload.scale,
+                    art.collision_height.max(4.0) * bolt.payload.scale,
                 )?;
                 (at < 1.0).then_some((index, at))
             })
@@ -903,8 +1016,8 @@ impl Match {
             let zone = map.collision.regions.at(bolt.position);
             bolt.velocity = bolt.velocity + zone.gravity * (payload.gravity * dt);
             let delta = bolt.velocity * dt;
-            let radius = art.collision_radius.max(0.0);
-            let height = art.collision_height.max(0.0);
+            let radius = art.collision_radius.max(0.0) * payload.scale;
+            let height = art.collision_height.max(0.0) * payload.scale;
             let wall = map
                 .collision
                 .projectile_surface(bolt.position, delta, radius, height);
@@ -1007,6 +1120,7 @@ impl Match {
                 end: position,
                 explosion: Some(payload.kind),
                 born: self.time,
+                scale: payload.scale,
                 expires: self.time + 0.48,
             });
             sounds.extend_at(art.sound.iter().cloned(), position, BLAST_SOUND_RADIUS, 1.0);
@@ -1071,6 +1185,7 @@ impl Match {
             return;
         }
         victim.deaths += 1;
+        victim.charge = None;
         victim.fell_at = Some(self.time);
         sounds.extend_at(
             map.player_audio.death.iter().flatten().take(1).cloned(),
@@ -1152,8 +1267,16 @@ impl Match {
                 bot.react_at = self.time + skill.reaction + (id % 3) as f32 * 0.07;
             }
             let range = distance.sqrt();
-            let weapon = fighter.inventory.preferred(range);
-            let (alt, shot) = arsenal::bot_shot(weapon, fighter.inventory.ammo(weapon), range);
+            let charge = fighter.charge;
+            let weapon = if charge.is_some() {
+                fighter.weapon
+            } else {
+                fighter.inventory.preferred(range)
+            };
+            let (alt, shot) = charge.map_or_else(
+                || arsenal::bot_shot(weapon, fighter.inventory.ammo(weapon), range),
+                |charge| (charge.alternate, arsenal::shot(weapon, charge.alternate)),
+            );
             let mut clear = true;
             let attack_range = match shot.path {
                 Path::Missile {
@@ -1190,6 +1313,16 @@ impl Match {
                 && (pitch - tilt).abs() < 0.045
                 && range < attack_range
                 && clear;
+            let release_charge = firing
+                && charge.is_some_and(|charge| {
+                    let wanted = match self.rules.difficulty {
+                        Difficulty::Easy => 1.0,
+                        Difficulty::Standard => 2.0,
+                        Difficulty::Hard => 3.0,
+                    };
+                    self.time - charge.since >= charge.profile.period * (wanted - 0.85)
+                });
+            let hold_trigger = firing && !release_charge && fighter.charge_locked != Some(alt);
             return Command {
                 movement: [
                     if weapon == Weapon::Hammer || range > (attack_range * 0.75).min(480.0) {
@@ -1200,8 +1333,9 @@ impl Match {
                     strafe * skill.strafe,
                 ],
                 look: [yaw, tilt],
-                primary: firing && !alt,
-                alternate: firing && alt,
+                primary: hold_trigger && !alt,
+                alternate: hold_trigger && alt,
+                release_charge,
                 preferred: (weapon != fighter.weapon).then_some(weapon),
                 ..Command::default()
             };
@@ -1575,6 +1709,166 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local GOTY assets"]
+    fn rocket_releases_a_spread_and_does_not_rearm_until_the_trigger_is_released() {
+        let map = arena();
+        let mut game = Match::new(&map, 6, Rules::default());
+        let mut sounds = SoundEvents::default();
+        let mut hits = Vec::new();
+        let held = Command {
+            primary: true,
+            ..Command::default()
+        };
+        let fighter = &mut game.fighters[0];
+        fighter.inventory.pickup(&map.arsenal, Weapon::Rocket);
+        fighter
+            .inventory
+            .grant_ammo(&map.arsenal, Weapon::Rocket, 20);
+        fighter.weapon = Weapon::Rocket;
+        let starting_ammo = fighter.ammo().unwrap();
+        game.fire(&map, 0, held, &mut hits, &mut sounds);
+        game.time = 0.74;
+        game.fire(&map, 0, held, &mut hits, &mut sounds);
+        assert!(game.bolts.is_empty());
+        assert_eq!(game.fighters[0].ammo(), Some(starting_ammo));
+        assert_eq!(game.fighters[0].charge_status(game.time).unwrap().0, 3);
+        game.fire(&map, 0, Command::default(), &mut hits, &mut sounds);
+        assert_eq!(game.bolts.len(), 3);
+        assert!(game.bolts.iter().all(|bolt| bolt.owner == 0));
+        let spread = game.bolts[0].velocity - game.bolts[2].velocity;
+        assert!(spread.dot(spread) > 500.0);
+        assert_eq!(game.fighters[0].ammo(), Some(starting_ammo - 3));
+
+        game.time = 2.0;
+        let remainder = game.fighters[0].ammo().unwrap() - 2;
+        assert!(game.fighters[0].inventory.spend(Weapon::Rocket, remainder));
+        game.fire(&map, 0, held, &mut hits, &mut sounds);
+        game.time = 2.4;
+        game.fire(&map, 0, held, &mut hits, &mut sounds);
+        assert_eq!(game.bolts.len(), 5);
+        assert_eq!(game.fighters[0].ammo(), Some(0));
+        game.fighters[0]
+            .inventory
+            .grant_ammo(&map.arsenal, Weapon::Rocket, 4);
+        game.time = 4.0;
+        game.fire(&map, 0, held, &mut hits, &mut sounds);
+        assert!(game.fighters[0].charge.is_none());
+        game.fire(&map, 0, Command::default(), &mut hits, &mut sounds);
+        game.fire(&map, 0, held, &mut hits, &mut sounds);
+        assert!(game.fighters[0].charge.is_some());
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY assets"]
+    fn bio_charge_grows_one_projectile_and_switching_or_bot_abort_cancels_it() {
+        let map = arena();
+        let mut game = Match::new(&map, 6, Rules::default());
+        let mut sounds = SoundEvents::default();
+        let mut hits = Vec::new();
+        let held = Command {
+            alternate: true,
+            ..Command::default()
+        };
+        for fighter in &mut game.fighters[..2] {
+            fighter.inventory.pickup(&map.arsenal, Weapon::Bio);
+            fighter.weapon = Weapon::Bio;
+        }
+        let starting_ammo = game.fighters[0].ammo();
+        game.fire(&map, 0, held, &mut hits, &mut sounds);
+        game.time = 1.20;
+        game.fire(
+            &map,
+            0,
+            Command {
+                slot: Some(2),
+                ..Command::default()
+            },
+            &mut hits,
+            &mut sounds,
+        );
+        assert!(game.bolts.is_empty());
+        assert_eq!(
+            Some(game.fighters[0].inventory.ammo(Weapon::Bio)),
+            starting_ammo
+        );
+        assert!(game.fighters[0].charge.is_none());
+
+        let bot_ammo = game.fighters[1].ammo().unwrap();
+        game.fire(&map, 1, held, &mut hits, &mut sounds);
+        game.time = 1.8;
+        game.fire(&map, 1, Command::default(), &mut hits, &mut sounds);
+        assert_eq!(game.fighters[1].ammo(), Some(bot_ammo));
+        assert!(game.bolts.is_empty());
+        game.fire(&map, 1, held, &mut hits, &mut sounds);
+        game.time = 2.91;
+        game.fire(
+            &map,
+            1,
+            Command {
+                release_charge: true,
+                ..Command::default()
+            },
+            &mut hits,
+            &mut sounds,
+        );
+        let base = arsenal::shot(Weapon::Bio, true);
+        assert_eq!(game.bolts.len(), 1);
+        assert_eq!(game.bolts[0].owner, 1);
+        assert!(game.bolts[0].payload.damage > base.damage);
+        assert!(game.bolts[0].payload.scale > 1.0);
+        assert_eq!(game.fighters[1].ammo(), Some(bot_ammo - 3));
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY assets"]
+    fn bot_combat_holds_and_releases_its_own_rocket_charge() {
+        let mut map = arena();
+        map.collision = crate::collision::Collision::test_world();
+        map.collision
+            .add_box(Vec3(-900.0, -900.0, -96.0), Vec3(900.0, 900.0, 0.0));
+        map.starts = vec![
+            crate::map::Start {
+                position: Vec3(440.0, 0.0, 39.2),
+                yaw: std::f32::consts::PI,
+            },
+            crate::map::Start {
+                position: Vec3(0.0, 0.0, 39.2),
+                yaw: 0.0,
+            },
+        ];
+        map.navigation_points.clear();
+        map.movers.clear();
+        map.lift_exits.clear();
+        map.teleporters.clear();
+        map.props.clear();
+        let mut game = Match::new(
+            &map,
+            0,
+            Rules {
+                bots: 1,
+                ..Rules::default()
+            },
+        );
+        game.fighters[0].protected_until = 0.0;
+        let bot = &mut game.fighters[1];
+        bot.inventory.pickup(&map.arsenal, Weapon::Rocket);
+        bot.weapon = Weapon::Rocket;
+        let ammo_before = bot.ammo().unwrap();
+        let mut charging = false;
+        for _ in 0..150 {
+            game.step(&mut map, Command::default(), 1.0 / 60.0);
+            charging |= game.fighters[1].charge.is_some();
+            if !game.bolts.is_empty() {
+                break;
+            }
+        }
+        assert!(charging);
+        assert_eq!(game.bolts.len(), 2);
+        assert!(game.bolts.iter().all(|bolt| bolt.owner == 1));
+        assert_eq!(game.fighters[1].ammo(), Some(ammo_before - 2));
+    }
+
+    #[test]
     #[ignore = "requires local GOTY map"]
     fn deck16_bot_executes_a_planned_jump() {
         let mut map = arena();
@@ -1738,6 +2032,7 @@ mod tests {
                 blast: 144.0,
                 gravity: 0.0,
                 rebounds: 0,
+                scale: 1.0,
             };
             for offset in [154.0, 268.0] {
                 game.bolts.push(Bolt {
@@ -1841,6 +2136,7 @@ mod tests {
             &mut Vec::new(),
             &mut sounds,
         );
+        game.fire(&map, 0, Command::default(), &mut Vec::new(), &mut sounds);
         assert_eq!(
             game.bolts[0].payload.damage,
             arsenal::shot(Weapon::Rocket, false).damage * 3
@@ -1964,6 +2260,7 @@ mod tests {
             &mut hits,
             &mut sounds,
         );
+        match_.fire(&map, 0, Command::default(), &mut hits, &mut sounds);
         assert_eq!(match_.fighters[0].ammo(), Some(ammo - 1));
         assert!(match_.bolts[0].payload.kind == super::super::ordnance::Kind::Rocket);
         assert_eq!(match_.bolts[0].owner, 0);
@@ -2027,6 +2324,19 @@ mod tests {
                     &mut hits,
                     &mut sounds,
                 );
+                if arsenal::charge_profile(weapon, alternate).is_some() {
+                    assert_eq!(game.bolts.len(), bolts_before);
+                    game.fire(
+                        &map,
+                        1,
+                        Command {
+                            release_charge: true,
+                            ..Command::default()
+                        },
+                        &mut hits,
+                        &mut sounds,
+                    );
+                }
                 assert_eq!(
                     game.fighters[1].inventory.ammo(weapon),
                     ammo_before - shot.ammo,
@@ -2417,6 +2727,7 @@ mod tests {
                 blast: 190.0,
                 gravity: 0.0,
                 rebounds: 0,
+                scale: 1.0,
             },
         });
         game.step(&mut map, Command::default(), 1.0 / 60.0);

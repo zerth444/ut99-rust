@@ -100,6 +100,43 @@ pub(super) struct Shot {
 }
 
 #[derive(Clone, Copy)]
+pub(super) struct ChargeProfile {
+    pub period: f32,
+    pub max_units: u16,
+    pub shape: ChargeShape,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ChargeShape {
+    Volley,
+    Grow,
+}
+
+impl ChargeProfile {
+    pub fn units(self, elapsed: f32, ammo: u16, cost: u16) -> u16 {
+        let available = ammo / cost.max(1);
+        let built = 1u16.saturating_add((elapsed.max(0.0) / self.period) as u16);
+        built.min(self.max_units).min(available)
+    }
+}
+
+pub(super) fn charge_profile(weapon: Weapon, alt: bool) -> Option<ChargeProfile> {
+    match (weapon, alt) {
+        (Weapon::Rocket, _) => Some(ChargeProfile {
+            period: 0.35,
+            max_units: 4,
+            shape: ChargeShape::Volley,
+        }),
+        (Weapon::Bio, true) => Some(ChargeProfile {
+            period: 0.52,
+            max_units: 5,
+            shape: ChargeShape::Grow,
+        }),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
 pub(super) enum Path {
     Trace {
         range: f32,
@@ -156,7 +193,7 @@ pub(super) fn shot(weapon: Weapon, alt: bool) -> Shot {
         (Weapon::Enforcer, false) => trace(26, 0.32, 1, 4800.0, 1, 0.018),
         (Weapon::Enforcer, true) => trace(20, 0.22, 1, 3200.0, 1, 0.055),
         (Weapon::Bio, false) => missile(28, 0.36, 1, Gel, 44.0, 0.72, 0),
-        (Weapon::Bio, true) => missile(78, 0.88, 3, Glob, 117.0, 0.8, 0),
+        (Weapon::Bio, true) => missile(42, 0.88, 1, Glob, 76.0, 0.8, 0),
         (Weapon::Shock, false) => trace(39, 0.59, 1, 6500.0, 1, 0.0),
         (Weapon::Shock, true) => missile(58, 0.71, 1, Pulse, 145.0, 0.0, 0),
         (Weapon::Pulse, false) => missile(16, 0.15, 1, Pulse, 0.0, 0.0, 0),

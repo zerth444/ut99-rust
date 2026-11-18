@@ -406,7 +406,13 @@ impl Frame {
                 && let Some(sprite) = &map.ordnance[kind as usize].explosion
             {
                 let age = game.time - trace.born;
-                self.world_sprite(&view, trace.start, sprite.image(age), 0.8 + age, 1.0 - age);
+                self.world_sprite(
+                    &view,
+                    trace.start,
+                    sprite.image(age),
+                    (0.8 + age) * trace.scale,
+                    1.0 - age,
+                );
                 continue;
             }
             self.effect(
@@ -423,10 +429,10 @@ impl Frame {
                 },
             );
         }
-        for (kind, position, direction, age) in game.bolts() {
+        for (kind, position, direction, age, scale) in game.bolts() {
             let art = &map.ordnance[kind as usize];
             if let Some(sprite) = &art.sprite {
-                self.world_sprite(&view, position, sprite.image(age), 0.68, 0.8);
+                self.world_sprite(&view, position, sprite.image(age), 0.68 * scale, 0.8);
                 continue;
             }
             let duration = art.flight.duration();
@@ -438,7 +444,7 @@ impl Frame {
                 } else {
                     Vec3(1.0, 0.0, 0.0)
                 };
-                let model = view.in_model(position, direction, 1.0);
+                let model = view.in_model(position, direction, scale);
                 self.draw_faces_in_view(pose.current, &model, game.time, false, Some(pose), None);
                 continue;
             }
@@ -462,8 +468,14 @@ impl Frame {
                 } else {
                     &weapon.primary_motion
                 };
-                let pose = fire
-                    .sample(game.time - player.fired_at)
+                let pose = player
+                    .charge_age(game.time)
+                    .and_then(|age| {
+                        weapon
+                            .load
+                            .sample(age.min((weapon.load.duration() - 0.001).max(0.0)))
+                    })
+                    .or_else(|| fire.sample(game.time - player.fired_at))
                     .or_else(|| weapon.select_motion.sample(game.time - player.selected_at));
                 let faces = pose
                     .as_ref()

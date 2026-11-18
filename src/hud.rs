@@ -83,6 +83,20 @@ impl Hud {
                 accent,
             );
         }
+        if let Some((units, progress)) = player.charge_status(game.time) {
+            let width = (135.0 * scale) as i32;
+            let x = (frame.width as i32 - width) / 2;
+            let y = frame.height as i32 / 2 + (40.0 * scale) as i32;
+            self.centered(
+                frame,
+                y - (21.0 * scale) as i32,
+                scale,
+                &format!("CHARGE {units}"),
+                accent,
+            );
+            frame.solid([x, y, width, 4], [0.08, 0.13, 0.17]);
+            frame.solid([x, y, (width as f32 * progress) as i32, 4], accent);
+        }
         if scoreboard || game.finished {
             let standings = game.standings();
             let w = (440.0 * scale) as i32;
