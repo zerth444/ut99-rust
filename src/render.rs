@@ -374,6 +374,7 @@ impl Frame {
         self.draw(map, camera, game.time);
         self.layer(Layer::Effects);
         let view = self.camera_view(camera);
+        self.draw_shock(map, &view, &game.shock, game.time);
         for beam in game.pulse_beams(map) {
             self.draw_pulse_beam(map, &view, &beam, game.time);
         }
@@ -422,10 +423,15 @@ impl Frame {
             }
         }
         for trace in &game.traces {
-            if let Some(kind) = trace.explosion
-                && let Some(sprite) = &map.ordnance[kind as usize].explosion
-            {
-                let age = game.time - trace.born;
+            let art = &map.ordnance[trace.explosion as usize];
+            let age = game.time - trace.born;
+            if trace.explosion == crate::game::ordnance::Kind::FlakShell {
+                let progress = age / (trace.expires - trace.born);
+                if let Some(visual) = art.impact_sprite(trace.start, progress, trace.scale) {
+                    self.draw_world_effect(&view, game.time, visual);
+                    continue;
+                }
+            } else if let Some(sprite) = &art.explosion {
                 self.world_sprite(
                     &view,
                     trace.start,
@@ -439,12 +445,8 @@ impl Frame {
                 camera,
                 crate::game::Effect {
                     origin: trace.start,
-                    end: trace.end,
-                    color: if trace.explosion.is_some() {
-                        0xf07130
-                    } else {
-                        0xffdf84
-                    },
+                    end: trace.start,
+                    color: 0xf07130,
                     expires: game.time,
                 },
             );
@@ -683,35 +685,7 @@ impl Frame {
         for effect in game.visible_effects() {
             self.effect(camera, effect);
         }
-        if let Some(assets) = shock::assets(map) {
-            let view = View::camera(camera);
-            game.shock
-                .visuals(assets, game.time, |visual| match visual {
-                    Visual::Sprite {
-                        position,
-                        image,
-                        scale,
-                        glow,
-                    } => self.world_sprite(&view, position, image, scale, glow),
-                    Visual::Ring {
-                        position,
-                        direction,
-                        pose,
-                        scale,
-                        glow,
-                    } => {
-                        let model = view.in_model(position, direction, scale);
-                        self.draw_faces_in_view(
-                            pose.current,
-                            &model,
-                            time,
-                            false,
-                            Some(pose),
-                            Some(glow),
-                        );
-                    }
-                });
-        }
+        self.draw_shock(map, &view, &game.shock, time);
         if let Some(beam) = &game.pulse_beam {
             self.draw_pulse_beam(map, &view, beam, time);
         }
@@ -762,6 +736,36 @@ impl Frame {
             self.draw_scope(map, game.weapon);
         } else if map.hud.crosshair.is_none() {
             self.draw_crosshair();
+        }
+    }
+
+    fn draw_shock(&mut self, map: &Map, view: &View, shots: &shock::Shots, time: f32) {
+        if let Some(assets) = shock::assets(map) {
+            shots.visuals(assets, time, |visual| match visual {
+                Visual::Sprite {
+                    position,
+                    image,
+                    scale,
+                    glow,
+                } => self.world_sprite(view, position, image, scale, glow),
+                Visual::Ring {
+                    position,
+                    direction,
+                    pose,
+                    scale,
+                    glow,
+                } => {
+                    let model = view.in_model(position, direction, scale);
+                    self.draw_faces_in_view(
+                        pose.current,
+                        &model,
+                        time,
+                        false,
+                        Some(pose),
+                        Some(glow),
+                    );
+                }
+            });
         }
     }
 

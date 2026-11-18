@@ -1360,7 +1360,7 @@ impl Practice {
             dt,
             self.time,
             &mut sounds,
-            self.target.as_ref(),
+            self.target.as_mut(),
             &mut self.ordnance,
         );
         blasts.extend(pulse_blast);
@@ -1984,14 +1984,7 @@ impl Practice {
         }
         if weapon == Weapon::Flak {
             self.next_shot = self.time + shot_interval(map, weapon, alternate).unwrap();
-            let forward = camera.look_direction();
-            let right = camera.right();
-            let up = forward.cross(right);
-            for _ in 0..8 {
-                let direction = crate::mover::unit(
-                    forward + right * (self.jitter() * 0.11) + up * (self.jitter() * 0.11),
-                );
-                let variation = (self.jitter() + 1.0) * 0.5;
+            for (direction, variation) in ordnance::flak_pattern(camera, || self.jitter()) {
                 self.ordnance.fire(
                     map,
                     camera,

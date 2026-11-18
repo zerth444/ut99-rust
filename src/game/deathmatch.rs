@@ -9,7 +9,8 @@ mod timestep;
 use super::{
     Item, Pose, Powerup, PulseBeam, Weapon, WeaponAssets, ballistics, decals,
     liquid::{Impact, LiquidState},
-    shock::cylinder_hit,
+    ordnance,
+    shock::{self, cylinder_hit},
 };
 use crate::{
     collision::{PLAYER_HEIGHT, PLAYER_RADIUS, Walker},
@@ -488,11 +489,10 @@ struct Detonation {
 
 pub struct Trace {
     pub start: Vec3,
-    pub end: Vec3,
-    pub explosion: Option<super::ordnance::Kind>,
+    pub explosion: ordnance::Kind,
     pub born: f32,
     pub scale: f32,
-    expires: f32,
+    pub expires: f32,
 }
 
 struct Hit {
@@ -501,6 +501,57 @@ struct Hit {
     owner: Option<usize>,
     damage: u16,
     impulse: Vec3,
+}
+
+struct ShockTargets<'a> {
+    game: &'a mut Match,
+    map: &'a Map,
+    hits: &'a mut Vec<Hit>,
+}
+
+impl shock::Targets for ShockTargets<'_> {
+    fn trace(&self, owner: usize, start: Vec3, delta: Vec3) -> Option<(shock::Target, f32)> {
+        shock::nearest(
+            nearest_hit(&self.game.fighters, owner, start, delta, [0.0, 0.0])
+                .map(|(id, at)| (shock::Target::Pawn(id), at)),
+            self.game
+                .closest_explosive(self.map, start, delta)
+                .map(|(id, at)| (shock::Target::Projectile(id), at)),
+        )
+    }
+
+    fn hit(
+        &mut self,
+        target: shock::Target,
+        owner: usize,
+        damage: u16,
+        direction: Vec3,
+        sounds: &mut SoundEvents,
+    ) -> Option<shock::Blast> {
+        match target {
+            shock::Target::Pawn(victim) => self.hits.push(Hit {
+                owner: Some(owner),
+                victim,
+                damage: damage.saturating_mul(self.game.shock_damage_scale(owner)),
+                impulse: direction * (f32::from(damage) * 3.4),
+                bypass_armor: false,
+            }),
+            shock::Target::Projectile(index) => {
+                let bolt = self.game.bolts.swap_remove(index);
+                self.game.detonate(
+                    self.map,
+                    vec![Detonation {
+                        position: bolt.position,
+                        owner,
+                        payload: bolt.payload,
+                    }],
+                    self.hits,
+                    sounds,
+                );
+            }
+        }
+        None
+    }
 }
 
 pub struct Match {
@@ -514,6 +565,7 @@ pub struct Match {
     pub show_decals: bool,
     pub decals: decals::Marks,
     pub ballistics: ballistics::Effects,
+    pub shock: shock::Shots,
     pub traces: Vec<Trace>,
     bolts: Vec<Bolt>,
     initial_props: Vec<bool>,
@@ -539,6 +591,7 @@ impl Match {
             show_decals: true,
             decals: decals::Marks::default(),
             ballistics: ballistics::Effects::default(),
+            shock: shock::Shots::default(),
             traces: Vec::new(),
             bolts: Vec::new(),
             initial_props: map.props.iter().map(|prop| prop.visible).collect(),
@@ -585,6 +638,7 @@ impl Match {
         self.traces.clear();
         self.decals = decals::Marks::default();
         self.ballistics = ballistics::Effects::default();
+        self.shock = shock::Shots::default();
         self.bolts.clear();
         self.pickups.fill(None);
         for (prop, &visible) in map.props.iter_mut().zip(&self.initial_props) {
@@ -1023,6 +1077,23 @@ impl Match {
             self.detonate(map, vec![detonation], &mut hits, &mut sounds);
         }
         self.move_bolts(map, dt, &mut hits, &mut sounds);
+        let mut shock = std::mem::take(&mut self.shock);
+        let now = self.time;
+        let blasts = shock.advance(
+            map,
+            dt,
+            now,
+            &mut ShockTargets {
+                game: self,
+                map,
+                hits: &mut hits,
+            },
+            &mut sounds,
+        );
+        self.shock = shock;
+        for (owner, blast) in blasts {
+            self.shock_blast(map, owner, blast, &mut hits);
+        }
         for (id, input) in inputs.into_iter().enumerate() {
             if !hits
                 .iter()
@@ -1387,9 +1458,12 @@ impl Match {
                 gravity,
                 rebounds,
             } => {
-                let speed = arsenal::velocity(map, kind);
                 let guided = id == 0 && shot.guided;
-                let count = if matches!(shape, Some(ChargeShape::Volley)) {
+                let flak = (kind == ordnance::Kind::Chunk)
+                    .then(|| ordnance::flak_pattern(&aim, &mut jitter));
+                let count = if let Some(pattern) = &flak {
+                    pattern.len() as u16
+                } else if matches!(shape, Some(ChargeShape::Volley)) {
                     units
                 } else {
                     1
@@ -1402,7 +1476,23 @@ impl Match {
                     } else {
                         0.0
                     };
-                    let offset = kind.launch_offset(&aim, spread * 7.0, variation);
+                    let (aim_direction, variation, lateral) =
+                        flak.as_ref()
+                            .map_or((aim_direction, variation, spread * 7.0), |pattern| {
+                                let (aim_direction, variation) = pattern[usize::from(index)];
+                                (aim_direction, variation, 0.0)
+                            });
+                    let art = &map.ordnance[kind as usize];
+                    let speed = kind.launch_speed(art, variation);
+                    let damage =
+                        if matches!(kind, ordnance::Kind::Chunk | ordnance::Kind::FlakShell) {
+                            art.damage.map_or(damage, |value| {
+                                (value as u16).saturating_mul(if boosted { 3 } else { 1 })
+                            })
+                        } else {
+                            damage
+                        };
+                    let offset = kind.launch_offset(&aim, lateral, variation);
                     let position = map
                         .collision
                         .ray_surface(start, offset)
@@ -1410,11 +1500,22 @@ impl Match {
                     self.bolts.push(Bolt {
                         owner: id,
                         position,
-                        velocity: aim_direction * speed + Vec3(0.0, 0.0, gravity * 115.0),
+                        velocity: aim_direction * speed
+                            + Vec3(
+                                0.0,
+                                0.0,
+                                if kind == ordnance::Kind::FlakShell {
+                                    200.0
+                                } else {
+                                    gravity * 115.0
+                                },
+                            ),
                         born: self.time,
                         expires: self.time
                             + if guided {
                                 guidance::FLIGHT_TIME
+                            } else if kind == ordnance::Kind::Chunk {
+                                ordnance::FLAK_CHUNK_LIFETIME
                             } else if rebounds > 0 && gravity > 0.0 {
                                 2.35
                             } else {
@@ -1436,108 +1537,140 @@ impl Match {
                     });
                 }
             }
-            Path::Trace {
-                range,
-                rays,
-                spread,
-            } => {
-                let right = aim.right();
-                let up = direction.cross(right);
-                for ray in 0..rays {
-                    let spread = if ray == 0 && rays > 1 { 0.0 } else { spread };
-                    let beam = pulse_alt.then(|| PulseBeam::trace(map, &aim, self.time));
-                    let (start, delta) = match (&bullet, &beam) {
-                        (Some(profile), _) => profile.ray(&aim, &mut jitter),
-                        (_, Some(beam)) if beam.blocked => continue,
-                        (_, Some(beam)) => (beam.start, beam.end - beam.start),
-                        _ => (
-                            start,
-                            unit(direction + (right * jitter() + up * jitter()) * spread) * range,
-                        ),
-                    };
-                    let wall = if beam.is_none() {
-                        map.collision.ray_surface(start, delta)
-                    } else {
-                        None
-                    };
-                    let end = wall.map_or(start + delta, |(point, _)| point);
-                    let clipped = end - start;
-                    let target = nearest_hit(&self.fighters, id, start, clipped, [0.0, 0.0]);
-                    let projectile = self.closest_explosive(map, start, clipped);
-                    let intercepted = projectile
-                        .filter(|&(_, at)| target.is_none_or(|(_, victim_at)| at < victim_at));
-                    let fraction = if let Some((projectile, at)) = intercepted {
-                        let bolt = self.bolts.swap_remove(projectile);
-                        self.detonate(
-                            map,
-                            vec![Detonation {
-                                position: bolt.position,
-                                owner: id,
-                                payload: bolt.payload,
-                            }],
-                            hits,
-                            sounds,
+            Path::Trace { range } => {
+                let beam = pulse_alt.then(|| PulseBeam::trace(map, &aim, self.time));
+                let (start, delta) = match (&bullet, &beam) {
+                    (Some(profile), _) => profile.ray(&aim, &mut jitter),
+                    (_, Some(beam)) if beam.blocked => return,
+                    (_, Some(beam)) => (beam.start, beam.end - beam.start),
+                    _ => (start, direction * range),
+                };
+                let wall = if beam.is_none() {
+                    map.collision.ray_surface(start, delta)
+                } else {
+                    None
+                };
+                let end = wall.map_or(start + delta, |(point, _)| point);
+                let clipped = end - start;
+                let target = nearest_hit(&self.fighters, id, start, clipped, [0.0, 0.0]);
+                let projectile = self.closest_explosive(map, start, clipped);
+                let intercepted = projectile
+                    .filter(|&(_, at)| target.is_none_or(|(_, victim_at)| at < victim_at));
+                let fraction = if let Some((projectile, at)) = intercepted {
+                    let bolt = self.bolts.swap_remove(projectile);
+                    self.detonate(
+                        map,
+                        vec![Detonation {
+                            position: bolt.position,
+                            owner: id,
+                            payload: bolt.payload,
+                        }],
+                        hits,
+                        sounds,
+                    );
+                    at
+                } else if let Some((victim, at)) = target {
+                    let point = start + clipped * at;
+                    if bullet.is_some() {
+                        sounds.extend_at(
+                            map.ballistics.flesh.iter().cloned(),
+                            point,
+                            CONTACT_SOUND_RADIUS,
+                            1.0,
                         );
-                        at
-                    } else if let Some((victim, at)) = target {
-                        let point = start + clipped * at;
-                        if bullet.is_some() {
-                            sounds.extend_at(
-                                map.ballistics.flesh.iter().cloned(),
-                                point,
-                                CONTACT_SOUND_RADIUS,
-                                1.0,
-                            );
-                        }
-                        let headshot = weapon == Weapon::Sniper
-                            && point.2 - self.fighters[victim].walker.position.2
-                                > 0.62 * PLAYER_HEIGHT;
-                        hits.push(Hit {
-                            bypass_armor: false,
-                            victim,
-                            owner: Some(id),
-                            damage: if headshot {
-                                if boosted { 300 } else { 100 }
-                            } else {
-                                damage
-                            },
-                            impulse: unit(delta) * (f32::from(base_damage) * 3.4),
-                        });
-                        at
-                    } else {
-                        1.0
-                    };
-                    if ray == 0 && bullet.is_some() {
-                        self.ballistics.bullet(
-                            map,
-                            &mut self.decals,
-                            &aim,
-                            weapon,
-                            self.time,
-                            ballistics::Bullet {
-                                start,
-                                delta,
-                                visible: clipped * fraction,
-                                wall: wall.filter(|_| target.is_none() && intercepted.is_none()),
-                                case_origin,
-                            },
-                            &mut self.fighters[id].bullet_cadence,
-                            sounds,
-                            &mut jitter,
-                        );
-                    } else if ray == 0 && weapon != Weapon::Hammer && !pulse_alt {
-                        self.traces.push(Trace {
-                            start,
-                            end: start + clipped * fraction,
-                            explosion: None,
-                            born: self.time,
-                            scale: 1.0,
-                            expires: self.time + 0.065,
-                        });
                     }
+                    let headshot = weapon == Weapon::Sniper
+                        && point.2 - self.fighters[victim].walker.position.2 > 0.62 * PLAYER_HEIGHT;
+                    hits.push(Hit {
+                        bypass_armor: false,
+                        victim,
+                        owner: Some(id),
+                        damage: if headshot {
+                            if boosted { 300 } else { 100 }
+                        } else {
+                            damage
+                        },
+                        impulse: unit(delta) * (f32::from(base_damage) * 3.4),
+                    });
+                    at
+                } else {
+                    1.0
+                };
+                if bullet.is_some() {
+                    self.ballistics.bullet(
+                        map,
+                        &mut self.decals,
+                        &aim,
+                        weapon,
+                        self.time,
+                        ballistics::Bullet {
+                            start,
+                            delta,
+                            visible: clipped * fraction,
+                            wall: wall.filter(|_| target.is_none() && intercepted.is_none()),
+                            case_origin,
+                        },
+                        &mut self.fighters[id].bullet_cadence,
+                        sounds,
+                        &mut jitter,
+                    );
+                }
+            }
+            Path::Shock => {
+                let now = self.time;
+                let mut shock = std::mem::take(&mut self.shock);
+                let (blast, combo) = shock.fire_at(
+                    map,
+                    &aim,
+                    id,
+                    alt,
+                    now,
+                    &mut ShockTargets {
+                        game: self,
+                        map,
+                        hits,
+                    },
+                    sounds,
+                );
+                self.shock = shock;
+                if combo {
+                    self.fighters[id].inventory.spend(Weapon::Shock, 2);
+                }
+                if let Some(blast) = blast {
+                    self.shock_blast(map, id, blast, hits);
                 }
             }
             Path::Zoom => unreachable!(),
+        }
+    }
+
+    fn shock_damage_scale(&self, owner: usize) -> u16 {
+        if self.fighters[owner].amp_left(self.time) > 0.0 {
+            3
+        } else {
+            1
+        }
+    }
+
+    fn shock_blast(&self, map: &Map, owner: usize, blast: shock::Blast, hits: &mut Vec<Hit>) {
+        let scale = self.shock_damage_scale(owner);
+        for (victim, fighter) in self
+            .fighters
+            .iter()
+            .enumerate()
+            .filter(|(_, fighter)| fighter.health > 0)
+        {
+            if let Some((damage, momentum)) =
+                blast.hit_player(&map.collision, fighter.walker.position)
+            {
+                hits.push(Hit {
+                    owner: Some(owner),
+                    victim,
+                    damage: damage.saturating_mul(scale),
+                    impulse: momentum * map.collision.profile.mass.max(1.0).recip(),
+                    bypass_armor: false,
+                });
+            }
         }
     }
 
@@ -1561,11 +1694,18 @@ impl Match {
 
     fn move_bolts(&mut self, map: &Map, dt: f32, hits: &mut Vec<Hit>, sounds: &mut SoundEvents) {
         let mut detonations = Vec::new();
+        let mut fragments = Vec::new();
         self.bolts.retain_mut(|bolt| {
             let payload = &mut bolt.payload;
             let art = &map.ordnance[payload.kind as usize];
             let zone = map.collision.regions.at(bolt.position);
-            bolt.velocity = bolt.velocity + zone.gravity * (payload.gravity * dt);
+            let chunk = payload.kind == ordnance::Kind::Chunk;
+            if chunk && self.time >= bolt.expires {
+                return false;
+            }
+            let ricocheted = chunk && payload.rebounds < ordnance::FLAK_CHUNK_REBOUNDS;
+            let gravity = if ricocheted { 1.0 } else { payload.gravity };
+            bolt.velocity = bolt.velocity + zone.gravity * (gravity * dt);
             let delta = bolt.velocity * dt;
             let radius = art.collision_radius.max(0.0) * payload.scale;
             let height = art.collision_height.max(0.0) * payload.scale;
@@ -1575,7 +1715,7 @@ impl Match {
             let end = wall.map_or(bolt.position + delta, |(point, _)| point);
             let target = nearest_hit(
                 &self.fighters,
-                bolt.owner,
+                if ricocheted { usize::MAX } else { bolt.owner },
                 bolt.position,
                 end - bolt.position,
                 [radius, height],
@@ -1586,15 +1726,25 @@ impl Match {
                     if payload.rebounds > 0 {
                         payload.rebounds -= 1;
                         bolt.position = contact + normal * 0.7;
-                        let retain = if payload.gravity > 0.0 { 0.64 } else { 0.95 };
-                        bolt.velocity =
-                            (bolt.velocity - normal * (2.0 * bolt.velocity.dot(normal))) * retain;
-                        sounds.extend_at(
-                            art.contact.iter().cloned(),
-                            contact,
-                            CONTACT_SOUND_RADIUS,
-                            1.0,
-                        );
+                        let retain = if chunk {
+                            0.8
+                        } else if payload.gravity > 0.0 {
+                            0.64
+                        } else {
+                            0.95
+                        };
+                        bolt.velocity = ordnance::ricochet(bolt.velocity, normal, retain);
+                        if chunk && bolt.velocity.dot(bolt.velocity) < 10_000.0 {
+                            return false;
+                        }
+                        if !ricocheted {
+                            sounds.extend_at(
+                                art.contact.iter().cloned(),
+                                contact,
+                                CONTACT_SOUND_RADIUS,
+                                1.0,
+                            );
+                        }
                         return true;
                     }
                 } else {
@@ -1606,12 +1756,44 @@ impl Match {
                 bolt.position + (end - bolt.position) * fraction
             }) - unit(bolt.velocity) * 0.5;
             if payload.blast > 0.0 {
+                if payload.kind == ordnance::Kind::FlakShell
+                    && target.is_none()
+                    && !expired
+                    && let Some((point, normal)) = wall
+                {
+                    let chunk = &map.ordnance[ordnance::Kind::Chunk as usize];
+                    let scale = self.fighters[bolt.owner].amp_left(self.time) > 0.0;
+                    let damage = (chunk.damage.unwrap_or(16.0) as u16).saturating_mul(if scale {
+                        3
+                    } else {
+                        1
+                    });
+                    fragments.extend(ordnance::flak_fragments(normal).map(|direction| Bolt {
+                        owner: bolt.owner,
+                        position: point + normal * 0.5 + direction * 2.0,
+                        velocity: direction * ordnance::Kind::Chunk.launch_speed(chunk, 0.5),
+                        born: self.time,
+                        expires: self.time + ordnance::FLAK_CHUNK_LIFETIME,
+                        payload: ProjectilePayload {
+                            kind: ordnance::Kind::Chunk,
+                            damage,
+                            blast: 0.0,
+                            gravity: 0.0,
+                            rebounds: ordnance::FLAK_CHUNK_REBOUNDS,
+                            scale: 1.0,
+                        },
+                        pilot: None,
+                    }));
+                }
                 detonations.push(Detonation {
                     position,
                     owner: bolt.owner,
                     payload: *payload,
                 });
             } else if let Some((victim, _)) = target {
+                if chunk && bolt.velocity.dot(bolt.velocity) <= 200.0 * 200.0 {
+                    return false;
+                }
                 hits.push(Hit {
                     bypass_armor: false,
                     victim,
@@ -1630,6 +1812,7 @@ impl Match {
             false
         });
         self.detonate(map, detonations, hits, sounds);
+        self.bolts.extend(fragments);
     }
 
     fn detonate(
@@ -1668,13 +1851,17 @@ impl Match {
                     impulse: unit(delta) * (370.0 * strength),
                 });
             }
+            let (duration, scale) = if payload.kind == ordnance::Kind::FlakShell {
+                ordnance::FLAK_SHELL_IMPACT
+            } else {
+                (0.48, payload.scale)
+            };
             self.traces.push(Trace {
                 start: position,
-                end: position,
-                explosion: Some(payload.kind),
+                explosion: payload.kind,
                 born: self.time,
-                scale: payload.scale,
-                expires: self.time + 0.48,
+                scale,
+                expires: self.time + duration,
             });
             sounds.extend_at(art.sound.iter().cloned(), position, BLAST_SOUND_RADIUS, 1.0);
             self.bolts.retain(|bolt| {
@@ -1926,9 +2113,23 @@ impl Match {
                     if map.collision.ray(eye.position, aim).is_none() {
                         delta = aim;
                     }
-                    speed * if gravity > 0.0 { 0.95 } else { 1.45 }
+                    if kind == ordnance::Kind::Chunk {
+                        1100.0
+                    } else {
+                        speed * if gravity > 0.0 { 0.95 } else { 1.45 }
+                    }
                 }
                 Path::Trace { range, .. } => range,
+                Path::Shock if alt => {
+                    let speed = shock::assets(map).map_or(1000.0, |assets| assets.speed);
+                    let aim = delta + (ai::intercept(delta, velocity, speed) - delta) * skill.lead;
+                    clear = range > 90.0;
+                    if map.collision.ray(eye.position, aim).is_none() {
+                        delta = aim;
+                    }
+                    speed * 1.45
+                }
+                Path::Shock => 10_000.0,
                 Path::Zoom => 0.0,
             };
             let strafe = (self.time * 1.75 + id as f32 * 1.7).sin();
@@ -2100,28 +2301,38 @@ impl Match {
         let threat = self
             .bolts
             .iter()
-            .filter_map(|bolt| {
-                if bolt.owner == id || self.time - bolt.born < skill.reaction.min(0.16) {
+            .map(|bolt| {
+                (
+                    bolt.owner,
+                    bolt.position,
+                    bolt.velocity,
+                    bolt.born,
+                    bolt.payload.blast,
+                )
+            })
+            .chain(
+                self.shock
+                    .incoming(shock::assets(map).map_or(1000.0, |assets| assets.speed)),
+            )
+            .filter_map(|(owner, location, velocity, born, blast)| {
+                if owner == id || self.time - born < skill.reaction.min(0.16) {
                     return None;
                 }
-                let relative = bolt.velocity - fighter.walker.velocity();
+                let relative = velocity - fighter.walker.velocity();
                 let speed_squared = relative.dot(relative);
                 if speed_squared < 100.0 {
                     return None;
                 }
-                let offset = bolt.position - position;
+                let offset = location - position;
                 let closest = -offset.dot(relative) / speed_squared;
                 if !(0.02..=skill.evade_window).contains(&closest) {
                     return None;
                 }
                 let pass = offset + relative * closest;
-                let clearance = 43.0 + bolt.payload.blast.min(150.0) * 0.53;
+                let clearance = 43.0 + blast.min(150.0) * 0.53;
                 if pass.dot(pass) >= clearance * clearance
                     || map.collision.ray(position, offset).is_some()
-                    || map
-                        .collision
-                        .ray(bolt.position, bolt.velocity * closest)
-                        .is_some()
+                    || map.collision.ray(location, velocity * closest).is_some()
                 {
                     return None;
                 }
@@ -2772,7 +2983,7 @@ mod tests {
         game.step(&mut map, detonate, dt);
         assert!(game.guidance_left().is_none() && game.bolts.is_empty());
         assert!(game.guidance_lost_until > game.time);
-        assert!(game.traces.iter().any(|trace| trace.explosion.is_some()));
+        assert!(!game.traces.is_empty());
         assert!(
             distance_squared(
                 game.player_view(&map).position,
@@ -2849,7 +3060,7 @@ mod tests {
                         &mut sounds,
                     );
                     assert!(game.bolts.is_empty());
-                    assert!(game.traces.iter().any(|trace| trace.explosion.is_some()));
+                    assert!(!game.traces.is_empty());
                 }
                 "wall" => {
                     map.collision
@@ -2861,7 +3072,7 @@ mod tests {
                         }
                     }
                     assert!(game.bolts.is_empty());
-                    assert!(game.traces.iter().any(|trace| trace.explosion.is_some()));
+                    assert!(!game.traces.is_empty());
                 }
                 _ => unreachable!(),
             }
@@ -2873,6 +3084,128 @@ mod tests {
                 ) < 0.01
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY assets"]
+    fn shock_combo_credits_beam_shooter_when_the_other_fighter_launched_the_bolt() {
+        let (map, mut game) = flight_fixture();
+        game.time = 2.0;
+        for (id, x) in [(0, 0.0), (1, 160.0)] {
+            let fighter = &mut game.fighters[id];
+            fighter.walker = Walker::spawn(&map.collision, Vec3(x, 0.0, 39.2));
+            fighter.yaw = 0.0;
+            fighter.inventory.pickup(&map.arsenal, Weapon::Shock);
+            fighter.weapon = Weapon::Shock;
+        }
+        let ammo = game.fighters[0].ammo().unwrap();
+        let mut hits = Vec::new();
+        let mut sounds = SoundEvents::default();
+        game.fire(
+            &map,
+            1,
+            Command {
+                alternate: true,
+                ..Command::default()
+            },
+            &mut hits,
+            &mut sounds,
+        );
+        assert_eq!(game.shock.incoming(1000.0).next().unwrap().0, 1);
+        game.fighters[1].walker.position = Vec3(190.0, 65.0, 39.2);
+        game.fire(
+            &map,
+            0,
+            Command {
+                primary: true,
+                ..Command::default()
+            },
+            &mut hits,
+            &mut sounds,
+        );
+        assert!(game.shock.incoming(1000.0).next().is_none());
+        assert_eq!(game.fighters[0].ammo(), Some(ammo - 3));
+        let assets = shock::assets(&map).unwrap();
+        assert!(
+            sounds
+                .waves()
+                .any(|wave| std::sync::Arc::ptr_eq(wave, assets.combo_sound.as_ref().unwrap()))
+        );
+        let mut visuals = 0;
+        game.shock
+            .visuals(assets, game.time + 0.05, |_| visuals += 1);
+        assert!(visuals > 1);
+        for hit in hits {
+            game.apply_hit(&map, hit, &mut sounds);
+        }
+        assert_eq!(game.fighters[1].health, 0);
+        assert_eq!(game.fighters[0].score, 1);
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY assets"]
+    fn flak_launches_flying_chunks_and_shell_spawns_wall_fragments() {
+        let (mut map, mut game) = flight_fixture();
+        map.collision
+            .add_box(Vec3(120.0, -140.0, 0.0), Vec3(138.0, 140.0, 200.0));
+        game.time = 2.0;
+        let fighter = &mut game.fighters[0];
+        fighter.inventory.pickup(&map.arsenal, Weapon::Flak);
+        fighter.weapon = Weapon::Flak;
+        let ammo = fighter.ammo().unwrap();
+        let mut hits = Vec::new();
+        let mut sounds = SoundEvents::default();
+        game.fire(
+            &map,
+            0,
+            Command {
+                primary: true,
+                ..Command::default()
+            },
+            &mut hits,
+            &mut sounds,
+        );
+        assert!(
+            hits.is_empty(),
+            "launch must not already deal damage along the flight path"
+        );
+        assert_eq!(game.bolts.len(), 8);
+        assert!(
+            game.bolts
+                .iter()
+                .all(|bolt| bolt.payload.kind == ordnance::Kind::Chunk && bolt.velocity.0 > 0.0)
+        );
+        game.time += 0.07;
+        game.move_bolts(&map, 0.07, &mut hits, &mut sounds);
+        assert_eq!(game.bolts.len(), 8);
+        assert!(game.bolts.iter().all(|bolt| bolt.velocity.0 < 0.0
+            && bolt.payload.rebounds == ordnance::FLAK_CHUNK_REBOUNDS - 1));
+
+        game.bolts.clear();
+        game.time = 4.0;
+        game.fire(
+            &map,
+            0,
+            Command {
+                alternate: true,
+                ..Command::default()
+            },
+            &mut hits,
+            &mut sounds,
+        );
+        assert_eq!(game.bolts.len(), 1);
+        game.time += 0.15;
+        game.move_bolts(&map, 0.15, &mut hits, &mut sounds);
+        assert_eq!(game.fighters[0].ammo(), Some(ammo - 2));
+        assert_eq!(game.bolts.len(), 5);
+        assert!(game.bolts.iter().all(|bolt| bolt.owner == 0
+            && bolt.payload.kind == ordnance::Kind::Chunk
+            && bolt.velocity.0 < 0.0));
+        assert!(
+            game.traces
+                .iter()
+                .any(|trace| trace.explosion == ordnance::Kind::FlakShell)
+        );
     }
 
     #[test]
@@ -3225,12 +3558,16 @@ mod tests {
         let mut orientation = None;
         for start in 0..map.starts.len() {
             let pawn = Fighter::spawn(&map, start, 0.0);
-            let eye = pawn.camera(&map).position;
             for index in 0..4 {
                 let yaw = (index as f32) * std::f32::consts::FRAC_PI_2;
                 let direction = Vec3(yaw.cos(), yaw.sin(), 0.0);
-                if pawn.walker.grounded && map.collision.ray(eye, direction * 435.0).is_none() {
-                    orientation = Some((start, eye, yaw, direction));
+                let camera = Camera {
+                    yaw,
+                    ..pawn.camera(&map)
+                };
+                let origin = shock::assets(&map).unwrap().beam_origin(&camera);
+                if pawn.walker.grounded && map.collision.ray(origin, direction * 435.0).is_none() {
+                    orientation = Some((start, origin, yaw, direction));
                     break;
                 }
             }
@@ -3296,13 +3633,7 @@ mod tests {
                 &mut sounds,
             );
             assert_eq!(game.bolts.len(), usize::from(cover));
-            assert_eq!(
-                game.traces
-                    .iter()
-                    .filter(|trace| trace.explosion.is_some())
-                    .count(),
-                if cover { 1 } else { 2 }
-            );
+            assert_eq!(game.traces.len(), if cover { 1 } else { 2 });
             for hit in hits {
                 game.apply_hit(&map, hit, &mut sounds);
             }
@@ -3578,12 +3909,15 @@ mod tests {
                 );
                 match shot.path {
                     Path::Missile { kind, .. } => {
-                        assert_eq!(game.bolts.len(), bolts_before + 1, "{weapon:?}");
+                        let count = if kind == ordnance::Kind::Chunk { 8 } else { 1 };
+                        assert_eq!(game.bolts.len(), bolts_before + count, "{weapon:?}");
                         let bolt = game.bolts.last().unwrap();
                         assert_eq!(bolt.owner, 1);
                         assert!(bolt.payload.kind == kind);
                     }
-                    Path::Trace { .. } => assert_eq!(game.fighters[1].fired_at, game.time),
+                    Path::Trace { .. } | Path::Shock => {
+                        assert_eq!(game.fighters[1].fired_at, game.time)
+                    }
                     Path::Zoom => assert!(game.fighters[1].zoomed),
                 }
             }

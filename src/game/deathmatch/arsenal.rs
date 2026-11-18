@@ -141,8 +141,6 @@ pub(super) fn charge_profile(weapon: Weapon, alt: bool) -> Option<ChargeProfile>
 pub(super) enum Path {
     Trace {
         range: f32,
-        rays: u8,
-        spread: f32,
     },
     Missile {
         kind: Kind,
@@ -150,22 +148,19 @@ pub(super) enum Path {
         gravity: f32,
         rebounds: u8,
     },
+    Shock,
     Zoom,
 }
 
 pub(super) fn shot(weapon: Weapon, alt: bool) -> Shot {
-    let bullet = || trace(0, 0.0, 1, super::ballistics::BulletProfile::RANGE, 1, 0.0);
-    fn trace(damage: u16, interval: f32, ammo: u16, range: f32, rays: u8, spread: f32) -> Shot {
+    let bullet = || trace(0, 0.0, 1, super::ballistics::BulletProfile::RANGE);
+    fn trace(damage: u16, interval: f32, ammo: u16, range: f32) -> Shot {
         Shot {
             damage,
             interval,
             ammo,
             guided: false,
-            path: Path::Trace {
-                range,
-                rays,
-                spread,
-            },
+            path: Path::Trace { range },
         }
     }
     fn missile(
@@ -192,20 +187,36 @@ pub(super) fn shot(weapon: Weapon, alt: bool) -> Shot {
     }
     use Kind::*;
     match (weapon, alt) {
-        (Weapon::Hammer, false) => trace(44, 0.58, 0, 96.0, 1, 0.0),
-        (Weapon::Hammer, true) => trace(28, 0.34, 0, 78.0, 1, 0.0),
+        (Weapon::Hammer, false) => trace(44, 0.58, 0, 96.0),
+        (Weapon::Hammer, true) => trace(28, 0.34, 0, 78.0),
         (Weapon::Enforcer, _) => bullet(),
         (Weapon::Bio, false) => missile(28, 0.36, 1, Gel, 44.0, 0.72, 0),
         (Weapon::Bio, true) => missile(42, 0.88, 1, Glob, 76.0, 0.8, 0),
-        (Weapon::Shock, false) => trace(39, 0.59, 1, 6500.0, 1, 0.0),
-        (Weapon::Shock, true) => missile(58, 0.71, 1, Pulse, 145.0, 0.0, 0),
+        (Weapon::Shock, _) => Shot {
+            damage: 40,
+            interval: super::super::shock::fallback_cooldown(alt),
+            ammo: 1,
+            guided: false,
+            path: Path::Shock,
+        },
         (Weapon::Pulse, false) => missile(16, 0.15, 1, Pulse, 0.0, 0.0, 0),
-        (Weapon::Pulse, true) => trace(12, 0.24, 1, super::PulseBeam::RANGE, 1, 0.0),
+        (Weapon::Pulse, true) => trace(12, 0.24, 1, super::PulseBeam::RANGE),
         (Weapon::Ripper, false) => missile(33, 0.41, 1, Razor, 0.0, 0.0, 3),
         (Weapon::Ripper, true) => missile(42, 0.58, 1, RazorAlt, 115.0, 0.0, 0),
         (Weapon::Minigun, _) => bullet(),
-        (Weapon::Flak, false) => trace(12, 0.66, 1, 1100.0, 8, 0.16),
-        (Weapon::Flak, true) => missile(86, 0.85, 1, FlakShell, 170.0, 0.8, 0),
+        (Weapon::Flak, false) => missile(
+            16,
+            0.82,
+            1,
+            Chunk,
+            0.0,
+            0.0,
+            super::super::ordnance::FLAK_CHUNK_REBOUNDS,
+        ),
+        (Weapon::Flak, true) => {
+            let (radius, damage, _) = super::super::ordnance::FLAK_SHELL_BLAST;
+            missile(damage as u16, 0.92, 1, FlakShell, radius, 1.0, 0)
+        }
         (Weapon::Rocket, false) => missile(83, 0.92, 1, Rocket, 207.0, 0.0, 0),
         (Weapon::Rocket, true) => missile(80, 0.98, 1, Grenade, 190.0, 0.87, 2),
         (Weapon::Sniper, false) => bullet(),
@@ -225,10 +236,7 @@ pub(super) fn shot(weapon: Weapon, alt: bool) -> Shot {
 }
 
 pub(super) fn velocity(map: &Map, kind: Kind) -> f32 {
-    map.ordnance[kind as usize]
-        .speed
-        .filter(|&speed| speed.is_finite() && speed > 0.0)
-        .unwrap_or(1050.0)
+    kind.launch_speed(&map.ordnance[kind as usize], 0.5)
 }
 
 pub(super) fn bot_shot(weapon: Weapon, ammo: u16, range: f32) -> (bool, Shot) {

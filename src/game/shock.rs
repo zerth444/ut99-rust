@@ -48,6 +48,15 @@ impl Default for Assets {
     }
 }
 
+impl Assets {
+    pub(super) fn beam_origin(&self, camera: &Camera) -> Vec3 {
+        let direction = camera.look_direction();
+        let right = camera.right();
+        let Vec3(_, y, z) = self.fire_offset;
+        camera.position + right * y + direction.cross(right) * z
+    }
+}
+
 pub struct BeamArt {
     pub texture: Arc<Texture>,
     pub points: Vec<Vec3>,
@@ -140,6 +149,7 @@ impl Blast {
 }
 
 struct Bolt {
+    owner: usize,
     position: Vec3,
     direction: Vec3,
     born: f32,
@@ -225,7 +235,94 @@ fn blast_sound(assets: &Assets) -> Option<Arc<Wave>> {
     assets.blast.as_ref()?.sound.clone()
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum Target {
+    Pawn(usize),
+    Projectile(usize),
+}
+
+pub(super) trait Targets {
+    fn trace(&self, owner: usize, start: Vec3, delta: Vec3) -> Option<(Target, f32)>;
+    fn hit(
+        &mut self,
+        target: Target,
+        owner: usize,
+        damage: u16,
+        direction: Vec3,
+        sounds: &mut SoundEvents,
+    ) -> Option<Blast>;
+    fn local(&self, owner: usize) -> bool {
+        owner == 0
+    }
+}
+
+pub(super) fn nearest(
+    pawn: Option<(Target, f32)>,
+    projectile: Option<(Target, f32)>,
+) -> Option<(Target, f32)> {
+    projectile
+        .filter(|&(_, at)| pawn.is_none_or(|(_, other)| at < other))
+        .or(pawn)
+}
+
+struct PracticeTargets<'a> {
+    map: &'a Map,
+    pawn: Option<&'a mut super::TrainingTarget>,
+    ordnance: &'a mut super::ordnance::Shots,
+    now: f32,
+}
+
+impl Targets for PracticeTargets<'_> {
+    fn trace(&self, _: usize, start: Vec3, delta: Vec3) -> Option<(Target, f32)> {
+        nearest(
+            self.pawn
+                .as_ref()
+                .and_then(|pawn| pawn.ray(start, delta))
+                .map(|at| (Target::Pawn(0), at)),
+            self.ordnance
+                .trace_target(&self.map.ordnance, start, delta)
+                .map(|(index, at)| (Target::Projectile(index), at)),
+        )
+    }
+
+    fn hit(
+        &mut self,
+        target: Target,
+        _: usize,
+        damage: u16,
+        _: Vec3,
+        sounds: &mut SoundEvents,
+    ) -> Option<Blast> {
+        match target {
+            Target::Pawn(_) => {
+                if let Some(pawn) = &mut self.pawn {
+                    pawn.damage(damage);
+                }
+                None
+            }
+            Target::Projectile(index) => {
+                self.ordnance
+                    .damage_target(&self.map.ordnance, index, damage, self.now, sounds)
+            }
+        }
+    }
+}
 impl Shots {
+    pub(super) fn incoming(
+        &self,
+        speed: f32,
+    ) -> impl Iterator<Item = (usize, Vec3, Vec3, f32, f32)> + '_ {
+        self.bolts.iter().map(move |bolt| {
+            (
+                bolt.owner,
+                bolt.position,
+                bolt.direction * speed,
+                bolt.born,
+                70.0,
+            )
+        })
+    }
+
     pub(super) fn deflect(&mut self, map: &Map, camera: &Camera) {
         for bolt in &mut self.bolts {
             let speed = assets(map).map_or(1000.0, |art| art.speed);
@@ -248,68 +345,76 @@ impl Shots {
         pawn: Option<&mut super::TrainingTarget>,
         ordnance: &mut super::ordnance::Shots,
     ) -> Option<Blast> {
+        let mut targets = PracticeTargets {
+            map,
+            pawn,
+            ordnance,
+            now,
+        };
+        let (blast, combo) = self.fire_at(map, camera, 0, alternate, now, &mut targets, sounds);
+        if combo && *ammo >= 2 {
+            *ammo -= 2;
+        }
+        blast
+    }
+
+    pub(super) fn fire_at(
+        &mut self,
+        map: &Map,
+        camera: &Camera,
+        owner: usize,
+        alternate: bool,
+        now: f32,
+        targets: &mut impl Targets,
+        sounds: &mut SoundEvents,
+    ) -> (Option<Blast>, bool) {
         let fallback = Assets::default();
         let assets = assets(map).unwrap_or(&fallback);
         let direction = camera.look_direction();
-        let right = camera.right();
-        let up = direction.cross(right);
-        let Vec3(x, y, z) = assets.fire_offset;
-        let start = camera.position + right * y + up * z;
+        let x = assets.fire_offset.0;
+        let start = assets.beam_origin(camera);
         if alternate {
             let muzzle = start + direction * x;
-            let offset = muzzle - camera.position;
-            if let Some((point, normal)) = map.collision.ray_surface(camera.position, offset) {
-                self.rings.push(Ring {
-                    impact: Impact::Wall,
-                    position: point + normal * 8.0,
-                    direction,
-                    born: now,
-                });
-                sounds.extend_at(
-                    assets.hit_sound.iter().cloned(),
-                    point,
-                    CONTACT_SOUND_RADIUS,
-                    1.0,
-                );
-                sounds.extend_at(blast_sound(assets), point, BLAST_SOUND_RADIUS, 1.0);
-                return Some(Blast::new(point, assets, false));
+            if let Some((point, normal)) = map
+                .collision
+                .ray_surface(camera.position, muzzle - camera.position)
+            {
+                let blast = self.bolt_impact(assets, point, normal * 8.0, direction, now, sounds);
+                return (Some(blast), false);
             }
             self.bolts.push(Bolt {
+                owner,
                 position: muzzle,
                 direction,
                 born: now,
             });
-            return None;
+            return (None, false);
         }
 
-        let hit = map.collision.ray_surface(start, direction * 10_000.0);
-        let (end, normal) = hit.unwrap_or((start + direction * 10_000.0, direction * -1.0));
+        let ray = direction * 10_000.0;
+        let (end, normal) = map
+            .collision
+            .ray_surface(start, ray)
+            .unwrap_or((start + ray, direction * -1.0));
         let delta = end - start;
         let bolt_target = self
             .bolts
             .iter()
             .enumerate()
-            .filter_map(|(i, bolt)| {
-                let fraction = cylinder_hit(
+            .filter_map(|(index, bolt)| {
+                let at = cylinder_hit(
                     start - bolt.position,
                     delta,
                     assets.radius,
                     assets.half_height,
                 )?;
-                (fraction < 1.0).then_some((i, fraction))
+                (at < 1.0).then_some((index, at))
             })
-            .min_by(|(_, a), (_, b)| a.total_cmp(b));
-        let pawn_fraction = pawn.as_ref().and_then(|pawn| pawn.ray(start, delta));
-        let projectile = ordnance.trace_target(&map.ordnance, start, delta);
-        let mut blast = None;
-        let beam_end = if let Some((index, fraction)) = bolt_target
-            && pawn_fraction.is_none_or(|pawn| fraction < pawn)
-            && projectile.is_none_or(|(_, projectile)| fraction < projectile)
-        {
-            let bolt = self.bolts.remove(index);
-            if *ammo >= 2 {
-                *ammo -= 2;
-            }
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        let target = targets.trace(owner, start, delta);
+        let combo = bolt_target.filter(|&(_, at)| target.is_none_or(|(_, other)| at < other));
+        let (beam_end, blast) = if let Some((index, at)) = combo {
+            let bolt = self.bolts.swap_remove(index);
             self.rings.push(Ring {
                 impact: Impact::Combo,
                 position: bolt.position,
@@ -322,35 +427,70 @@ impl Shots {
                 BLAST_SOUND_RADIUS,
                 1.0,
             );
-            blast = Some(Blast::new(bolt.position, assets, true));
-            start + delta * fraction
-        } else if let Some((index, fraction)) = projectile
-            && pawn_fraction.is_none_or(|pawn| fraction < pawn)
-        {
-            blast = ordnance.damage_target(&map.ordnance, index, 40, now, sounds);
-            start + delta * fraction
+            (
+                start + delta * at,
+                Some(Blast::new(bolt.position, assets, true)),
+            )
         } else {
-            let (end, normal) = if let (Some(pawn), Some(fraction)) = (pawn, pawn_fraction) {
-                pawn.damage(40);
-                (start + delta * fraction, direction * -1.0)
-            } else {
-                (end, normal)
+            let (end, normal, blob, ring) = match target {
+                Some((target, at)) => {
+                    let point = start + delta * at;
+                    let blast = targets.hit(target, owner, 40, direction, sounds);
+                    (
+                        point,
+                        direction * -1.0,
+                        blast,
+                        matches!(target, Target::Pawn(_)),
+                    )
+                }
+                None => (end, normal, None, true),
             };
-            self.rings.push(Ring {
-                impact: Impact::Beam,
-                position: end + normal * 8.0,
-                direction: normal,
-                born: now,
-            });
-            end
+            if ring {
+                self.rings.push(Ring {
+                    impact: Impact::Beam,
+                    position: end + normal * 8.0,
+                    direction: normal,
+                    born: now,
+                });
+            }
+            (end, blob)
         };
         self.beams.push(Beam {
             start: start + direction * (x + 20.0),
             end: beam_end,
             born: now,
         });
-        sounds.extend(blast_sound(assets));
-        blast
+        if targets.local(owner) {
+            sounds.extend(blast_sound(assets));
+        } else {
+            sounds.extend_at(blast_sound(assets), start, CONTACT_SOUND_RADIUS, 1.0);
+        }
+        (blast, combo.is_some())
+    }
+
+    fn bolt_impact(
+        &mut self,
+        assets: &Assets,
+        position: Vec3,
+        offset: Vec3,
+        direction: Vec3,
+        now: f32,
+        sounds: &mut SoundEvents,
+    ) -> Blast {
+        self.rings.push(Ring {
+            impact: Impact::Wall,
+            position: position + offset,
+            direction,
+            born: now,
+        });
+        sounds.extend_at(
+            assets.hit_sound.iter().cloned(),
+            position,
+            CONTACT_SOUND_RADIUS,
+            1.0,
+        );
+        sounds.extend_at(blast_sound(assets), position, BLAST_SOUND_RADIUS, 1.0);
+        Blast::new(position, assets, false)
     }
 
     pub(super) fn update(
@@ -359,9 +499,29 @@ impl Shots {
         dt: f32,
         now: f32,
         sounds: &mut SoundEvents,
-        pawn: Option<&super::TrainingTarget>,
+        pawn: Option<&mut super::TrainingTarget>,
         ordnance: &mut super::ordnance::Shots,
     ) -> Vec<Blast> {
+        let mut targets = PracticeTargets {
+            map,
+            pawn,
+            ordnance,
+            now,
+        };
+        self.advance(map, dt, now, &mut targets, sounds)
+            .into_iter()
+            .map(|(_, blast)| blast)
+            .collect()
+    }
+
+    pub(super) fn advance(
+        &mut self,
+        map: &Map,
+        dt: f32,
+        now: f32,
+        targets: &mut impl Targets,
+        sounds: &mut SoundEvents,
+    ) -> Vec<(usize, Blast)> {
         let fallback = Assets::default();
         let assets = assets(map).unwrap_or(&fallback);
         self.rings
@@ -372,70 +532,49 @@ impl Shots {
             })
         });
         let mut blasts = Vec::new();
-        self.bolts.retain_mut(|bolt| {
+        let mut index = 0;
+        while index < self.bolts.len() {
+            let bolt = &mut self.bolts[index];
             if now - bolt.born >= assets.lifetime {
-                return false;
+                self.bolts.swap_remove(index);
+                continue;
             }
             let delta = bolt.direction * (assets.speed * dt);
-            let hit = map.collision.ray_surface(bolt.position, delta);
-            let visible = hit.map_or(delta, |(point, _)| point - bolt.position);
-            let projectile = ordnance.trace_target(&map.ordnance, bolt.position, visible);
-            let pawn_fraction = pawn.and_then(|pawn| pawn.ray(bolt.position, visible));
-            if let Some((index, fraction)) = projectile
-                && pawn_fraction.is_none_or(|pawn| fraction < pawn)
-            {
-                let position = bolt.position + visible * fraction;
-                blasts.extend(ordnance.damage_target(
-                    &map.ordnance,
-                    index,
-                    assets.damage as u16,
-                    now,
-                    sounds,
-                ));
-                blasts.push(Blast::new(position, assets, false));
-                self.rings.push(Ring {
-                    impact: Impact::Wall,
-                    position,
-                    direction: bolt.direction,
-                    born: now,
-                });
-                sounds.extend_at(
-                    assets.hit_sound.iter().cloned(),
-                    position,
-                    CONTACT_SOUND_RADIUS,
-                    1.0,
-                );
-                sounds.extend_at(blast_sound(assets), position, BLAST_SOUND_RADIUS, 1.0);
-                return false;
-            }
-            let hit = pawn
-                .and_then(|pawn| pawn.ray(bolt.position, visible))
-                .map(|fraction| (bolt.position + visible * fraction, bolt.direction * -1.0))
-                .or(hit);
-            if let Some((point, normal)) = hit {
-                self.rings.push(Ring {
-                    impact: Impact::Wall,
-                    position: point + normal * 8.0,
-                    direction: bolt.direction,
-                    born: now,
-                });
-                sounds.extend_at(
-                    assets.hit_sound.iter().cloned(),
-                    point,
-                    CONTACT_SOUND_RADIUS,
-                    1.0,
-                );
-                sounds.extend_at(blast_sound(assets), point, BLAST_SOUND_RADIUS, 1.0);
-                blasts.push(Blast::new(point, assets, false));
-                false
+            let wall = map.collision.ray_surface(bolt.position, delta);
+            let visible = wall.map_or(delta, |(point, _)| point - bolt.position);
+            let impact = match targets.trace(bolt.owner, bolt.position, visible) {
+                Some((target, at)) => {
+                    let offset = if matches!(target, Target::Projectile(_)) {
+                        blasts.extend(
+                            targets
+                                .hit(
+                                    target,
+                                    bolt.owner,
+                                    assets.damage as u16,
+                                    bolt.direction,
+                                    sounds,
+                                )
+                                .map(|blast| (bolt.owner, blast)),
+                        );
+                        Vec3::default()
+                    } else {
+                        bolt.direction * -8.0
+                    };
+                    Some((bolt.position + visible * at, offset))
+                }
+                None => wall.map(|(point, normal)| (point, normal * 8.0)),
+            };
+            if let Some((position, offset)) = impact {
+                let bolt = self.bolts.swap_remove(index);
+                let blast = self.bolt_impact(assets, position, offset, bolt.direction, now, sounds);
+                blasts.push((bolt.owner, blast));
             } else {
                 bolt.position = bolt.position + delta;
-                true
+                index += 1;
             }
-        });
+        }
         blasts
     }
-
     pub fn visuals<'a>(&self, assets: &'a Assets, now: f32, mut draw: impl FnMut(Visual<'a>)) {
         if let Some(texture) = &assets.bolt {
             for bolt in &self.bolts {
@@ -665,6 +804,7 @@ mod tests {
         let start = camera.position + camera.right() * -5.0 - Vec3(0.0, 0.0, 8.0);
         let wall = map.collision.ray(start, direction * 10_000.0).unwrap();
         game.shock.bolts.push(Bolt {
+            owner: 0,
             position: wall + direction * 32.0,
             direction,
             born: game.time,

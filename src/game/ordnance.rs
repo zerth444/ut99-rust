@@ -75,6 +75,23 @@ impl Kind {
         }
     }
 
+    pub(super) fn launch_speed(self, art: &Art, variation: f32) -> f32 {
+        art.speed
+            .filter(|speed| speed.is_finite() && *speed > 0.0)
+            .unwrap_or(match self {
+                Kind::Pulse => 1450.0,
+                Kind::Rocket => 900.0,
+                Kind::Grenade => 600.0,
+                Kind::Gel => 840.0,
+                Kind::Glob => 700.0,
+                Kind::Splash => 300.0,
+                Kind::Chunk => 2500.0 + variation * 200.0 - 100.0,
+                Kind::FlakShell => 1200.0,
+                Kind::Razor | Kind::RazorAlt => 1300.0,
+                Kind::Warhead | Kind::GuidedWarhead => 600.0,
+            })
+    }
+
     fn bio(self) -> bool {
         matches!(self, Self::Gel | Self::Glob | Self::Splash)
     }
@@ -82,6 +99,32 @@ impl Kind {
     fn warhead(self) -> bool {
         matches!(self, Self::Warhead | Self::GuidedWarhead)
     }
+}
+
+pub(super) const FLAK_CHUNK_LIFETIME: f32 = 2.9;
+pub(super) const FLAK_CHUNK_REBOUNDS: u8 = 6;
+pub(super) const FLAK_SHELL_BLAST: (f32, f32, f32) = (150.0, 70.0, 75_000.0);
+
+pub(super) fn flak_pattern(camera: &Camera, mut jitter: impl FnMut() -> f32) -> [(Vec3, f32); 8] {
+    let forward = camera.look_direction();
+    let right = camera.right();
+    let up = forward.cross(right);
+    std::array::from_fn(|_| {
+        let direction = unit(forward + right * (jitter() * 0.11) + up * (jitter() * 0.11));
+        (direction, (jitter() + 1.0) * 0.5)
+    })
+}
+
+pub(super) fn flak_fragments(normal: Vec3) -> [Vec3; 5] {
+    let (right, up) = super::shock::axes(normal);
+    std::array::from_fn(|index| {
+        let angle = index as f32 * std::f32::consts::TAU / 5.0;
+        unit(normal + (right * angle.cos() + up * angle.sin()) * 0.8)
+    })
+}
+
+pub(super) fn ricochet(velocity: Vec3, normal: Vec3, retain: f32) -> Vec3 {
+    (velocity - normal * (2.0 * velocity.dot(normal))) * retain
 }
 
 #[derive(Default)]
@@ -118,6 +161,15 @@ pub enum Visual<'a> {
 }
 
 impl Art {
+    pub fn impact_sprite(&self, position: Vec3, progress: f32, scale: f32) -> Option<Visual<'_>> {
+        Some(Visual::Sprite(
+            position,
+            self.explosion.as_ref()?.image_once(progress),
+            scale,
+            1.0,
+        ))
+    }
+
     pub fn flight_visual(
         &self,
         kind: Kind,
@@ -550,18 +602,7 @@ impl Shots {
             self.guided_roll = 0.0;
         }
         let offset = kind.launch_offset(camera, side, variation);
-        let speed = art.speed.unwrap_or(match kind {
-            Kind::Pulse => 1450.0,
-            Kind::Rocket => 900.0,
-            Kind::Grenade => 600.0,
-            Kind::Gel => 840.0,
-            Kind::Glob => 700.0,
-            Kind::Splash => 300.0,
-            Kind::Chunk => 2500.0 + variation * 200.0 - 100.0,
-            Kind::FlakShell => 1200.0,
-            Kind::Razor | Kind::RazorAlt => 1300.0,
-            Kind::Warhead | Kind::GuidedWarhead => 600.0,
-        });
+        let speed = kind.launch_speed(art, variation);
         let lift = match kind {
             Kind::Grenade => 210.0,
             Kind::FlakShell => 200.0,
@@ -586,7 +627,7 @@ impl Shots {
                     Kind::Pulse => 2.0,
                     Kind::Grenade => 2.5 + variation * 0.5,
                     Kind::Rocket | Kind::FlakShell | Kind::Razor | Kind::RazorAlt => 6.0,
-                    Kind::Chunk => 2.9,
+                    Kind::Chunk => FLAK_CHUNK_LIFETIME,
                     Kind::Warhead | Kind::GuidedWarhead => 30.0,
                     _ => 3.1 + 0.2 * variation,
                 },
@@ -882,12 +923,11 @@ impl Shots {
                 }
                 true
             } else if matches!(kind, Kind::Chunk | Kind::Razor) {
-                if shot.wall_hits > 6 {
+                if shot.wall_hits > FLAK_CHUNK_REBOUNDS {
                     return false;
                 }
                 let retain = if kind == Kind::Chunk { 0.8 } else { 1.0 };
-                shot.velocity =
-                    (shot.velocity - normal * (2.0 * shot.velocity.dot(normal))) * retain;
+                shot.velocity = ricochet(shot.velocity, normal, retain);
                 if shot.velocity.dot(shot.velocity) < 10_000.0 {
                     return false;
                 }
@@ -936,18 +976,14 @@ impl Shots {
                 true
             } else {
                 if kind == Kind::FlakShell {
-                    let (right, up) = super::shock::axes(normal);
-                    for index in 0..5 {
-                        let angle = index as f32 * std::f32::consts::TAU / 5.0;
-                        let direction =
-                            unit(normal + (right * angle.cos() + up * angle.sin()) * 0.8);
+                    for direction in flak_fragments(normal) {
                         fragments.push(Projectile {
                             kind: Kind::Chunk,
                             position: shot.position + direction * 2.0,
                             direction,
                             velocity: direction * 2500.0,
                             born: time,
-                            expires: time + 2.9,
+                            expires: time + FLAK_CHUNK_LIFETIME,
                             scale: 1.0,
                             stuck: None,
                             base: None,
@@ -1112,17 +1148,16 @@ impl Shots {
                 }
                 continue;
             }
-            let (texture, glow) = if effect.trail {
-                (&art.trail, 1.0 - age)
-            } else {
-                (&art.explosion, 1.0)
-            };
-            if let Some(texture) = texture {
+            if !effect.trail {
+                if let Some(visual) = art.impact_sprite(effect.position, age, effect.scale) {
+                    draw(visual);
+                }
+            } else if let Some(texture) = &art.trail {
                 draw(Visual::Sprite(
                     effect.position,
                     texture.image_once(age),
                     effect.scale,
-                    glow,
+                    1.0 - age,
                 ));
             }
         }
@@ -1133,6 +1168,8 @@ impl Shots {
         self.projectiles.len()
     }
 }
+
+pub(super) const FLAK_SHELL_IMPACT: (f32, f32) = (0.5, 2.0);
 
 fn projectile_damage(shot: &Projectile, art: &Art, center: Vec3) -> (u16, Vec3) {
     if shot.kind == Kind::Chunk && shot.velocity.dot(shot.velocity) <= 200.0 * 200.0 {
@@ -1317,7 +1354,7 @@ fn explode_at(
     let (duration, scale) = match kind {
         Kind::Pulse => (0.5, 0.65),
         Kind::Rocket | Kind::Grenade => (0.7, 1.4),
-        Kind::FlakShell => (0.5, 2.0),
+        Kind::FlakShell => FLAK_SHELL_IMPACT,
         Kind::RazorAlt => (0.7, 1.0),
         Kind::Warhead | Kind::GuidedWarhead => (1.5, 2.8),
         _ => (1.0, shot.scale * 1.4),
@@ -1336,7 +1373,7 @@ fn explode_at(
         Kind::Pulse | Kind::Chunk | Kind::Razor => return None,
         Kind::Rocket => (220.0, 75.0, 80_000.0),
         Kind::Grenade => (200.0, 80.0, 50_000.0),
-        Kind::FlakShell => (150.0, 70.0, 75_000.0),
+        Kind::FlakShell => FLAK_SHELL_BLAST,
         Kind::RazorAlt => (180.0, 34.0, 87_000.0),
         Kind::Warhead | Kind::GuidedWarhead => (300.0, 1000.0, 100_000.0),
         Kind::Glob => ((150.0 * shot.scale).min(250.0), 75.0, 30_000.0),
