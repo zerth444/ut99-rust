@@ -92,7 +92,7 @@ impl Kind {
             })
     }
 
-    fn bio(self) -> bool {
+    pub(crate) fn bio(self) -> bool {
         matches!(self, Self::Gel | Self::Glob | Self::Splash)
     }
 
@@ -233,6 +233,43 @@ impl Art {
             None,
         ))
     }
+
+    pub fn bio_surface_visual(
+        &self,
+        position: Vec3,
+        normal: Vec3,
+        elapsed: f32,
+        scale: f32,
+    ) -> Option<Visual<'_>> {
+        let surface = if normal.2 < -0.7 {
+            &self.dripping
+        } else if normal.2 < 0.5 {
+            &self.sliding
+        } else {
+            &self.stuck
+        };
+        let after_hit = elapsed - self.stuck.duration();
+        let pose = if after_hit >= 0.0 && surface.duration() > 0.0 {
+            surface.hold_pose(after_hit)
+        } else {
+            self.stuck.hold_pose(elapsed)
+        }?;
+        Some(Visual::Mesh(position, normal, pose, scale, None))
+    }
+}
+
+pub(super) const BIO_SURFACE_LIFETIME: f32 = 3.8;
+
+pub(super) fn bio_splash_count(scale: f32) -> u8 {
+    if scale > 0.5 {
+        ((scale * 4.0) as u8).saturating_sub(1)
+    } else {
+        0
+    }
+}
+
+pub(super) fn bio_trigger_delay(born: f32) -> f32 {
+    0.1 + 0.2 * ((born * 997.0).sin() * 0.5 + 0.5)
 }
 
 #[derive(Default)]
@@ -372,7 +409,7 @@ impl Shots {
     ) -> Option<Blast> {
         let shot = &mut self.projectiles[index];
         if shot.kind.bio() {
-            let delay = 0.1 + 0.2 * ((shot.born * 997.0).sin() * 0.5 + 0.5);
+            let delay = bio_trigger_delay(shot.born);
             shot.expires = shot.expires.min(time + delay);
             return None;
         }
@@ -788,7 +825,7 @@ impl Shots {
                     return false;
                 }
                 if kind.bio() && touched {
-                    let delay = 0.1 + 0.2 * ((shot.born * 997.0).sin() * 0.5 + 0.5);
+                    let delay = bio_trigger_delay(shot.born);
                     shot.expires = shot.expires.min(time + delay);
                     return true;
                 }
@@ -980,12 +1017,7 @@ impl Shots {
                 true
             } else if kind.bio() {
                 if kind == Kind::Glob {
-                    let draw_scale = shot.scale * 2.0;
-                    let count = if draw_scale > 1.0 {
-                        (draw_scale * 2.0) as u8 - 1
-                    } else {
-                        0
-                    };
+                    let count = bio_splash_count(shot.scale);
                     shot.spray = Some((count, shot.position + normal * 5.0));
                     shot.scale = shot.scale.min(1.5);
                 }
@@ -997,7 +1029,7 @@ impl Shots {
                     .enumerate()
                     .find(|(_, mover)| mover.collision_hull() == Some(hull))
                     .map(|(index, mover)| (index, shot.position - mover.offset));
-                shot.expires = time + 3.8;
+                shot.expires = time + BIO_SURFACE_LIFETIME;
                 spawn_splashes(shot, map, time, &mut fragments);
                 if art.scorch.is_some() {
                     let contact = map.collision.ray(point, normal * -8.0).unwrap_or(point);
@@ -1077,50 +1109,19 @@ impl Shots {
         }
         for shot in &self.projectiles {
             let art = &assets[shot.kind as usize];
-            let (motion, age) = if let Some(at) = shot.stuck.filter(|_| shot.kind.bio()) {
-                let elapsed = time - at;
-                let after_hit = elapsed - art.stuck.duration();
-                let surface = if shot.direction.2 < -0.7 {
-                    &art.dripping
-                } else if shot.direction.2 < 0.5 {
-                    &art.sliding
-                } else {
-                    &art.stuck
-                };
-                if after_hit >= 0.0 && surface.duration() > 0.0 {
-                    (
-                        surface,
-                        after_hit.min((surface.duration() - 0.001).max(0.0)),
-                    )
-                } else {
-                    (
-                        &art.stuck,
-                        elapsed.min((art.stuck.duration() - 0.001).max(0.0)),
-                    )
-                }
+            let visual = if let Some(at) = shot.stuck.filter(|_| shot.kind.bio()) {
+                art.bio_surface_visual(shot.position, shot.direction, time - at, shot.scale)
             } else {
-                if let Some(visual) = art.flight_visual(
+                art.flight_visual(
                     shot.kind,
                     shot.position,
                     shot.direction,
                     time - shot.born,
                     shot.scale,
-                ) {
-                    draw(visual);
-                }
-                continue;
+                )
             };
-            let duration = motion.duration();
-            if duration > 0.0
-                && let Some(pose) = motion.sample(age.rem_euclid(duration))
-            {
-                draw(Visual::Mesh(
-                    shot.position,
-                    shot.direction,
-                    pose,
-                    shot.scale,
-                    None,
-                ));
+            if let Some(visual) = visual {
+                draw(visual);
             }
         }
         for effect in &self.effects {
@@ -1279,35 +1280,51 @@ fn water_crossing(
     }
 }
 
+pub(super) fn bio_splash(
+    map: &Map,
+    parent: Vec3,
+    origin: Vec3,
+    born: f32,
+    left: u8,
+) -> (Vec3, Vec3, f32) {
+    let seed = born
+        .to_bits()
+        .wrapping_add(u32::from(left))
+        .wrapping_mul(1_664_525)
+        .wrapping_add(1_013_904_223);
+    let z = 2.0 * (seed >> 8) as f32 / 16_777_216.0 - 1.0;
+    let angle = seed.wrapping_mul(22_695_477) as f32 / u32::MAX as f32 * std::f32::consts::TAU;
+    let radius = (1.0 - z * z).max(0.0).sqrt();
+    let position = origin + Vec3(radius * angle.cos(), radius * angle.sin(), z) * 4.0;
+    let direction = unit(position - parent);
+    let mut velocity = direction * map.ordnance[Kind::Splash as usize].speed.unwrap_or(300.0)
+        + Vec3(0.0, 0.0, 120.0);
+    if map.collision.regions.at(position).water {
+        velocity = velocity * 0.7;
+    }
+    (
+        position,
+        velocity,
+        3.1 + 0.2 * (seed >> 8) as f32 / 16_777_216.0,
+    )
+}
+
 fn spawn_splashes(shot: &mut Projectile, map: &Map, time: f32, fragments: &mut Vec<Projectile>) {
     let Some((left, origin)) = &mut shot.spray else {
         return;
     };
     for _ in 0..(*left).min(2) {
         *left -= 1;
-        let seed = shot
-            .born
-            .to_bits()
-            .wrapping_add(u32::from(*left))
-            .wrapping_mul(1_664_525)
-            .wrapping_add(1_013_904_223);
-        let z = 2.0 * (seed >> 8) as f32 / 16_777_216.0 - 1.0;
-        let angle = seed.wrapping_mul(22_695_477) as f32 / u32::MAX as f32 * std::f32::consts::TAU;
-        let radius = (1.0 - z * z).max(0.0).sqrt();
-        let position = *origin + Vec3(radius * angle.cos(), radius * angle.sin(), z) * 4.0;
+        let (position, velocity, lifetime) =
+            bio_splash(map, shot.position, *origin, shot.born, *left);
         let direction = unit(position - shot.position);
-        let mut velocity = direction * map.ordnance[Kind::Splash as usize].speed.unwrap_or(300.0)
-            + Vec3(0.0, 0.0, 120.0);
-        if map.collision.regions.at(position).water {
-            velocity = velocity * 0.7;
-        }
         fragments.push(Projectile {
             kind: Kind::Splash,
             position,
             direction,
             velocity,
             born: time,
-            expires: time + 3.1 + 0.2 * (seed >> 8) as f32 / 16_777_216.0,
+            expires: time + lifetime,
             scale: 1.0,
             stuck: None,
             base: None,

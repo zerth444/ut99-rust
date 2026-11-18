@@ -131,6 +131,25 @@ impl Hud {
                 white,
             );
         }
+        if captured
+            && player.health > 0
+            && game.guidance_left().is_none()
+            && let Some((health, armor, age)) = game.damage_notice()
+        {
+            let remaining = ((0.9 - age) / 0.25).clamp(0.0, 1.0);
+            let text = if armor > 0 {
+                format!("{health} HP + {armor} ARMOR")
+            } else {
+                format!("{health} DAMAGE")
+            };
+            self.centered(
+                frame,
+                frame.height as i32 / 2 - (58.0 * scale) as i32,
+                scale,
+                &text,
+                [1.0, 0.78, 0.34].map(|channel| channel * remaining),
+            );
+        }
         if player.health == 0 {
             self.centered(frame, frame.height as i32 / 2, scale, "RESPAWNING", white);
         } else if !captured {

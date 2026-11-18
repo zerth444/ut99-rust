@@ -17,7 +17,7 @@ use windows_sys::Win32::UI::Input::{
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::collision::{MotionEvents, Walker};
-use crate::frontend::{Action, Frontend, Menu};
+use crate::frontend::{Action, Frontend, Menu, MenuSession};
 use crate::game::{Input, Practice, deathmatch};
 use crate::hud::Hud;
 use crate::map::{Map, Vec3};
@@ -41,7 +41,8 @@ pub fn show(
         .unwrap_or_else(|| Path::new("."))
         .join("../UT99-Rust.ini");
     let mut settings = Settings::load(&settings_path)?;
-    let mut frontend = startup.then(|| Frontend::load(path, settings.intro));
+    let mut frontend =
+        (startup || match_rules.is_some()).then(|| Frontend::load(path, startup && settings.intro));
     let class: Vec<u16> = "Ut99RustViewer\0".encode_utf16().collect();
     let title: Vec<u16> = title.encode_utf16().chain([0]).collect();
 
@@ -86,6 +87,7 @@ pub fn show(
             &mut settings,
             &settings_path,
             match_rules,
+            startup,
         )
     }
 }
@@ -133,6 +135,7 @@ unsafe fn message_loop(
     settings: &mut Settings,
     settings_path: &Path,
     mut match_rules: Option<deathmatch::Rules>,
+    startup: bool,
 ) -> io::Result<()> {
     let mut frame = Frame::hardware(map);
     let hud = Hud::new();
@@ -150,11 +153,7 @@ unsafe fn message_loop(
     let mut audio = if no_sound {
         None
     } else {
-        Audio::open(if frontend.is_some() {
-            None
-        } else {
-            map.music.as_ref()
-        })
+        Audio::open(if startup { None } else { map.music.as_ref() })
     };
     let mut jump = false;
     let mut occupied_portal = None;
@@ -177,7 +176,7 @@ unsafe fn message_loop(
     unsafe {
         ShowWindow(window, SW_SHOW);
     }
-    if let Some(frontend) = frontend.as_deref_mut() {
+    if startup && let Some(frontend) = frontend.as_deref_mut() {
         match run_frontend(
             window,
             map,
@@ -189,7 +188,7 @@ unsafe fn message_loop(
             settings_path,
             &mut windowed,
             obs,
-            false,
+            MenuSession::Main,
         )? {
             Action::Deathmatch => {
                 match_rules = Some(deathmatch::Rules {
@@ -255,7 +254,7 @@ unsafe fn message_loop(
                                 VK_RETURN => restart_match = true,
                                 VK_ESCAPE if let Some(frontend) = frontend.as_deref_mut() => {
                                     mouse.release();
-                                    if run_frontend(
+                                    let action = run_frontend(
                                         window,
                                         map,
                                         frontend,
@@ -266,10 +265,58 @@ unsafe fn message_loop(
                                         settings_path,
                                         &mut windowed,
                                         obs,
-                                        true,
-                                    )? == Action::Quit
-                                    {
+                                        MenuSession::Match,
+                                    )?;
+                                    if action == Action::Quit {
                                         return Ok(());
+                                    }
+                                    if action == Action::LeaveMatch {
+                                        if let Some(game) = deathmatch.take() {
+                                            game.restore_map(map);
+                                        }
+                                        let action = run_frontend(
+                                            window,
+                                            map,
+                                            frontend,
+                                            &hud,
+                                            &mut presenter,
+                                            &mut audio,
+                                            settings,
+                                            settings_path,
+                                            &mut windowed,
+                                            obs,
+                                            MenuSession::Main,
+                                        )?;
+                                        match action {
+                                            Action::Quit => return Ok(()),
+                                            Action::Deathmatch => {
+                                                deathmatch = Some(deathmatch::Match::new(
+                                                    map,
+                                                    start,
+                                                    deathmatch::Rules {
+                                                        difficulty:
+                                                            deathmatch::Difficulty::from_level(
+                                                                settings.bot_difficulty,
+                                                            ),
+                                                        ..deathmatch::Rules::default()
+                                                    },
+                                                ));
+                                            }
+                                            _ => {
+                                                game = Practice::new(map);
+                                                walker = Walker::spawn(
+                                                    &map.collision,
+                                                    map.starts[start].position,
+                                                );
+                                                camera = Camera::from_start(map.starts[start]);
+                                                fly = false;
+                                                occupied_portal = None;
+                                                pilot_view = None;
+                                            }
+                                        }
+                                        if let Some(audio) = &mut audio {
+                                            audio.set_track(map.music.as_ref());
+                                        }
                                     }
                                     frame = Frame::hardware(map);
                                     tick = Instant::now();
@@ -281,6 +328,7 @@ unsafe fn message_loop(
                                     jump = false;
                                     dodge = None;
                                     last_direction = None;
+                                    restart_match = false;
                                     match_clock.clear();
                                     stats = FrameStats::new(tick);
                                     if GetForegroundWindow() == window {
@@ -381,7 +429,7 @@ unsafe fn message_loop(
                                 settings_path,
                                 &mut windowed,
                                 obs,
-                                true,
+                                MenuSession::Practice,
                             )? == Action::Quit
                             {
                                 return Ok(());
@@ -877,13 +925,14 @@ fn run_frontend(
     settings_path: &Path,
     windowed: &mut Option<WINDOWPLACEMENT>,
     obs: bool,
-    resume: bool,
+    session: MenuSession,
 ) -> io::Result<Action> {
+    let resume = session.paused();
     let mut intro = (!resume && settings.intro)
         .then(|| frontend.intro.take())
         .flatten();
     let mut menu = Menu::default();
-    menu.resume = resume;
+    menu.session = session;
     let logo = frontend.logo.as_ref().map(|(map, _)| map);
     let mut frame = Frame::hardware(
         intro
@@ -981,7 +1030,9 @@ fn run_frontend(
                         frontend.play_menu_sound(audio, sound);
                     }
                     match action {
-                        Action::Play | Action::Deathmatch => return Ok(action),
+                        Action::Play | Action::Deathmatch | Action::LeaveMatch => {
+                            return Ok(action);
+                        }
                         Action::Quit => {
                             DestroyWindow(window);
                             return Ok(Action::Quit);

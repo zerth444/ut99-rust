@@ -160,6 +160,7 @@ pub enum Action {
     None,
     Play,
     Deathmatch,
+    LeaveMatch,
     Quit,
     Changed,
 }
@@ -192,9 +193,23 @@ impl MenuState {
     }
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum MenuSession {
+    #[default]
+    Main,
+    Practice,
+    Match,
+}
+
+impl MenuSession {
+    pub fn paused(self) -> bool {
+        self != Self::Main
+    }
+}
+
 #[derive(Default)]
 pub struct Menu {
-    pub resume: bool,
+    pub session: MenuSession,
     preferences: bool,
     tab: usize,
     selected: usize,
@@ -321,9 +336,14 @@ impl Pulldown {
         }
     }
 
-    fn entries(self, resume: bool) -> &'static [(&'static str, &'static str)] {
+    fn entries(self, session: MenuSession) -> &'static [(&'static str, &'static str)] {
         match self {
-            Self::Game if resume => &[
+            Self::Game if session == MenuSession::Match => &[
+                ("Return to Current Game", "Return to the current game."),
+                ("Leave Match", "End this match and return to the main menu."),
+                ("Quit", "Exit Unreal Tournament."),
+            ],
+            Self::Game if session.paused() => &[
                 ("Return to Current Game", "Return to the current game."),
                 ("Quit", "Exit Unreal Tournament."),
             ],
@@ -343,13 +363,13 @@ impl Pulldown {
         }
     }
 
-    fn rect(self, resume: bool) -> [i32; 4] {
+    fn rect(self, session: MenuSession) -> [i32; 4] {
         let width = match self {
             Self::Game => 190,
             Self::Options => 120,
             Self::Help => 132,
         };
-        let count = self.entries(resume).len();
+        let count = self.entries(session).len();
         [
             TOP_ITEMS[self.index()],
             16,
@@ -367,13 +387,13 @@ impl Pulldown {
             }
     }
 
-    fn item_at(self, [x, y]: [i32; 2], resume: bool) -> Option<usize> {
-        let [left, top, width, height] = self.rect(resume);
+    fn item_at(self, [x, y]: [i32; 2], session: MenuSession) -> Option<usize> {
+        let [left, top, width, height] = self.rect(session);
         if !(left + 4..left + width - 4).contains(&x) || !(top + 4..top + height - 4).contains(&y) {
             return None;
         }
         let y = y - top - 4;
-        (0..self.entries(resume).len()).find(|&index| {
+        (0..self.entries(session).len()).find(|&index| {
             let offset = self.row_offset(index);
             (offset..offset + MENU_ROW).contains(&y)
         })
@@ -409,7 +429,7 @@ impl Menu {
                 self.bar_focus = section.index();
                 *open = section;
                 *item = 0;
-            } else if let Some(index) = open.item_at([x, y], self.resume) {
+            } else if let Some(index) = open.item_at([x, y], self.session) {
                 *item = index;
             }
         }
@@ -459,7 +479,8 @@ impl Menu {
         self.pulldown = None;
         match section {
             Pulldown::Game if item == 0 => Action::Play,
-            Pulldown::Game if item == 2 && !self.resume => Action::Deathmatch,
+            Pulldown::Game if item == 1 && self.session == MenuSession::Match => Action::LeaveMatch,
+            Pulldown::Game if item == 2 && !self.session.paused() => Action::Deathmatch,
             Pulldown::Game => {
                 self.quit = Some(true);
                 Action::None
@@ -541,7 +562,7 @@ impl Menu {
             return Action::None;
         }
         if let Some((section, item)) = self.pulldown {
-            let len = section.entries(self.resume).len();
+            let len = section.entries(self.session).len();
             match key {
                 VK_ESCAPE => self.pulldown = None,
                 VK_UP => self.pulldown = Some((section, (item + len - 1) % len)),
@@ -565,7 +586,7 @@ impl Menu {
                     return Action::Play;
                 }
             }
-            VK_ESCAPE if self.resume => return Action::Play,
+            VK_ESCAPE if self.session.paused() => return Action::Play,
             _ => {}
         }
         Action::None
@@ -605,7 +626,7 @@ impl Menu {
         if !self.preferences {
             let open = self.pulldown.take().map(|(section, _)| section);
             if let Some(section) = open
-                && let Some(item) = section.item_at([x, y], self.resume)
+                && let Some(item) = section.item_at([x, y], self.session)
             {
                 return self.activate(section, item, settings);
             }
@@ -769,7 +790,11 @@ impl Menu {
             }
         }
         for (index, label) in [
-            if self.resume { "Resume" } else { "Play" },
+            if self.session.paused() {
+                "Resume"
+            } else {
+                "Play"
+            },
             "Game",
             "Options",
             "Help",
@@ -807,7 +832,7 @@ impl Menu {
         }
         if !self.preferences {
             if let Some((section, selected)) = self.pulldown {
-                let [x, y, w, h] = section.rect(self.resume);
+                let [x, y, w, h] = section.rect(self.session);
                 let columns = [(x, 4), (x + 4, w - 8), (x + w - 4, 4)];
                 let rows = [(y, 4), (y + 4, h - 8), (y + h - 4, 4)];
                 for (row, (top, height)) in rows.into_iter().enumerate() {
@@ -828,7 +853,7 @@ impl Menu {
                         [0.31, 0.40, 0.56],
                     );
                 }
-                for (index, &(caption, _)) in section.entries(self.resume).iter().enumerate() {
+                for (index, &(caption, _)) in section.entries(self.session).iter().enumerate() {
                     let row = y + 4 + section.row_offset(index);
                     if index == selected {
                         ui.tile(
@@ -858,10 +883,10 @@ impl Menu {
                     [0.24, 0.27, 0.31],
                 );
                 let help = if let Some((open, selected)) = self.pulldown {
-                    open.entries(self.resume)[selected].1
+                    open.entries(self.session)[selected].1
                 } else {
                     [
-                        if self.resume {
+                        if self.session.paused() {
                             "Return to the current game."
                         } else {
                             "Start a practice session on Deck16][."
@@ -1349,9 +1374,15 @@ mod tests {
         menu.click(size, 180, 8, VK_LBUTTON, &mut settings);
         assert!(menu.click(size, 180, 25, VK_LBUTTON, &mut settings) == Action::Changed);
         assert!(!settings.context_help);
-        menu.resume = true;
+        menu.session = MenuSession::Match;
         menu.click(size, 70, 8, VK_LBUTTON, &mut settings);
         assert!(menu.click(size, 72, 25, VK_LBUTTON, &mut settings) == Action::Play);
+        menu.click(size, 70, 8, VK_LBUTTON, &mut settings);
+        menu.key(VK_DOWN, &mut settings);
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::LeaveMatch);
+        assert!(menu.quit.is_none());
+        menu.click(size, 70, 8, VK_LBUTTON, &mut settings);
+        assert!(menu.click(size, 72, 48, VK_LBUTTON, &mut settings) == Action::LeaveMatch);
     }
 
     #[test]

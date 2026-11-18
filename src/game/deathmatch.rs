@@ -473,6 +473,22 @@ struct Bolt {
     payload: ProjectilePayload,
     pilot: Option<Pilot>,
     next_trail: f32,
+    gel: Option<GelSurface>,
+    gel_trigger: Option<f32>,
+}
+
+struct GelSurface {
+    normal: Vec3,
+    landed: f32,
+    base: Option<(usize, Vec3)>,
+    splashes: u8,
+}
+
+impl Bolt {
+    fn trigger_gel(&mut self, now: f32) {
+        let due = now + ordnance::bio_trigger_delay(self.born);
+        self.gel_trigger = Some(self.gel_trigger.map_or(due, |previous| previous.min(due)));
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -505,6 +521,74 @@ struct Hit {
     owner: Option<usize>,
     damage: u16,
     impulse: Vec3,
+}
+
+pub(crate) struct DroppedWeapon {
+    pub prop: usize,
+    pub position: Vec3,
+    velocity: Vec3,
+    weapon: Weapon,
+    ammo: u16,
+    available_at: f32,
+    expires: f32,
+}
+
+impl DroppedWeapon {
+    fn from_fighter(map: &Map, fighter: &Fighter, time: f32) -> Option<Self> {
+        let weapon = fighter.weapon;
+        if matches!(weapon, Weapon::Hammer | Weapon::Enforcer) || !fighter.inventory.owns(weapon) {
+            return None;
+        }
+        let prop = map
+            .props
+            .iter()
+            .position(|prop| matches!(prop.item, Some(Item::Gun(kind)) if kind == weapon))?;
+        let camera = fighter.camera(map);
+        let position = fighter.walker.position;
+        let zone = map.collision.regions.at(position);
+        if zone.pain {
+            return None;
+        }
+        Some(Self {
+            prop,
+            position,
+            velocity: camera.forward() * 135.0 + Vec3(0.0, 0.0, 160.0),
+            weapon,
+            ammo: fighter.inventory.ammo(weapon),
+            available_at: time + 0.18,
+            expires: time + 30.0,
+        })
+    }
+
+    fn tick(&mut self, map: &Map, dt: f32) {
+        if self.velocity.dot(self.velocity) <= 0.01 {
+            return;
+        }
+        let zone = map.collision.regions.at(self.position);
+        self.velocity = self.velocity + zone.gravity * dt;
+        let delta = self.velocity * dt;
+        if let Some((point, normal)) =
+            map.collision
+                .projectile_surface(self.position, delta, 8.0, 9.0)
+        {
+            self.position = point + normal * 0.5;
+            self.velocity = if normal.2 > 0.65 {
+                Vec3::default()
+            } else {
+                ordnance::ricochet(self.velocity, normal, 0.4)
+            };
+        } else {
+            self.position = self.position + delta;
+        }
+    }
+}
+
+#[derive(Default)]
+struct DamageReadout {
+    target: usize,
+    health: u16,
+    armor: u16,
+    at: f32,
 }
 
 struct ShockTargets<'a> {
@@ -541,17 +625,8 @@ impl shock::Targets for ShockTargets<'_> {
                 bypass_armor: false,
             }),
             shock::Target::Projectile(index) => {
-                let bolt = self.game.bolts.swap_remove(index);
-                self.game.detonate(
-                    self.map,
-                    vec![Detonation {
-                        position: bolt.position,
-                        owner,
-                        payload: bolt.payload,
-                    }],
-                    self.hits,
-                    sounds,
-                );
+                self.game
+                    .intercept(self.map, index, owner, self.hits, sounds);
             }
         }
         None
@@ -572,6 +647,8 @@ pub struct Match {
     pub shock: shock::Shots,
     pub traces: Vec<Trace>,
     pub rocket_trails: ordnance::RocketTrails,
+    pub(crate) drops: Vec<DroppedWeapon>,
+    outgoing_damage: Option<DamageReadout>,
     bolts: Vec<Bolt>,
     initial_props: Vec<bool>,
     pickups: Vec<Option<f32>>,
@@ -599,6 +676,8 @@ impl Match {
             shock: shock::Shots::default(),
             traces: Vec::new(),
             rocket_trails: ordnance::RocketTrails::default(),
+            drops: Vec::new(),
+            outgoing_damage: None,
             bolts: Vec::new(),
             initial_props: map.props.iter().map(|prop| prop.visible).collect(),
             pickups: vec![None; map.props.len()],
@@ -643,19 +722,25 @@ impl Match {
         self.guidance_lost_until = 0.0;
         self.traces.clear();
         self.rocket_trails = ordnance::RocketTrails::default();
+        self.drops.clear();
+        self.outgoing_damage = None;
         self.decals = decals::Marks::default();
         self.ballistics = ballistics::Effects::default();
         self.shock = shock::Shots::default();
         self.bolts.clear();
         self.pickups.fill(None);
+        self.restore_map(map);
+        self.message_until = 0.0;
+        self.spawn_all(map);
+    }
+
+    pub fn restore_map(&self, map: &mut Map) {
         for (prop, &visible) in map.props.iter_mut().zip(&self.initial_props) {
             prop.visible = visible;
         }
         for mover in &mut map.movers {
             mover.reset_motion(&mut map.collision);
         }
-        self.message_until = 0.0;
-        self.spawn_all(map);
     }
 
     fn choose_spawn(&self, map: &Map, fighter: usize, previous: Option<usize>) -> usize {
@@ -757,6 +842,12 @@ impl Match {
         (self.time < self.message_until).then_some(self.message.as_str())
     }
 
+    pub fn damage_notice(&self) -> Option<(u16, u16, f32)> {
+        let hit = self.outgoing_damage.as_ref()?;
+        let age = self.time - hit.at;
+        (age < 0.9).then_some((hit.health, hit.armor, age))
+    }
+
     fn pilot_index(&self) -> Option<usize> {
         if self.finished || self.fighters[0].health == 0 {
             return None;
@@ -826,7 +917,7 @@ impl Match {
 
     pub(crate) fn bolts(
         &self,
-    ) -> impl Iterator<Item = (super::ordnance::Kind, Vec3, Vec3, f32, f32)> + '_ {
+    ) -> impl Iterator<Item = (super::ordnance::Kind, Vec3, Vec3, f32, f32, Option<f32>)> + '_ {
         let camera = self.pilot_index();
         self.bolts
             .iter()
@@ -836,9 +927,12 @@ impl Match {
                 (
                     bolt.payload.kind,
                     bolt.position,
-                    unit(bolt.velocity),
+                    bolt.gel
+                        .as_ref()
+                        .map_or_else(|| unit(bolt.velocity), |surface| surface.normal),
                     self.time - bolt.born,
                     bolt.payload.scale,
+                    bolt.gel.as_ref().map(|surface| self.time - surface.landed),
                 )
             })
     }
@@ -1104,6 +1198,7 @@ impl Match {
         }
         self.separate_fighters(map);
         self.collect(map, &mut sounds);
+        self.update_drops(map, dt, &mut sounds);
         if let Some(detonation) = manual_detonation {
             self.detonate(map, vec![detonation], &mut hits, &mut sounds);
         }
@@ -1187,20 +1282,13 @@ impl Match {
             let Some(item) = prop.item.filter(|_| prop.visible) else {
                 continue;
             };
-            nearby.clear();
-            nearby.extend(
-                self.fighters
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(id, fighter)| {
-                        let delta = fighter.walker.position - prop.position;
-                        (fighter.health > 0
-                            && delta.2.abs() <= prop.pickup_height + PLAYER_HEIGHT
-                            && delta.0.hypot(delta.1) <= prop.pickup_radius + PLAYER_RADIUS)
-                            .then_some((delta.dot(delta), id))
-                    }),
+            pickup_order(
+                &mut nearby,
+                &self.fighters,
+                prop.position,
+                prop.pickup_radius,
+                prop.pickup_height,
             );
-            nearby.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
             for &(_, id) in &nearby {
                 let fighter = &mut self.fighters[id];
                 if map
@@ -1234,15 +1322,75 @@ impl Match {
                         1.0,
                     );
                 }
-                if let Some(weapon) = new_weapon
-                    && (fighter.ammo() == Some(0)
-                        || weapon.switch_priority() > fighter.weapon.switch_priority())
-                {
-                    fighter.equip(map.arsenal.get(&weapon), weapon, self.time, sounds, id == 0);
-                }
+                equip_pickup(
+                    &map.arsenal,
+                    fighter,
+                    new_weapon,
+                    self.time,
+                    sounds,
+                    id == 0,
+                );
                 break;
             }
         }
+    }
+
+    fn update_drops(&mut self, map: &Map, dt: f32, sounds: &mut SoundEvents) {
+        let mut nearby = Vec::new();
+        self.drops.retain_mut(|drop| {
+            drop.tick(map, dt);
+            if drop.expires <= self.time
+                || drop.position.2 < self.kill_z
+                || map.collision.regions.at(drop.position).pain
+            {
+                return false;
+            }
+            if self.time < drop.available_at {
+                return true;
+            }
+            let prop = &map.props[drop.prop];
+            pickup_order(
+                &mut nearby,
+                &self.fighters,
+                drop.position,
+                prop.pickup_radius,
+                prop.pickup_height,
+            );
+            for &(_, id) in &nearby {
+                let fighter = &mut self.fighters[id];
+                if map
+                    .collision
+                    .ray(drop.position, fighter.walker.position - drop.position)
+                    .is_some()
+                {
+                    continue;
+                }
+                let new_weapon = (!fighter.inventory.owns(drop.weapon)).then_some(drop.weapon);
+                if !fighter
+                    .inventory
+                    .pickup_with_ammo(&map.arsenal, drop.weapon, drop.ammo)
+                {
+                    continue;
+                }
+                fighter.pickup_time = self.time;
+                sounds.extend_at(
+                    prop.pickup_sound.iter().cloned(),
+                    drop.position,
+                    CONTACT_SOUND_RADIUS,
+                    1.0,
+                );
+                equip_pickup(
+                    &map.arsenal,
+                    fighter,
+                    new_weapon,
+                    self.time,
+                    sounds,
+                    id == 0,
+                );
+                return false;
+            }
+            true
+        });
     }
 
     fn fire(
@@ -1314,12 +1462,17 @@ impl Match {
         let (alt, mut shot, units, shape) = if let Some(mut charge) = fighter.charge {
             let alt = charge.alternate;
             let shot = arsenal::shot(weapon, alt);
-            let held = input_holds(alt);
+            let growing = matches!(charge.profile.shape, ChargeShape::Grow);
+            let held = if growing {
+                input.alternate
+            } else {
+                input_holds(alt)
+            };
             let cap = charge.profile.max_units.min(ammo / shot.ammo.max(1));
             let art = map.arsenal.get(&weapon);
             let rocket = art.and_then(|art| art.rocket.as_ref());
             let units = charge.profile.units(rocket, self.time - charge.since, cap);
-            if held && units < cap {
+            if held && (growing || units < cap) {
                 if weapon == Weapon::Rocket
                     && let Some(art) = art
                     && let Some(rocket) = rocket
@@ -1576,6 +1729,8 @@ impl Match {
                         },
                         pilot: guided.then(|| Pilot::new(&aim)),
                         next_trail: self.time,
+                        gel: None,
+                        gel_trigger: None,
                     });
                 }
             }
@@ -1599,17 +1754,7 @@ impl Match {
                 let intercepted = projectile
                     .filter(|&(_, at)| target.is_none_or(|(_, victim_at)| at < victim_at));
                 let fraction = if let Some((projectile, at)) = intercepted {
-                    let bolt = self.bolts.swap_remove(projectile);
-                    self.detonate(
-                        map,
-                        vec![Detonation {
-                            position: bolt.position,
-                            owner: id,
-                            payload: bolt.payload,
-                        }],
-                        hits,
-                        sounds,
-                    );
+                    self.intercept(map, projectile, id, hits, sounds);
                     at
                 } else if let Some((victim, at)) = target {
                     let point = start + clipped * at;
@@ -1734,6 +1879,32 @@ impl Match {
             .min_by(|a, b| a.1.total_cmp(&b.1))
     }
 
+    fn intercept(
+        &mut self,
+        map: &Map,
+        index: usize,
+        owner: usize,
+        hits: &mut Vec<Hit>,
+        sounds: &mut SoundEvents,
+    ) {
+        let bolt = &mut self.bolts[index];
+        if bolt.payload.kind.bio() {
+            bolt.trigger_gel(self.time);
+        } else {
+            let bolt = self.bolts.swap_remove(index);
+            self.detonate(
+                map,
+                vec![Detonation {
+                    position: bolt.position,
+                    owner,
+                    payload: bolt.payload,
+                }],
+                hits,
+                sounds,
+            );
+        }
+    }
+
     fn move_bolts(&mut self, map: &Map, dt: f32, hits: &mut Vec<Hit>, sounds: &mut SoundEvents) {
         let mut detonations = Vec::new();
         let mut fragments = Vec::new();
@@ -1741,6 +1912,62 @@ impl Match {
         self.bolts.retain_mut(|bolt| {
             let payload = &mut bolt.payload;
             let art = &map.ordnance[payload.kind as usize];
+            let expired =
+                self.time >= bolt.expires || bolt.gel_trigger.is_some_and(|due| self.time >= due);
+            if let Some(surface) = &mut bolt.gel {
+                if let Some((index, offset)) = surface.base {
+                    bolt.position = map.movers[index].offset + offset;
+                }
+                if expired {
+                    detonations.push(Detonation {
+                        position: bolt.position,
+                        owner: bolt.owner,
+                        payload: *payload,
+                    });
+                    return false;
+                }
+                let origin = bolt.position + surface.normal * 5.0;
+                for _ in 0..surface.splashes.min(2) {
+                    surface.splashes -= 1;
+                    let (position, velocity, lifetime) = ordnance::bio_splash(
+                        map,
+                        bolt.position,
+                        origin,
+                        bolt.born,
+                        surface.splashes,
+                    );
+                    fragments.push(Bolt {
+                        owner: bolt.owner,
+                        position,
+                        velocity,
+                        born: self.time,
+                        expires: self.time + lifetime,
+                        payload: ProjectilePayload {
+                            kind: ordnance::Kind::Splash,
+                            damage: 20,
+                            blast: 44.0,
+                            gravity: 1.0,
+                            rebounds: 0,
+                            scale: 1.0,
+                        },
+                        pilot: None,
+                        next_trail: self.time,
+                        gel: None,
+                        gel_trigger: None,
+                    });
+                }
+                let touching = self.fighters.iter().any(|fighter| {
+                    let delta = fighter.walker.position - bolt.position;
+                    fighter.health > 0
+                        && delta.0.hypot(delta.1) <= PLAYER_RADIUS + art.collision_radius
+                        && delta.2.abs() <= PLAYER_HEIGHT + art.collision_height
+                        && map.collision.ray(bolt.position, delta).is_none()
+                });
+                if touching {
+                    bolt.trigger_gel(self.time);
+                }
+                return true;
+            }
             let zone = map.collision.regions.at(bolt.position);
             if payload.kind == ordnance::Kind::Rocket && self.time < bolt.expires {
                 let direction = unit(bolt.velocity);
@@ -1764,9 +1991,10 @@ impl Match {
             let delta = bolt.velocity * dt;
             let radius = art.collision_radius.max(0.0) * payload.scale;
             let height = art.collision_height.max(0.0) * payload.scale;
-            let wall = map
+            let contact = map
                 .collision
-                .projectile_surface(bolt.position, delta, radius, height);
+                .projectile_contact(bolt.position, delta, radius, height);
+            let wall = contact.map(|(point, normal, _)| (point, normal));
             let end = wall.map_or(bolt.position + delta, |(point, _)| point);
             let target = nearest_hit(
                 &self.fighters,
@@ -1775,8 +2003,62 @@ impl Match {
                 end - bolt.position,
                 [radius, height],
             );
-            let expired = self.time >= bolt.expires;
             if target.is_none() && !expired {
+                if payload.kind.bio()
+                    && let Some((point, normal, hull)) = contact
+                {
+                    let base = map
+                        .movers
+                        .iter()
+                        .position(|mover| mover.collision_hull() == Some(hull));
+                    let position = point + normal * 0.5;
+                    let splashes = if payload.kind == ordnance::Kind::Glob {
+                        let count = ordnance::bio_splash_count(payload.scale);
+                        payload.scale = payload.scale.min(1.5);
+                        count
+                    } else {
+                        0
+                    };
+                    bolt.position = position;
+                    bolt.velocity = Vec3::default();
+                    bolt.expires = self.time + ordnance::BIO_SURFACE_LIFETIME;
+                    bolt.gel = Some(GelSurface {
+                        normal,
+                        landed: self.time,
+                        splashes,
+                        base: base.map(|index| (index, position - map.movers[index].offset)),
+                    });
+                    if let Some((texture, scale, lifetime)) = &art.scorch {
+                        let point = map.collision.ray(point, normal * -8.0).unwrap_or(point);
+                        if let Some(index) = base {
+                            self.decals.project_mover(
+                                &map.movers,
+                                index,
+                                point,
+                                normal,
+                                texture,
+                                *scale,
+                                self.time + lifetime,
+                            );
+                        } else {
+                            self.decals.project(
+                                &map.faces,
+                                point,
+                                normal,
+                                texture,
+                                *scale,
+                                self.time + lifetime,
+                            );
+                        }
+                    }
+                    sounds.extend_at(
+                        art.contact.iter().cloned(),
+                        position,
+                        CONTACT_SOUND_RADIUS,
+                        1.0,
+                    );
+                    return true;
+                }
                 if let Some((contact, normal)) = wall {
                     if payload.rebounds > 0 {
                         payload.rebounds -= 1;
@@ -1839,6 +2121,8 @@ impl Match {
                         },
                         pilot: None,
                         next_trail: self.time,
+                        gel: None,
+                        gel_trigger: None,
                     }));
                 }
                 detonations.push(Detonation {
@@ -1910,6 +2194,7 @@ impl Match {
             let (duration, scale) = match payload.kind {
                 ordnance::Kind::FlakShell => ordnance::FLAK_SHELL_IMPACT,
                 ordnance::Kind::Rocket | ordnance::Kind::Grenade => ordnance::ROCKET_IMPACT,
+                kind if kind.bio() => (1.0, payload.scale * 1.4),
                 _ => (0.48, payload.scale),
             };
             self.traces.push(Trace {
@@ -1920,12 +2205,16 @@ impl Match {
                 expires: self.time + duration,
             });
             sounds.extend_at(art.sound.iter().cloned(), position, BLAST_SOUND_RADIUS, 1.0);
-            self.bolts.retain(|bolt| {
+            self.bolts.retain_mut(|bolt| {
                 let delta = bolt.position - position;
                 if bolt.payload.blast > 0.0
                     && delta.dot(delta) < payload.blast.powi(2)
                     && map.collision.ray(position, delta).is_none()
                 {
+                    if bolt.payload.kind.bio() {
+                        bolt.trigger_gel(self.time);
+                        return true;
+                    }
                     queue.push(Detonation {
                         position: bolt.position,
                         owner,
@@ -1947,6 +2236,8 @@ impl Match {
         {
             return;
         }
+        let health_before = victim.health;
+        let armor_before = victim.armor.iter().sum::<u16>();
         let (damage, shield) = if hit.bypass_armor {
             (hit.damage, false)
         } else {
@@ -1962,6 +2253,24 @@ impl Match {
             );
         }
         victim.health = victim.health.saturating_sub(damage);
+        if hit.owner == Some(0) && hit.victim != 0 {
+            let health = health_before - victim.health;
+            let armor = armor_before - victim.armor.iter().sum::<u16>();
+            if health > 0 || armor > 0 {
+                let readout = self
+                    .outgoing_damage
+                    .get_or_insert_with(DamageReadout::default);
+                if readout.target != hit.victim || self.time - readout.at > 0.28 {
+                    *readout = DamageReadout {
+                        target: hit.victim,
+                        ..DamageReadout::default()
+                    };
+                }
+                readout.health = readout.health.saturating_add(health);
+                readout.armor = readout.armor.saturating_add(armor);
+                readout.at = self.time;
+            }
+        }
         victim.walker.add_velocity(hit.impulse);
         if let Some(owner) = hit.owner.filter(|&owner| owner != hit.victim)
             && hit.impulse.dot(hit.impulse) > 0.0
@@ -1986,6 +2295,8 @@ impl Match {
             return;
         }
         victim.deaths += 1;
+        self.drops
+            .extend(DroppedWeapon::from_fighter(map, victim, self.time));
         victim.charge = None;
         victim.fell_at = Some(self.time);
         for bolt in &mut self.bolts {
@@ -2684,6 +2995,40 @@ fn drive(fighter: &Fighter, movement: Vec3, dt: f32) -> Command {
     }
 }
 
+fn pickup_order(
+    nearby: &mut Vec<(f32, usize)>,
+    fighters: &[Fighter],
+    position: Vec3,
+    radius: f32,
+    height: f32,
+) {
+    nearby.clear();
+    nearby.extend(fighters.iter().enumerate().filter_map(|(id, fighter)| {
+        let delta = fighter.walker.position - position;
+        (fighter.health > 0
+            && delta.2.abs() <= height + PLAYER_HEIGHT
+            && delta.0.hypot(delta.1) <= radius + PLAYER_RADIUS)
+            .then_some((delta.dot(delta), id))
+    }));
+    nearby.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+}
+
+fn equip_pickup(
+    arsenal: &std::collections::HashMap<Weapon, WeaponAssets>,
+    fighter: &mut Fighter,
+    new_weapon: Option<Weapon>,
+    time: f32,
+    sounds: &mut SoundEvents,
+    local: bool,
+) {
+    if let Some(weapon) = new_weapon
+        && (fighter.ammo() == Some(0)
+            || weapon.switch_priority() > fighter.weapon.switch_priority())
+    {
+        fighter.equip(arsenal.get(&weapon), weapon, time, sounds, local);
+    }
+}
+
 fn take_item(
     arsenal: &std::collections::HashMap<Weapon, WeaponAssets>,
     fighter: &mut Fighter,
@@ -2981,6 +3326,8 @@ mod tests {
             payload,
             pilot: None,
             next_trail: 0.0,
+            gel: None,
+            gel_trigger: None,
         });
         let dt = 1.0 / 120.0;
         let first = game.bot_command(&map, 1, dt);
@@ -3485,6 +3832,202 @@ mod tests {
 
     #[test]
     #[ignore = "requires local GOTY assets"]
+    fn damage_readout_counts_actual_health_and_armor_loss() {
+        let (map, mut game) = flight_fixture();
+        game.time = 2.0;
+        let mut sounds = SoundEvents::default();
+        let hit = |owner, damage| Hit {
+            owner,
+            victim: 1,
+            damage,
+            bypass_armor: false,
+            impulse: Vec3::default(),
+        };
+        game.fighters[1].armor[0] = 15;
+        game.apply_hit(&map, hit(Some(0), 20), &mut sounds);
+        let (health, armor, _) = game.damage_notice().unwrap();
+        assert_eq!((health, armor), (5, 15));
+        game.apply_hit(&map, hit(None, 3), &mut sounds);
+        assert_eq!(game.damage_notice(), Some((5, 15, 0.0)));
+        game.apply_hit(&map, hit(Some(0), 130), &mut sounds);
+        assert_eq!(game.damage_notice(), Some((97, 15, 0.0)));
+        game.time += 1.0;
+        assert!(game.damage_notice().is_none());
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY assets"]
+    fn held_nonstarter_weapon_drops_once_with_remaining_ammo() {
+        let (mut map, _) = flight_fixture();
+        let mut deck = arena();
+        let index = deck
+            .props
+            .iter()
+            .position(|prop| matches!(prop.item, Some(Item::Gun(Weapon::Rocket))))
+            .unwrap();
+        map.props.push(deck.props.swap_remove(index));
+        let mut game = Match::new(
+            &map,
+            0,
+            Rules {
+                bots: 1,
+                ..Rules::default()
+            },
+        );
+        game.time = 2.0;
+        let bot = &mut game.fighters[1];
+        bot.inventory.pickup(&map.arsenal, Weapon::Rocket);
+        bot.weapon = Weapon::Rocket;
+        let before = bot.inventory.ammo(Weapon::Rocket);
+        let ammo = before.min(3);
+        assert!(bot.inventory.spend(Weapon::Rocket, before - ammo));
+        assert!(DroppedWeapon::from_fighter(&map, &game.fighters[0], game.time).is_none());
+        game.fighters[0].weapon = Weapon::Hammer;
+        assert!(DroppedWeapon::from_fighter(&map, &game.fighters[0], game.time).is_none());
+        let kill = || Hit {
+            owner: Some(0),
+            victim: 1,
+            damage: 200,
+            bypass_armor: false,
+            impulse: Vec3::default(),
+        };
+        let mut sounds = SoundEvents::default();
+        game.apply_hit(&map, kill(), &mut sounds);
+        game.apply_hit(&map, kill(), &mut sounds);
+        assert_eq!(game.drops.len(), 1);
+        assert_eq!(game.drops[0].ammo, ammo);
+        game.fighters[0].walker.position = game.drops[0].position;
+        game.update_drops(&map, 0.0, &mut sounds);
+        assert_eq!(game.drops.len(), 1);
+        game.time += 0.2;
+        game.update_drops(&map, 0.0, &mut sounds);
+        assert!(game.drops.is_empty());
+        assert!(game.fighters[0].inventory.owns(Weapon::Rocket));
+        assert_eq!(game.fighters[0].inventory.ammo(Weapon::Rocket), ammo);
+        map.props[0].visible = false;
+        game.restore_map(&mut map);
+        assert!(map.props[0].visible);
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY assets"]
+    fn bio_alt_charge_and_release_emit_each_sound_once() {
+        let (map, mut game) = flight_fixture();
+        let bio = &map.arsenal[&Weapon::Bio];
+        let charge = bio.load_sound.as_ref().unwrap();
+        let release = bio.fire.as_ref().unwrap();
+        let player = &mut game.fighters[0];
+        player.inventory.pickup(&map.arsenal, Weapon::Bio);
+        player.weapon = Weapon::Bio;
+        let ammo = player.inventory.ammo(Weapon::Bio);
+        assert!(player.inventory.spend(Weapon::Bio, ammo - 2));
+        let mut sounds = SoundEvents::default();
+        let mut hits = Vec::new();
+        let held = Command {
+            alternate: true,
+            ..Command::default()
+        };
+        game.fire(&map, 0, held, &mut hits, &mut sounds);
+        for tick in 1..=5 {
+            game.time = tick as f32;
+            game.fire(&map, 0, held, &mut hits, &mut sounds);
+        }
+        assert!(game.bolts.is_empty());
+        assert_eq!(
+            sounds
+                .waves()
+                .filter(|wave| std::sync::Arc::ptr_eq(wave, charge))
+                .count(),
+            1
+        );
+        assert_eq!(
+            sounds
+                .waves()
+                .filter(|wave| std::sync::Arc::ptr_eq(wave, release))
+                .count(),
+            0
+        );
+        game.fire(&map, 0, Command::default(), &mut hits, &mut sounds);
+        game.fire(&map, 0, Command::default(), &mut hits, &mut sounds);
+        assert_eq!(game.bolts.len(), 1);
+        assert_eq!(
+            sounds
+                .waves()
+                .filter(|wave| std::sync::Arc::ptr_eq(wave, release))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY assets"]
+    fn charged_bio_sticks_sprays_and_delays_its_explosion_in_a_match() {
+        let (mut map, mut game) = flight_fixture();
+        map.collision
+            .add_box(Vec3(115.0, -100.0, 0.0), Vec3(135.0, 100.0, 180.0));
+        game.time = 2.0;
+        game.fighters[0].inventory.pickup(&map.arsenal, Weapon::Bio);
+        game.fighters[0].weapon = Weapon::Bio;
+        let mut sounds = SoundEvents::default();
+        let mut hits = Vec::new();
+        game.fire(
+            &map,
+            0,
+            Command {
+                alternate: true,
+                ..Command::default()
+            },
+            &mut hits,
+            &mut sounds,
+        );
+        game.time += 1.2;
+        game.fire(&map, 0, Command::default(), &mut hits, &mut sounds);
+        let dt = 1.0 / 120.0;
+        for _ in 0..60 {
+            game.time += dt;
+            game.move_bolts(&map, dt, &mut hits, &mut sounds);
+            if game.bolts.first().is_some_and(|bolt| bolt.gel.is_some()) {
+                break;
+            }
+        }
+        let bolt = &game.bolts[0];
+        let surface = bolt.gel.as_ref().unwrap();
+        assert!(surface.normal.0 < -0.9 && surface.splashes >= 2);
+        let art = &map.ordnance[ordnance::Kind::Glob as usize];
+        assert!(
+            art.bio_surface_visual(bolt.position, surface.normal, 0.05, bolt.payload.scale)
+                .is_some()
+        );
+        assert!(
+            sounds
+                .waves()
+                .any(|wave| std::sync::Arc::ptr_eq(wave, art.contact.as_ref().unwrap()))
+        );
+        assert!(game.traces.is_empty());
+
+        game.time += 1.0 / 120.0;
+        game.move_bolts(&map, 1.0 / 120.0, &mut hits, &mut sounds);
+        assert_eq!(
+            game.bolts
+                .iter()
+                .filter(|bolt| bolt.payload.kind == ordnance::Kind::Splash)
+                .count(),
+            2
+        );
+        game.intercept(&map, 0, 0, &mut hits, &mut sounds);
+        let due = game.bolts[0].gel_trigger.unwrap();
+        assert!(due > game.time && game.traces.is_empty());
+        game.time = due + 0.001;
+        game.move_bolts(&map, 1.0 / 120.0, &mut hits, &mut sounds);
+        assert!(
+            game.traces
+                .iter()
+                .any(|trace| trace.explosion == ordnance::Kind::Glob)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY assets"]
     fn bio_charge_grows_one_projectile_and_switching_or_bot_abort_cancels_it() {
         let map = arena();
         let mut game = Match::new(&map, 6, Rules::default());
@@ -3776,6 +4319,8 @@ mod tests {
                     payload,
                     pilot: None,
                     next_trail: 0.0,
+                    gel: None,
+                    gel_trigger: None,
                 });
             }
             if cover {
@@ -4668,6 +5213,8 @@ mod tests {
             expires: game.time + 2.0,
             pilot: None,
             next_trail: 0.0,
+            gel: None,
+            gel_trigger: None,
             payload: ProjectilePayload {
                 kind: super::super::ordnance::Kind::Rocket,
                 damage: 85,

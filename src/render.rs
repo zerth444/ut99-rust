@@ -372,8 +372,29 @@ impl Frame {
         };
         self.zoom = (0.5 * fov.to_radians()).tan().recip();
         self.draw(map, camera, game.time);
-        self.layer(Layer::Effects);
+        self.layer(Layer::World);
         let view = self.camera_view(camera);
+        for drop in &game.drops {
+            let template = &map.props[drop.prop];
+            let model = View {
+                eye: view.eye - (drop.position - template.position),
+                ..view
+            };
+            if model.point(template.position).2 + template.radius >= NEAR {
+                self.draw_lit_faces(
+                    &template.faces,
+                    &model,
+                    game.time,
+                    false,
+                    None,
+                    None,
+                    &[],
+                    None,
+                    None,
+                );
+            }
+        }
+        self.layer(Layer::Effects);
         game.rocket_trails
             .visuals(&map.ordnance, game.time, |visual| {
                 self.draw_world_effect(&view, game.time, visual);
@@ -429,12 +450,14 @@ impl Frame {
         for trace in &game.traces {
             let art = &map.ordnance[trace.explosion as usize];
             let age = game.time - trace.born;
-            if matches!(
-                trace.explosion,
-                crate::game::ordnance::Kind::FlakShell
-                    | crate::game::ordnance::Kind::Rocket
-                    | crate::game::ordnance::Kind::Grenade
-            ) {
+            if trace.explosion.bio()
+                || matches!(
+                    trace.explosion,
+                    crate::game::ordnance::Kind::FlakShell
+                        | crate::game::ordnance::Kind::Rocket
+                        | crate::game::ordnance::Kind::Grenade
+                )
+            {
                 let progress = age / (trace.expires - trace.born);
                 if let Some(visual) = art.impact_sprite(trace.start, progress, trace.scale) {
                     self.draw_world_effect(&view, game.time, visual);
@@ -460,14 +483,19 @@ impl Frame {
                 },
             );
         }
-        for (kind, position, direction, age, scale) in game.bolts() {
+        for (kind, position, direction, age, scale, surface_age) in game.bolts() {
             let art = &map.ordnance[kind as usize];
             let direction = if direction.dot(direction) > 0.01 {
                 direction
             } else {
                 Vec3(1.0, 0.0, 0.0)
             };
-            if let Some(visual) = art.flight_visual(kind, position, direction, age, scale) {
+            let visual = if let Some(elapsed) = surface_age {
+                art.bio_surface_visual(position, direction, elapsed, scale)
+            } else {
+                art.flight_visual(kind, position, direction, age, scale)
+            };
+            if let Some(visual) = visual {
                 self.draw_world_effect(&view, game.time, visual);
                 continue;
             }

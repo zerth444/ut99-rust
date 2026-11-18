@@ -46,9 +46,18 @@ impl Inventory {
     }
 
     pub fn pickup(&mut self, art: &HashMap<Weapon, WeaponAssets>, weapon: Weapon) -> bool {
+        self.pickup_with_ammo(art, weapon, initial_ammo(art, weapon))
+    }
+
+    pub fn pickup_with_ammo(
+        &mut self,
+        art: &HashMap<Weapon, WeaponAssets>,
+        weapon: Weapon,
+        quantity: u16,
+    ) -> bool {
         let new = !self.owns(weapon);
         self.owned[weapon as usize] = true;
-        let ammo = self.grant_ammo(art, weapon, initial_ammo(art, weapon));
+        let ammo = self.grant_ammo(art, weapon, quantity);
         new || ammo
     }
 
