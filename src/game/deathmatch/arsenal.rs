@@ -97,6 +97,7 @@ pub(super) struct Shot {
     pub interval: f32,
     pub ammo: u16,
     pub path: Path,
+    pub guided: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -158,6 +159,7 @@ pub(super) fn shot(weapon: Weapon, alt: bool) -> Shot {
             damage,
             interval,
             ammo,
+            guided: false,
             path: Path::Trace {
                 range,
                 rays,
@@ -178,6 +180,7 @@ pub(super) fn shot(weapon: Weapon, alt: bool) -> Shot {
             damage,
             interval,
             ammo,
+            guided: false,
             path: Path::Missile {
                 kind,
                 blast,
@@ -211,10 +214,14 @@ pub(super) fn shot(weapon: Weapon, alt: bool) -> Shot {
             damage: 0,
             interval: 0.0,
             ammo: 0,
+            guided: false,
             path: Path::Zoom,
         },
         (Weapon::Redeemer, false) => missile(220, 1.3, 1, Warhead, 460.0, 0.0, 0),
-        (Weapon::Redeemer, true) => missile(220, 1.3, 1, Warhead, 460.0, 0.0, 0),
+        (Weapon::Redeemer, true) => Shot {
+            guided: true,
+            ..missile(220, 1.3, 1, GuidedWarhead, 460.0, 0.0, 0)
+        },
     }
 }
 

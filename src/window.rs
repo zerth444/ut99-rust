@@ -480,8 +480,15 @@ unsafe fn message_loop(
                         audio.play_events(events);
                     }
                 }
-                let view = game.fighters[0].camera(map);
+                let view = game.player_view(map);
                 if let Some(audio) = &mut audio {
+                    let flight_sound = game.guidance_left().and_then(|_| {
+                        map.arsenal
+                            .get(&crate::game::Weapon::Redeemer)?
+                            .charge_loop
+                            .as_ref()
+                    });
+                    audio.set_weapon_loop(flight_sound);
                     audio.set_volume(settings.effects_volume, settings.music_volume);
                     audio.update(&map.ambient, view.position, view.right(), !active, false);
                 }

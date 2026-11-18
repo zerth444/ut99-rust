@@ -97,6 +97,22 @@ impl Hud {
             frame.solid([x, y, width, 4], [0.08, 0.13, 0.17]);
             frame.solid([x, y, (width as f32 * progress) as i32, 4], accent);
         }
+        if let Some(seconds) = game.guidance_left() {
+            self.centered(
+                frame,
+                frame.height as i32 / 2 + (42.0 * scale) as i32,
+                scale,
+                &format!("GUIDANCE  {:.0}S", seconds.ceil()),
+                accent,
+            );
+            self.centered(
+                frame,
+                frame.height as i32 / 2 + (65.0 * scale) as i32,
+                scale,
+                "PRESS FIRE TO DETONATE",
+                white,
+            );
+        }
         if scoreboard || game.finished {
             let standings = game.standings();
             let w = (440.0 * scale) as i32;

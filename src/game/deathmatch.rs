@@ -2,6 +2,7 @@
 
 mod ai;
 mod arsenal;
+mod guidance;
 mod navigation;
 
 use super::{Item, Powerup, Weapon, WeaponAssets, shock::cylinder_hit};
@@ -14,6 +15,7 @@ use crate::{
 };
 pub use ai::Difficulty;
 use arsenal::{ChargeProfile, ChargeShape, Inventory, Path};
+use guidance::Pilot;
 use navigation::{JumpControl, JumpProgress, LiftRide, Navigation, Step, WAYPOINT_RADIUS};
 
 const RESPAWN_DELAY: f32 = 1.25;
@@ -69,6 +71,7 @@ pub struct Fighter {
     alt_held: bool,
     charge: Option<Charge>,
     charge_locked: Option<bool>,
+    wait_for_fire_release: bool,
     pub score: i16,
     pub deaths: u16,
     pub fired_at: f32,
@@ -103,6 +106,7 @@ impl Fighter {
             alt_held: false,
             charge: None,
             charge_locked: None,
+            wait_for_fire_release: false,
             score: 0,
             deaths: 0,
             fired_at: f32::NEG_INFINITY,
@@ -308,6 +312,7 @@ struct Bolt {
     expires: f32,
     born: f32,
     payload: ProjectilePayload,
+    pilot: Option<Pilot>,
 }
 
 #[derive(Clone, Copy)]
@@ -458,18 +463,45 @@ impl Match {
         (self.time < self.message_until).then_some(self.message.as_str())
     }
 
+    fn pilot_index(&self) -> Option<usize> {
+        if self.finished || self.fighters[0].health == 0 {
+            return None;
+        }
+        self.bolts
+            .iter()
+            .position(|bolt| bolt.owner == 0 && bolt.pilot.is_some())
+    }
+
+    pub fn guidance_left(&self) -> Option<f32> {
+        self.pilot_index()
+            .map(|index| self.bolts[index].expires - self.time)
+    }
+
+    pub fn player_view(&self, map: &Map) -> Camera {
+        if let Some(index) = self.pilot_index() {
+            let bolt = &self.bolts[index];
+            return bolt.pilot.as_ref().unwrap().view(bolt.position);
+        }
+        self.fighters[0].camera(map)
+    }
+
     pub(crate) fn bolts(
         &self,
     ) -> impl Iterator<Item = (super::ordnance::Kind, Vec3, Vec3, f32, f32)> + '_ {
-        self.bolts.iter().map(|bolt| {
-            (
-                bolt.payload.kind,
-                bolt.position,
-                unit(bolt.velocity),
-                self.time - bolt.born,
-                bolt.payload.scale,
-            )
-        })
+        let camera = self.pilot_index();
+        self.bolts
+            .iter()
+            .enumerate()
+            .filter(move |&(index, _)| Some(index) != camera)
+            .map(|(_, bolt)| {
+                (
+                    bolt.payload.kind,
+                    bolt.position,
+                    unit(bolt.velocity),
+                    self.time - bolt.born,
+                    bolt.payload.scale,
+                )
+            })
     }
 
     pub fn step(&mut self, map: &mut Map, command: Command, dt: f32) -> SoundEvents {
@@ -482,8 +514,29 @@ impl Match {
         }
         self.time += dt;
         self.traces.retain(|trace| trace.expires > self.time);
+        let flight = self.pilot_index();
+        let manual_detonation = flight.and_then(|index| {
+            let bolt = &mut self.bolts[index];
+            let pilot = bolt.pilot.as_mut().unwrap();
+            let speed = bolt.velocity.dot(bolt.velocity).sqrt();
+            let explode = pilot.update(command.look, command.primary || command.alternate, dt);
+            if explode {
+                let bolt = self.bolts.swap_remove(index);
+                return Some(Detonation {
+                    position: bolt.position,
+                    owner: bolt.owner,
+                    payload: bolt.payload,
+                });
+            }
+            bolt.velocity = pilot.view(bolt.position).look_direction() * speed;
+            None
+        });
         let mut inputs = Vec::with_capacity(self.fighters.len());
-        inputs.push(command);
+        inputs.push(if flight.is_some() {
+            Command::default()
+        } else {
+            command
+        });
         for id in 1..self.fighters.len() {
             inputs.push(self.bot_command(map, id, dt));
         }
@@ -650,6 +703,9 @@ impl Match {
         }
         self.separate_fighters(map);
         self.collect(map, &mut sounds);
+        if let Some(detonation) = manual_detonation {
+            self.detonate(map, vec![detonation], &mut hits, &mut sounds);
+        }
         self.move_bolts(map, dt, &mut hits, &mut sounds);
         for (id, input) in inputs.into_iter().enumerate() {
             if !hits
@@ -667,6 +723,9 @@ impl Match {
                 .fighters
                 .iter()
                 .any(|fighter| fighter.score >= self.rules.frag_limit);
+        if flight.is_some() && self.pilot_index().is_none() {
+            self.fighters[0].wait_for_fire_release = command.primary || command.alternate;
+        }
         sounds
     }
 
@@ -769,6 +828,12 @@ impl Match {
         if let Some(weapon) = requested.filter(|&weapon| weapon != fighter.weapon) {
             fighter.equip(map.arsenal.get(&weapon), weapon, self.time, sounds, id == 0);
             return;
+        }
+        if fighter.wait_for_fire_release {
+            if input.primary || input.alternate {
+                return;
+            }
+            fighter.wait_for_fire_release = false;
         }
         let weapon = fighter.weapon;
         let input_holds = |alt: bool| {
@@ -893,6 +958,7 @@ impl Match {
                 rebounds,
             } => {
                 let speed = arsenal::velocity(map, kind);
+                let guided = id == 0 && shot.guided;
                 let count = if matches!(shape, Some(ChargeShape::Volley)) {
                     units
                 } else {
@@ -907,7 +973,9 @@ impl Match {
                         velocity: aim_direction * speed + Vec3(0.0, 0.0, gravity * 115.0),
                         born: self.time,
                         expires: self.time
-                            + if rebounds > 0 && gravity > 0.0 {
+                            + if guided {
+                                guidance::FLIGHT_TIME
+                            } else if rebounds > 0 && gravity > 0.0 {
                                 2.35
                             } else {
                                 4.0
@@ -924,6 +992,7 @@ impl Match {
                             rebounds,
                             scale: if grow { 1.0 + 0.20 * extra } else { 1.0 },
                         },
+                        pilot: guided.then(|| Pilot::new(&aim)),
                     });
                 }
             }
@@ -1187,6 +1256,11 @@ impl Match {
         victim.deaths += 1;
         victim.charge = None;
         victim.fell_at = Some(self.time);
+        for bolt in &mut self.bolts {
+            if bolt.owner == hit.victim {
+                bolt.pilot = None;
+            }
+        }
         sounds.extend_at(
             map.player_audio.death.iter().flatten().take(1).cloned(),
             victim.walker.position,
@@ -1708,6 +1782,190 @@ mod tests {
         Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap()
     }
 
+    fn flight_fixture() -> (Map, Match) {
+        let mut map = arena();
+        map.collision = crate::collision::Collision::test_world();
+        map.collision
+            .add_box(Vec3(-900.0, -900.0, -96.0), Vec3(900.0, 900.0, 0.0));
+        map.starts = vec![
+            crate::map::Start {
+                position: Vec3(0.0, 0.0, 39.2),
+                yaw: 0.0,
+            },
+            crate::map::Start {
+                position: Vec3(520.0, 325.0, 39.2),
+                yaw: std::f32::consts::PI,
+            },
+        ];
+        map.navigation_points.clear();
+        map.movers.clear();
+        map.lift_exits.clear();
+        map.teleporters.clear();
+        map.props.clear();
+        let mut game = Match::new(
+            &map,
+            0,
+            Rules {
+                bots: 1,
+                ..Rules::default()
+            },
+        );
+        let player = &mut game.fighters[0];
+        player.inventory.pickup(&map.arsenal, Weapon::Redeemer);
+        player
+            .inventory
+            .grant_ammo(&map.arsenal, Weapon::Redeemer, 1);
+        player.weapon = Weapon::Redeemer;
+        (map, game)
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY assets"]
+    fn piloting_shifts_input_and_camera_until_an_armed_manual_detonation() {
+        let (mut map, mut game) = flight_fixture();
+        game.fighters[0].protected_until = f32::INFINITY;
+        let dt = 1.0 / 60.0;
+        let ammo = game.fighters[0].ammo().unwrap();
+        let launch = Command {
+            alternate: true,
+            ..Command::default()
+        };
+        game.step(&mut map, launch, dt);
+        assert!(game.guidance_left().is_some());
+        assert_eq!(game.fighters[0].ammo(), Some(ammo - 1));
+        let old_body = game.fighters[0].walker.position;
+        let old_bot = game.fighters[1].walker.position;
+        for _ in 0..16 {
+            game.step(
+                &mut map,
+                Command {
+                    look: [0.035, 0.0],
+                    movement: [1.0, 0.0],
+                    jump: true,
+                    ..launch
+                },
+                dt,
+            );
+        }
+        assert!(distance_squared(game.fighters[0].walker.position, old_body) < 1.0);
+        assert!(distance_squared(game.fighters[1].walker.position, old_bot) > 10.0);
+        assert!(game.player_view(&map).yaw > 0.45);
+        assert!(distance_squared(game.player_view(&map).position, old_body) > 5_000.0);
+        assert_eq!(
+            game.bolts().count(),
+            0,
+            "hide only the player's guided projectile"
+        );
+
+        game.step(&mut map, Command::default(), dt);
+        let detonate = Command {
+            primary: true,
+            ..Command::default()
+        };
+        game.step(&mut map, detonate, dt);
+        assert!(game.guidance_left().is_none() && game.bolts.is_empty());
+        assert!(game.traces.iter().any(|trace| trace.explosion.is_some()));
+        assert!(
+            distance_squared(
+                game.player_view(&map).position,
+                game.fighters[0].camera(&map).position
+            ) < 0.01
+        );
+        game.fighters[0].ready_at = 0.0;
+        game.step(&mut map, detonate, dt);
+        assert!(
+            game.bolts.is_empty(),
+            "the detonation press must not fire another shot"
+        );
+        game.step(&mut map, Command::default(), dt);
+        game.step(&mut map, detonate, dt);
+        assert_eq!(game.bolts.len(), 1);
+        assert!(game.bolts[0].pilot.is_none());
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY assets"]
+    fn guidance_ends_on_impact_interception_expiry_and_owner_death() {
+        let (mut map, mut game) = flight_fixture();
+        let dt = 1.0 / 60.0;
+        let launch = Command {
+            alternate: true,
+            ..Command::default()
+        };
+        for cause in ["expiry", "death", "interception", "wall"] {
+            game.restart(&mut map);
+            let owner = &mut game.fighters[0];
+            owner.inventory.pickup(&map.arsenal, Weapon::Redeemer);
+            owner.weapon = Weapon::Redeemer;
+            game.step(&mut map, launch, dt);
+            assert!(game.guidance_left().is_some());
+            let mut sounds = SoundEvents::default();
+            match cause {
+                "expiry" => {
+                    game.bolts[0].expires = game.time;
+                    game.step(&mut map, Command::default(), dt);
+                    assert!(game.bolts.is_empty());
+                }
+                "death" => {
+                    game.fighters[0].protected_until = 0.0;
+                    game.apply_hit(
+                        &map,
+                        Hit {
+                            victim: 0,
+                            owner: Some(1),
+                            damage: 1000,
+                            impulse: Vec3::default(),
+                        },
+                        &mut sounds,
+                    );
+                    assert_eq!(game.fighters[1].score, 1);
+                    assert_eq!(game.bolts[0].owner, 0);
+                    assert!(game.bolts[0].pilot.is_none());
+                }
+                "interception" => {
+                    let bot = &mut game.fighters[1];
+                    bot.inventory.pickup(&map.arsenal, Weapon::Shock);
+                    bot.weapon = Weapon::Shock;
+                    bot.yaw = std::f32::consts::PI;
+                    let eye = bot.camera(&map).position;
+                    game.bolts[0].position = eye - Vec3(190.0, 0.0, 0.0);
+                    game.fire(
+                        &map,
+                        1,
+                        Command {
+                            primary: true,
+                            ..Command::default()
+                        },
+                        &mut Vec::new(),
+                        &mut sounds,
+                    );
+                    assert!(game.bolts.is_empty());
+                    assert!(game.traces.iter().any(|trace| trace.explosion.is_some()));
+                }
+                "wall" => {
+                    map.collision
+                        .add_box(Vec3(122.0, -90.0, 0.0), Vec3(194.0, 90.0, 145.0));
+                    for _ in 0..60 {
+                        game.step(&mut map, launch, dt);
+                        if game.guidance_left().is_none() {
+                            break;
+                        }
+                    }
+                    assert!(game.bolts.is_empty());
+                    assert!(game.traces.iter().any(|trace| trace.explosion.is_some()));
+                }
+                _ => unreachable!(),
+            }
+            assert!(game.guidance_left().is_none(), "{cause}");
+            assert!(
+                distance_squared(
+                    game.player_view(&map).position,
+                    game.fighters[0].camera(&map).position
+                ) < 0.01
+            );
+        }
+    }
+
     #[test]
     #[ignore = "requires local GOTY assets"]
     fn rocket_releases_a_spread_and_does_not_rearm_until_the_trigger_is_released() {
@@ -2042,6 +2300,7 @@ mod tests {
                     born: 0.0,
                     expires: 9.0,
                     payload,
+                    pilot: None,
                 });
             }
             if cover {
@@ -2721,6 +2980,7 @@ mod tests {
             velocity: Vec3(1250.0, 0.0, 0.0),
             born: game.time,
             expires: game.time + 2.0,
+            pilot: None,
             payload: ProjectilePayload {
                 kind: super::super::ordnance::Kind::Rocket,
                 damage: 85,

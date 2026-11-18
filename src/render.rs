@@ -363,12 +363,22 @@ impl Frame {
         fov: f32,
     ) {
         let player = &game.fighters[0];
-        let fov = if player.zoomed { fov.min(35.0) } else { fov };
+        let piloting = game.guidance_left().is_some();
+        let fov = if player.zoomed && !piloting {
+            fov.min(35.0)
+        } else {
+            fov
+        };
         self.zoom = (0.5 * fov.to_radians()).tan().recip();
         self.draw(map, camera, game.time);
         self.layer(Layer::Effects);
         let view = self.camera_view(camera);
-        for (id, fighter) in game.fighters.iter().enumerate().skip(1) {
+        for (id, fighter) in game
+            .fighters
+            .iter()
+            .enumerate()
+            .skip(usize::from(!piloting))
+        {
             if let Some(pose) = fighter.pose(map, id, game.time) {
                 let cloak = fighter.health > 0
                     && fighter.invis_left(game.time) > 0.0
@@ -461,6 +471,7 @@ impl Frame {
         self.zoom = 1.0;
         if player.health > 0 && !game.finished {
             if !player.zoomed
+                && !piloting
                 && let Some(weapon) = map.arsenal.get(&player.weapon)
             {
                 let fire = if player.last_alt && !weapon.alternate_motion.frames.is_empty() {
