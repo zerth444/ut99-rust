@@ -76,6 +76,8 @@ pub(crate) struct LiftExit {
 }
 
 pub struct Map {
+    pub title: String,
+    pub author: Option<String>,
     pub scene_lights: Vec<crate::light::Light>,
     pub(crate) animated_lightmaps: Vec<Arc<Lightmap>>,
     pub coronas: Vec<crate::light::Corona>,
@@ -239,7 +241,33 @@ impl Map {
             .filter(|map| map.animated_ids().next().is_some() && seen.insert(Arc::as_ptr(map)))
             .cloned()
             .collect();
+        let mut title = path
+            .and_then(Path::file_stem)
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut author = None;
+        if let Some(level) = package
+            .exports
+            .iter()
+            .find(|actor| package.object_name(actor.class) == Some("LevelInfo"))
+        {
+            let mut properties = package.properties(level)?;
+            while let Some((name, mut value)) = properties.next()? {
+                if matches!(name, "Title" | "Author")
+                    && let Ok(value) = value.string(package.version)
+                    && !value.trim().is_empty()
+                {
+                    if name == "Title" {
+                        title = value.trim().to_owned();
+                    } else {
+                        author = Some(value.trim().to_owned());
+                    }
+                }
+            }
+        }
         Ok(Self {
+            title,
+            author,
             animated_lightmaps,
             #[cfg(windows)]
             smoke: city_intro

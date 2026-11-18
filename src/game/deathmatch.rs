@@ -89,6 +89,7 @@ pub struct Fighter {
     pulse: Option<(bool, f32)>,
     pulse_ended: Option<(bool, f32)>,
     pub(crate) minigun_firing: bool,
+    minigun_stopped_at: Option<f32>,
     charge: Option<Charge>,
     charge_locked: Option<bool>,
     wait_for_fire_release: bool,
@@ -149,6 +150,7 @@ impl Fighter {
             pulse: None,
             pulse_ended: None,
             minigun_firing: false,
+            minigun_stopped_at: None,
             charge: None,
             charge_locked: None,
             wait_for_fire_release: false,
@@ -234,6 +236,10 @@ impl Fighter {
                     .and_then(|since| art.attack_end.sample_toward(time - since, Some(&art.view)))
             })
             .or_else(|| {
+                self.minigun_stopped_at
+                    .and_then(|since| art.attack_end.sample_toward(time - since, Some(&art.view)))
+            })
+            .or_else(|| {
                 self.charge.and_then(|charge| {
                     let age = time - charge.since;
                     if self.weapon == Weapon::Rocket {
@@ -311,7 +317,7 @@ impl Fighter {
 
     fn equip(
         &mut self,
-        art: Option<&WeaponAssets>,
+        arsenal: &std::collections::HashMap<Weapon, WeaponAssets>,
         weapon: Weapon,
         time: f32,
         sounds: &mut SoundEvents,
@@ -320,10 +326,12 @@ impl Fighter {
         if self.weapon == weapon || !self.inventory.owns(weapon) {
             return;
         }
+        self.stop_minigun(arsenal, time, sounds, local);
+        let art = arsenal.get(&weapon);
         self.weapon = weapon;
         self.pulse = None;
         self.pulse_ended = None;
-        self.minigun_firing = false;
+        self.minigun_stopped_at = None;
         self.charge = None;
         self.charge_locked = None;
         self.zoom = super::SniperZoom::default();
@@ -341,6 +349,23 @@ impl Fighter {
             sounds.extend(sound);
         } else {
             sounds.extend_at(sound, self.walker.position, 500.0, 0.6);
+        }
+    }
+
+    fn stop_minigun(
+        &mut self,
+        arsenal: &std::collections::HashMap<Weapon, WeaponAssets>,
+        time: f32,
+        sounds: &mut SoundEvents,
+        local: bool,
+    ) {
+        if std::mem::take(&mut self.minigun_firing) {
+            self.minigun_stopped_at = Some(time);
+            super::emit_minigun_wind_down(
+                arsenal,
+                (!local).then_some(self.walker.position),
+                sounds,
+            );
         }
     }
 
@@ -1883,7 +1908,7 @@ impl Match {
                 .select(fighter.weapon, input.slot, input.cycle)
         });
         if let Some(weapon) = requested.filter(|&weapon| weapon != fighter.weapon) {
-            fighter.equip(map.arsenal.get(&weapon), weapon, self.time, sounds, id == 0);
+            fighter.equip(&map.arsenal, weapon, self.time, sounds, id == 0);
             return;
         }
         if fighter.wait_for_fire_release {
@@ -1949,7 +1974,9 @@ impl Match {
                 }
             }
         }
-        fighter.minigun_firing &= holding && fighter.inventory.ammo(weapon) > 0;
+        if !holding || fighter.inventory.ammo(weapon) == 0 {
+            fighter.stop_minigun(&map.arsenal, self.time, sounds, id == 0);
+        }
         let input_holds = |alt: bool| {
             if alt {
                 input.alternate && !input.primary
@@ -2059,13 +2086,7 @@ impl Match {
         shot.ammo = shot.ammo.saturating_mul(units);
         if !fighter.inventory.spend(weapon, shot.ammo) {
             let fallback = fighter.inventory.preferred(560.0);
-            fighter.equip(
-                map.arsenal.get(&fallback),
-                fallback,
-                self.time,
-                sounds,
-                id == 0,
-            );
+            fighter.equip(&map.arsenal, fallback, self.time, sounds, id == 0);
             return;
         }
         fighter.fired_at = self.time;
@@ -2087,6 +2108,7 @@ impl Match {
             fighter.pulse_ended = None;
         }
         fighter.minigun_firing = weapon == Weapon::Minigun;
+        fighter.minigun_stopped_at = None;
         let mut seed = self.time.to_bits().rotate_left(5) ^ (id as u32).wrapping_mul(0x9e37_79b9);
         let mut jitter = || ballistics::jitter(&mut seed);
         let bullet = ballistics::BulletProfile::for_weapon(
@@ -4006,7 +4028,7 @@ fn equip_pickup(
         && (fighter.ammo() == Some(0)
             || weapon.switch_priority() > fighter.weapon.switch_priority())
     {
-        fighter.equip(arsenal.get(&weapon), weapon, time, sounds, local);
+        fighter.equip(arsenal, weapon, time, sounds, local);
     }
 }
 
@@ -4841,6 +4863,52 @@ mod tests {
             (76..=80).contains(&damage),
             "one second of contact plus the initial hit gave {damage}"
         );
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY assets"]
+    fn minigun_stops_its_loop_and_plays_wind_down_once_in_both_fire_modes() {
+        let (mut map, mut game) = flight_fixture();
+        let mut sounds = SoundEvents::default();
+        let mut hits = Vec::new();
+        for (id, alternate) in [(0, false), (1, true)] {
+            game.restart(&mut map);
+            let fighter = &mut game.fighters[id];
+            fighter.inventory.pickup(&map.arsenal, Weapon::Minigun);
+            fighter.weapon = Weapon::Minigun;
+            game.time = 2.0;
+            game.fire(
+                &map,
+                id,
+                Command {
+                    primary: !alternate,
+                    alternate,
+                    ..Command::default()
+                },
+                &mut hits,
+                &mut sounds,
+            );
+            assert!(fighter_loop(&game.fighters[id], &map).is_some());
+            sounds.clear();
+            game.time += 0.01;
+            game.fire(&map, id, Command::default(), &mut hits, &mut sounds);
+            game.fire(&map, id, Command::default(), &mut hits, &mut sounds);
+            let art = &map.arsenal[&Weapon::Minigun];
+            let tail = art.load_sound.as_ref().unwrap();
+            assert_eq!(
+                sounds
+                    .waves()
+                    .filter(|wave| std::sync::Arc::ptr_eq(wave, tail))
+                    .count(),
+                1
+            );
+            assert_eq!(sounds.position_of(tail).is_some(), id != 0);
+            assert!(fighter_loop(&game.fighters[id], &map).is_none());
+            assert!(std::ptr::eq(
+                game.fighters[id].weapon_pose(art, game.time).current,
+                art.attack_end.frames[0].as_slice()
+            ));
+        }
     }
 
     #[test]
@@ -5819,13 +5887,7 @@ mod tests {
                 let fighter = &mut game.fighters[1];
                 fighter.inventory.pickup(&map.arsenal, weapon);
                 fighter.inventory.grant_ammo(&map.arsenal, weapon, u16::MAX);
-                fighter.equip(
-                    map.arsenal.get(&weapon),
-                    weapon,
-                    game.time,
-                    &mut sounds,
-                    false,
-                );
+                fighter.equip(&map.arsenal, weapon, game.time, &mut sounds, false);
                 game.time = game.time.max(fighter.ready_at);
                 let ammo_before = fighter.inventory.ammo(weapon);
                 let bolts_before = game.bolts.len();
@@ -6636,6 +6698,17 @@ mod tests {
         );
         assert!(!game.finished);
         assert_eq!(game.remaining(), 120);
+        #[cfg(windows)]
+        {
+            let mut frame = crate::render::Frame::new();
+            let camera = game.player_view(&map);
+            frame.draw_deathmatch(&map, &camera, &game, 90.0, 1.0, true);
+            let scene = frame.pixels.clone();
+            crate::hud::Hud::new().draw_deathmatch(&mut frame, &game, &map, true, true);
+            let center = frame.width * (frame.height / 2) + frame.width / 2;
+            assert_ne!(frame.pixels[center], scene[center]);
+            assert_eq!(frame.pixels[0], scene[0]);
+        }
         assert!(
             game.fighters
                 .iter()

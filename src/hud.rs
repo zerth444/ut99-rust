@@ -42,7 +42,7 @@ impl Hud {
     ) {
         frame.begin_ui(false);
         if scoreboard || game.finished {
-            self.draw_match_board(frame, game);
+            self.draw_match_board(frame, game, map);
             return;
         }
         let has_art = map.hud.ready();
@@ -187,25 +187,25 @@ impl Hud {
         }
     }
 
-    fn draw_match_board(&self, frame: &mut Frame, game: &Match) {
+    fn draw_match_board(&self, frame: &mut Frame, game: &Match, map: &Map) {
         let standings = game.standings();
         let scale = (frame.width as f32 / 790.0)
-            .min(frame.height as f32 / (168.0 + standings.len() as f32 * 30.0))
+            .min(frame.height as f32 / (191.0 + standings.len() as f32 * 27.0))
             .min(1.5);
         let px = |value: f32| (value * scale).round() as i32;
-        let width = px(if game.finished { 365.0 } else { 640.0 });
-        let height = px(144.0 + standings.len() as f32 * 30.0);
+        let width = px(if game.finished { 365.0 } else { 530.0 });
+        let height = px(164.0 + standings.len() as f32 * 27.0);
         let left = if game.finished {
             px(16.0)
         } else {
             (frame.width as i32 - width) / 2
         };
         let top = (frame.height as i32 - height) / 2;
-        let white = [0.94, 0.96, 0.98];
-        let dim = [0.67, 0.72, 0.78];
-        let accent = [0.81, 0.88, 0.98];
-        frame.solid([left, top, width, height], [0.075, 0.09, 0.12]);
-        frame.solid([left, top, width, px(76.0)], [0.11, 0.15, 0.21]);
+        let white = [0.95, 0.96, 0.98];
+        let dim = [0.76, 0.8, 0.85];
+        let accent = [0.61, 0.84, 0.90];
+        frame.shade([left, top, width, height], [0.045, 0.062, 0.078], 0.74);
+        frame.solid([left, top, width, px(2.0).max(1)], [0.36, 0.58, 0.65]);
         let score = game.fighters[standings[0]].score;
         let title = if game.finished {
             match game.winner() {
@@ -257,61 +257,74 @@ impl Hud {
         self.text(
             frame,
             left + px(22.0),
-            top + px(47.0),
+            top + px(41.0),
             scale * 0.89,
             &details,
             dim,
         );
         let columns = if game.finished {
-            [19.0, 78.0, 234.0, 289.0]
+            [22.0, 222.0, 289.0]
         } else {
-            [22.0, 100.0, 427.0, 528.0]
+            [22.0, 334.0, 435.0]
         };
-        for (x, title) in columns
-            .into_iter()
-            .zip(["Rank", "Fighter", "Frags", "Deaths"])
-        {
+        frame.shade(
+            [left, top + px(73.0), width, px(24.0)],
+            [0.22, 0.32, 0.36],
+            0.58,
+        );
+        for (x, title) in columns.into_iter().zip(["Player", "Frags", "Deaths"]) {
             self.text(
                 frame,
                 left + px(x),
-                top + px(84.0),
+                top + px(77.0),
                 scale * 0.88,
                 title,
                 dim,
             );
         }
-        let mut last_score = None;
-        let mut rank = 0;
         for (index, id) in standings.into_iter().enumerate() {
-            let y = top + px(107.0 + index as f32 * 30.0);
+            let y = top + px(98.0 + index as f32 * 27.0);
             let fighter = &game.fighters[id];
-            if Some(fighter.score) != last_score {
-                rank = index + 1;
-                last_score = Some(fighter.score);
-            }
-            let tint = if id == 0 {
-                [0.19, 0.27, 0.38]
-            } else if index % 2 == 0 {
-                [0.106, 0.13, 0.17]
-            } else {
-                [0.085, 0.11, 0.15]
-            };
-            frame.solid([left, y, width, px(30.0)], tint);
             if id == 0 {
-                frame.solid([left, y, px(3.0).max(1), px(30.0)], accent);
+                frame.shade([left, y, width, px(26.0)], [0.18, 0.37, 0.42], 0.63);
+            } else if index % 2 == 0 {
+                frame.shade([left, y, width, px(26.0)], [0.20, 0.25, 0.31], 0.17);
             }
             for (x, value) in columns.into_iter().zip([
-                rank.to_string(),
                 if id == 0 {
-                    "PLAYER (YOU)".into()
+                    "Player (you)".into()
                 } else {
                     Match::label(id)
                 },
                 fighter.score.to_string(),
                 fighter.deaths.to_string(),
             ]) {
-                self.text(frame, left + px(x), y + px(5.0), scale, &value, white);
+                self.text(
+                    frame,
+                    left + px(x),
+                    y + px(4.0),
+                    scale,
+                    &value,
+                    if id == 0 { accent } else { white },
+                );
             }
+        }
+        if !map.title.is_empty() {
+            let caption = map.author.as_ref().map_or_else(
+                || map.title.clone(),
+                |author| format!("{}  /  {author}", map.title),
+            );
+            self.text(
+                frame,
+                left + px(22.0),
+                top + height - px(53.0),
+                scale * 0.9,
+                &caption
+                    .chars()
+                    .take(if game.finished { 41 } else { 63 })
+                    .collect::<String>(),
+                dim,
+            );
         }
         if game.finished {
             self.text(

@@ -854,6 +854,7 @@ pub fn load(
                     }
                     if weapon == Weapon::Minigun {
                         weapon_assets.alternate_motion = motion(&["Shoot1"], 1.3);
+                        weapon_assets.attack_end = motion(&["UnWind"], 1.5);
                     }
                     if weapon == Weapon::Pulse {
                         weapon_assets.primary_motion = motion(&["ShootLoop"], 1.5);

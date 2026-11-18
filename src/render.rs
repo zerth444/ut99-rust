@@ -1147,6 +1147,35 @@ impl Frame {
         }
     }
 
+    #[cfg(windows)]
+    pub(crate) fn shade(&mut self, rect: [i32; 4], color: [f32; 3], alpha: f32) {
+        let color = color.map(|channel| channel * alpha);
+        if let Some(commands) = &mut self.commands {
+            quad(
+                commands,
+                [self.width, self.height],
+                rect,
+                [0.0, 0.0, 1.0, 1.0],
+                [color[0], color[1], color[2], alpha],
+                None,
+                Mode::Flash,
+                commands::WHITE,
+            );
+        } else {
+            let [x, y, width, height] = rect;
+            for py in y.max(0)..(y + height).min(self.height as i32) {
+                for px in x.max(0)..(x + width).min(self.width as i32) {
+                    let pixel = &mut self.pixels[py as usize * self.width + px as usize];
+                    let under = [16, 8, 0].map(|shift| ((*pixel >> shift) & 255) as f32);
+                    *pixel = pack(
+                        std::array::from_fn(|i| under[i] * (1.0 - alpha) + 255.0 * color[i]),
+                        1.0,
+                    );
+                }
+            }
+        }
+    }
+
     fn blit_tile(
         &mut self,
         texture: &TextureImage,

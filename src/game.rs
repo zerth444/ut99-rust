@@ -1398,11 +1398,10 @@ impl Practice {
             && (input.primary || input.alternate)
             && self.ammo().is_some_and(|ammo| ammo > 0);
         if self.minigun_firing && !minigun {
-            sounds.extend(
-                map.arsenal
-                    .get(&Weapon::Minigun)
-                    .and_then(|art| art.load_sound.clone()),
-            );
+            emit_minigun_wind_down(&map.arsenal, None, &mut sounds);
+            if self.weapon == Weapon::Minigun {
+                self.attack_end = Some((Weapon::Minigun, false, self.time));
+            }
         }
         self.minigun_firing = minigun;
         self.update_rocket_lock(map, camera, ready, &mut sounds);
@@ -2005,6 +2004,9 @@ impl Practice {
                 .and_then(|asset| asset.flash.as_ref())
                 .map_or(0.0, |flash| flash.length);
         self.last_fire = Some((weapon, alternate, self.time));
+        if weapon == Weapon::Minigun {
+            self.attack_end = None;
+        }
         self.shots += 1;
         emit_shot_sound(map, weapon, alternate, None, sounds);
         if weapon == Weapon::Shock {
@@ -2247,6 +2249,21 @@ fn shot_sound(
         return assets.alternate.clone();
     }
     assets.fire.clone()
+}
+
+fn emit_minigun_wind_down(
+    arsenal: &HashMap<Weapon, WeaponAssets>,
+    source: Option<Vec3>,
+    sounds: &mut SoundEvents,
+) {
+    let wave = arsenal
+        .get(&Weapon::Minigun)
+        .and_then(|art| art.load_sound.clone());
+    if let Some(position) = source {
+        sounds.extend_at(wave, position, CONTACT_SOUND_RADIUS, 0.9);
+    } else {
+        sounds.extend(wave);
+    }
 }
 
 fn emit_shot_sound(
