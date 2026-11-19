@@ -39,10 +39,11 @@ impl Hud {
         map: &Map,
         scoreboard: bool,
         captured: bool,
+        result_help: &str,
     ) {
         frame.begin_ui(false);
         if scoreboard || game.finished {
-            self.draw_match_board(frame, game, map);
+            self.draw_match_board(frame, game, map, result_help);
             return;
         }
         let has_art = map.hud.ready();
@@ -258,7 +259,7 @@ impl Hud {
         }
     }
 
-    fn draw_match_board(&self, frame: &mut Frame, game: &Match, map: &Map) {
+    fn draw_match_board(&self, frame: &mut Frame, game: &Match, map: &Map, result_help: &str) {
         let standings = game.standings();
         let scale = (frame.width as f32 / 790.0)
             .min(frame.height as f32 / (191.0 + standings.len() as f32 * 27.0))
@@ -445,7 +446,7 @@ impl Hud {
                 left + px(19.0),
                 top + height - px(27.0),
                 scale * 0.8,
-                "Enter for rematch    Esc for menu",
+                result_help,
                 white,
             );
         }

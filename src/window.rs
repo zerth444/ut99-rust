@@ -134,7 +134,7 @@ unsafe fn message_loop(
     mut frontend: Option<&mut Frontend>,
     settings: &mut Settings,
     settings_path: &Path,
-    mut match_rules: Option<deathmatch::Rules>,
+    match_rules: Option<deathmatch::Rules>,
     startup: bool,
 ) -> io::Result<()> {
     let mut frame = Frame::hardware(map);
@@ -169,6 +169,8 @@ unsafe fn message_loop(
     let mut windowed = None;
     let mut pilot_view = None;
     let mut practice_arena = None;
+    let mut ladder_stage = None;
+    let mut deathmatch = match_rules.map(|rules| deathmatch::Match::new(map, start, rules));
     let mut obs_announced = false;
     set_window_size(window, settings.resolution);
     if obs || settings.fullscreen {
@@ -191,16 +193,14 @@ unsafe fn message_loop(
             obs,
             MenuSession::Main,
         )? {
-            Action::StartMatch(_, mode) => {
+            action @ (Action::StartMatch(..) | Action::StartLadder(_)) => {
                 if let Some(arena) = frontend.pending_arena.take() {
                     practice_arena = Some((std::mem::replace(map, arena), start));
                     start = 6.min(map.starts.len() - 1);
                     frame = Frame::hardware(map);
                 }
-                match_rules = Some(deathmatch::Rules {
-                    mode,
-                    ..settings.match_rules()
-                })
+                ladder_stage = action.ladder_stage();
+                deathmatch = Some(frontend.start_match(map, start, action, settings));
             }
             Action::Quit => return Ok(()),
             _ => {}
@@ -215,10 +215,11 @@ unsafe fn message_loop(
     let started = Instant::now();
     let mut tick = started;
     let mut stats = FrameStats::new(started);
-    let mut deathmatch = match_rules.map(|rules| deathmatch::Match::new(map, start, rules));
     let mut restart_match = false;
     let mut briefing_page: Option<usize> = None;
     let mut match_clock = deathmatch::Timestep::default();
+    let mut advance_ladder = false;
+    let mut ladder_error = false;
 
     unsafe {
         loop {
@@ -279,7 +280,17 @@ unsafe fn message_loop(
                                 VK_ESCAPE | VK_RETURN if briefing_page.is_some() => {
                                     briefing_page = None
                                 }
-                                VK_RETURN => restart_match = true,
+                                VK_RETURN => {
+                                    let next = ladder_stage.zip(frontend.as_deref()).is_some_and(
+                                        |(stage, menu)| {
+                                            deathmatch.as_ref().is_some_and(|game| {
+                                                menu.next_ladder_stage(stage, game).is_some()
+                                            })
+                                        },
+                                    );
+                                    advance_ladder |= next;
+                                    restart_match |= !next;
+                                }
                                 VK_ESCAPE if let Some(frontend) = frontend.as_deref_mut() => {
                                     briefing_page = None;
                                     mouse.release();
@@ -300,6 +311,9 @@ unsafe fn message_loop(
                                         return Ok(());
                                     }
                                     if action == Action::LeaveMatch {
+                                        ladder_stage = None;
+                                        advance_ladder = false;
+                                        ladder_error = false;
                                         if let Some(game) = deathmatch.take() {
                                             game.restore_map(map);
                                         }
@@ -323,7 +337,8 @@ unsafe fn message_loop(
                                         )?;
                                         match action {
                                             Action::Quit => return Ok(()),
-                                            Action::StartMatch(_, mode) => {
+                                            action @ (Action::StartMatch(..)
+                                            | Action::StartLadder(_)) => {
                                                 if let Some(arena) = frontend.pending_arena.take() {
                                                     practice_arena = Some((
                                                         std::mem::replace(map, arena),
@@ -331,14 +346,11 @@ unsafe fn message_loop(
                                                     ));
                                                     start = 6.min(map.starts.len() - 1);
                                                 }
-                                                deathmatch = Some(deathmatch::Match::new(
-                                                    map,
-                                                    start,
-                                                    deathmatch::Rules {
-                                                        mode,
-                                                        ..settings.match_rules()
-                                                    },
-                                                ));
+                                                ladder_stage = action.ladder_stage();
+                                                deathmatch = Some(
+                                                    frontend
+                                                        .start_match(map, start, action, settings),
+                                                );
                                             }
                                             _ => {
                                                 game = Practice::new(map);
@@ -487,20 +499,16 @@ unsafe fn message_loop(
                                     MenuSession::Main,
                                 )? {
                                     Action::Quit => return Ok(()),
-                                    Action::StartMatch(_, mode) => {
+                                    action @ (Action::StartMatch(..) | Action::StartLadder(_)) => {
                                         if let Some(arena) = frontend.pending_arena.take() {
                                             practice_arena =
                                                 Some((std::mem::replace(map, arena), start));
                                             start = 6.min(map.starts.len() - 1);
                                         }
-                                        deathmatch = Some(deathmatch::Match::new(
-                                            map,
-                                            start,
-                                            deathmatch::Rules {
-                                                mode,
-                                                ..settings.match_rules()
-                                            },
-                                        ));
+                                        ladder_stage = action.ladder_stage();
+                                        deathmatch = Some(
+                                            frontend.start_match(map, start, action, settings),
+                                        );
                                         match_clock.clear();
                                     }
                                     _ => {
@@ -597,6 +605,53 @@ unsafe fn message_loop(
                 DispatchMessageW(&message);
             }
 
+            if std::mem::take(&mut advance_ladder)
+                && let Some((stage, frontend)) = ladder_stage.zip(frontend.as_deref())
+            {
+                let next = stage + 1;
+                match frontend.load_ladder(next) {
+                    Ok(arena) => {
+                        *map = arena;
+                        start = 6.min(map.starts.len() - 1);
+                        deathmatch = Some(frontend.start_match(
+                            map,
+                            start,
+                            Action::StartLadder(next),
+                            settings,
+                        ));
+                        ladder_stage = Some(next);
+                        ladder_error = false;
+                        frame = Frame::hardware(map);
+                        if let Some(audio) = &mut audio {
+                            audio.keep_bio_charges(|_| false);
+                            audio.set_weapon_loop(None);
+                            audio.set_world_loops(std::iter::empty());
+                            audio.set_track(map.music.as_ref());
+                        }
+                        if GetForegroundWindow() == window {
+                            mouse.capture();
+                        }
+                        tick = Instant::now();
+                        stats = FrameStats::new(tick);
+                        match_clock.clear();
+                        raw = (0, 0);
+                        primary = false;
+                        alternate = false;
+                        slot = None;
+                        cycle = 0;
+                        jump = false;
+                        dodge = None;
+                        last_direction = None;
+                        restart_match = false;
+                        briefing_page = None;
+                    }
+                    Err(error) => {
+                        eprintln!("Loading next tournament map: {error}");
+                        ladder_error = true;
+                    }
+                }
+            }
+
             let now = Instant::now();
             let frame_dt = (now - tick).as_secs_f64();
             let input_dt = (frame_dt as f32).min(0.06);
@@ -669,6 +724,12 @@ unsafe fn message_loop(
                     match_clock.clear();
                     last_direction = None;
                 }
+                let won_ladder = ladder_stage.filter(|_| game.player_won_assault());
+                if let Some(stage) = won_ladder
+                    && settings.record_assault_win(stage)
+                {
+                    save_settings(settings, settings_path);
+                }
                 let blend = if active && mouse.captured && !game.finished {
                     match_clock.body_blend()
                 } else {
@@ -718,12 +779,36 @@ unsafe fn message_loop(
                     if let Some(index) = briefing_page {
                         hud.draw_assault_briefing(&mut frame, map, index);
                     } else {
-                        hud.draw_deathmatch(&mut frame, game, map, scoreboard, mouse.captured);
+                        let result_help = if ladder_error {
+                            "Next map unavailable    Enter to retry"
+                        } else if let Some((stage, menu)) = won_ladder.zip(frontend.as_deref()) {
+                            if menu.next_ladder_stage(stage, game).is_some() {
+                                "Enter for next match    Esc for menu"
+                            } else {
+                                "Assault ladder complete    Enter to replay"
+                            }
+                        } else if ladder_stage.is_some() {
+                            "Enter to retry    Esc for menu"
+                        } else {
+                            "Enter for rematch    Esc for menu"
+                        };
+                        hud.draw_deathmatch(
+                            &mut frame,
+                            game,
+                            map,
+                            scoreboard,
+                            mouse.captured,
+                            result_help,
+                        );
                     }
-                    if settings.show_fps && briefing_page.is_none() && !scoreboard && !game.finished
+                    if settings.show_fps
+                        && briefing_page.is_none()
+                        && !scoreboard
+                        && !game.finished
+                        && game.fighters[0].fell_at.is_none()
                     {
                         let label = stats.label(window, size, presenter.software);
-                        hud.centered(&mut frame, 8, 0.8, &label, [0.72, 0.95, 0.78]);
+                        hud.text(&mut frame, 12, 8, 0.8, &label, [0.72, 0.95, 0.78]);
                     }
                     if presenter
                         .draw(
@@ -1044,6 +1129,7 @@ fn run_frontend(
     let mut menu = Menu::default();
     menu.session = session;
     menu.match_names = frontend.match_names();
+    menu.ladder_names = frontend.ladder_names();
     let logo = frontend.logo.as_ref().map(|(map, _)| map);
     let mut frame = Frame::hardware(
         intro
@@ -1155,6 +1241,16 @@ fn run_frontend(
                             Err(error) => {
                                 eprintln!("Loading match map: {error}");
                                 menu.status = "COULD NOT LOAD MAP".into();
+                            }
+                        },
+                        Action::StartLadder(stage) => match frontend.load_ladder(stage) {
+                            Ok(arena) => {
+                                frontend.pending_arena = Some(arena);
+                                return Ok(action);
+                            }
+                            Err(error) => {
+                                eprintln!("Loading tournament map: {error}");
+                                menu.status = "Could not load tournament map".into();
                             }
                         },
                         Action::Resume | Action::LeaveMatch => {

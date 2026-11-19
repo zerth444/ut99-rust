@@ -1,5 +1,6 @@
 mod font;
 mod intro;
+mod ladder;
 pub(crate) mod smoke;
 
 use std::{
@@ -12,7 +13,7 @@ use std::{
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
 use crate::{
-    game::deathmatch::Mode,
+    game::deathmatch::{Match, Mode, Rules},
     hud::Hud,
     map::Map,
     package::Package,
@@ -29,6 +30,7 @@ pub struct Frontend {
     pub logo: Option<(Map, Camera)>,
     match_maps: Vec<PathBuf>,
     pub pending_arena: Option<Map>,
+    ladder: Vec<ladder::Stage>,
     art: MenuArt,
 }
 
@@ -91,11 +93,23 @@ impl Frontend {
                 .chain(installed_maps.as_deref())
                 .chain(std::iter::once(reference_maps.as_path())),
         );
+        let names = map_names(&match_maps);
+        let ladder = std::iter::once(maps)
+            .chain(installed_maps.as_deref())
+            .chain(std::iter::once(reference_maps.as_path()))
+            .find_map(|maps| {
+                let system = maps.join("../System");
+                ladder::load(&system, &names)
+                    .map_err(|error| optional(&system, error))
+                    .ok()
+            })
+            .unwrap_or_default();
         Self {
             intro,
             logo,
             match_maps,
             pending_arena: None,
+            ladder,
             art: MenuArt::load(
                 &maps.join("../System/UMenu.u"),
                 &maps.join("../Textures/UWindowFonts.utx"),
@@ -114,24 +128,100 @@ impl Frontend {
     }
 
     pub fn match_names(&self) -> Vec<String> {
-        self.match_maps
-            .iter()
-            .filter_map(|path| path.file_stem())
-            .map(|name| name.to_string_lossy().into_owned())
-            .collect()
+        map_names(&self.match_maps)
     }
 
     pub fn load_match(&self, index: usize) -> io::Result<Option<Map>> {
         if index != 0 {
-            let path = self.match_maps.get(index).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "Selected map is unavailable")
-            })?;
-            let bytes = fs::read(path)?;
-            let package = Package::read(&bytes)?;
-            return Ok(Some(Map::load(&package, Some(path))?));
+            return self.read_map(index).map(Some);
         }
         Ok(None)
     }
+
+    fn read_map(&self, index: usize) -> io::Result<Map> {
+        let path = self.match_maps.get(index).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "Selected map is unavailable")
+        })?;
+        let bytes = fs::read(path)?;
+        let package = Package::read(&bytes)?;
+        Map::load(&package, Some(path))
+    }
+
+    pub fn load_ladder(&self, stage: usize) -> io::Result<Map> {
+        let index = self
+            .ladder
+            .get(stage)
+            .and_then(|entry| entry.installed)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "Tournament map is unavailable")
+            })?;
+        let map = self.read_map(index)?;
+        if !map.supports_mode(Mode::Assault)
+            || (stage == 0
+                && map
+                    .assault
+                    .as_ref()
+                    .is_none_or(|data| data.tutorial.is_none()))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Tournament map or tutorial assets are incomplete",
+            ));
+        }
+        Ok(map)
+    }
+
+    pub fn ladder_names(&self) -> Vec<(String, bool)> {
+        self.ladder
+            .iter()
+            .map(|stage| (stage.map.clone(), stage.installed.is_some()))
+            .collect()
+    }
+
+    pub fn ladder_len(&self) -> usize {
+        self.ladder.len()
+    }
+
+    pub fn next_ladder_stage(&self, stage: usize, game: &Match) -> Option<usize> {
+        let next = stage + 1;
+        (next < self.ladder_len() && game.player_won_assault()).then_some(next)
+    }
+
+    pub fn start_match(
+        &self,
+        map: &Map,
+        start: usize,
+        action: Action,
+        settings: &Settings,
+    ) -> Match {
+        match action {
+            Action::StartMatch(_, mode) => Match::new(
+                map,
+                start,
+                Rules {
+                    mode,
+                    ..settings.match_rules()
+                },
+            ),
+            Action::StartLadder(index) => {
+                let entry = &self.ladder[index];
+                Match::with_assault_allies(map, start, entry.rules(settings), Some(entry.allies))
+            }
+            _ => unreachable!("starting a match requires a launch action"),
+        }
+    }
+}
+
+fn map_names(paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| {
+            path.file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
 }
 
 fn match_catalog<'a>(base: &Path, directories: impl IntoIterator<Item = &'a Path>) -> Vec<PathBuf> {
@@ -226,9 +316,19 @@ pub enum Action {
     None,
     Resume,
     StartMatch(usize, Mode),
+    StartLadder(usize),
     LeaveMatch,
     Quit,
     Changed,
+}
+
+impl Action {
+    pub fn ladder_stage(self) -> Option<usize> {
+        match self {
+            Self::StartLadder(stage) => Some(stage),
+            _ => None,
+        }
+    }
 }
 
 pub enum MenuSound {
@@ -276,7 +376,7 @@ impl MenuSession {
         if self.paused() {
             &["Resume", "Main Menu", "Settings", "Quit Game"]
         } else {
-            &["New Game", "Settings", "Quit Game"]
+            &["New Game", "Tournament", "Settings", "Quit Game"]
         }
     }
 }
@@ -285,6 +385,8 @@ impl MenuSession {
 pub struct Menu {
     pub session: MenuSession,
     pub match_names: Vec<String>,
+    pub ladder_names: Vec<(String, bool)>,
+    pub ladder_stage: Option<usize>,
     match_setup: Option<MatchSetup>,
     preferences: bool,
     tab: usize,
@@ -512,7 +614,10 @@ const NAV_BUTTON_WIDTH: i32 = 88;
 impl Menu {
     pub fn state(&self) -> MenuState {
         MenuState {
-            window: self.preferences || self.quit.is_some() || self.match_setup.is_some(),
+            window: self.preferences
+                || self.quit.is_some()
+                || self.match_setup.is_some()
+                || self.ladder_stage.is_some(),
             focus: self.nav_focus,
         }
     }
@@ -590,19 +695,59 @@ impl Menu {
                 Action::None
             }
             (true, 1) => Action::LeaveMatch,
-            (true, 2) | (false, 1) => {
+            (false, 1) => {
+                self.ladder_stage = Some(
+                    settings
+                        .assault_progress
+                        .min(self.ladder_names.len().saturating_sub(1)),
+                );
+                Action::None
+            }
+            (_, 2) => {
                 self.preferences = true;
                 self.selected = 0;
                 Action::None
             }
-            (true, 3) | (false, 2) => {
+            (_, 3) => {
                 self.quit = Some(true);
                 Action::None
             }
             _ => Action::None,
         }
     }
+
+    fn ladder_launch(&self, stage: usize, settings: &Settings) -> Action {
+        if stage <= settings.assault_progress
+            && self
+                .ladder_names
+                .get(stage)
+                .is_some_and(|(_, installed)| *installed)
+        {
+            return Action::StartLadder(stage);
+        }
+        Action::None
+    }
+
     pub fn key(&mut self, key: u16, settings: &mut Settings) -> Action {
+        if let Some(stage) = self.ladder_stage {
+            self.status.clear();
+            match key {
+                VK_ESCAPE => self.ladder_stage = None,
+                VK_UP => self.ladder_stage = Some(stage.saturating_sub(1)),
+                VK_DOWN => {
+                    self.ladder_stage =
+                        Some((stage + 1).min(self.ladder_names.len().saturating_sub(1)))
+                }
+                VK_PRIOR => self.ladder_stage = Some(stage.saturating_sub(MAPS_PER_PAGE)),
+                VK_NEXT => {
+                    self.ladder_stage =
+                        Some((stage + MAPS_PER_PAGE).min(self.ladder_names.len().saturating_sub(1)))
+                }
+                VK_RETURN | VK_SPACE => return self.ladder_launch(stage, settings),
+                _ => {}
+            }
+            return Action::None;
+        }
         if let Some(setup) = &mut self.match_setup {
             let count = setup.maps.len();
             match key {
@@ -720,6 +865,28 @@ impl Menu {
         }
         let ui = Layout::new(size, self.dpi);
         let [x, y] = ui.local(x, y);
+        if let Some(stage) = self.ladder_stage {
+            let [left, top, width, _] = ui.match_rect(size);
+            let (x, y) = (x - left, y - top);
+            self.status.clear();
+            if ((width - 16..width - 2).contains(&x) && (0..16).contains(&y))
+                || ((222..305).contains(&x) && (210..226).contains(&y))
+            {
+                self.ladder_stage = None;
+            } else if (12..416).contains(&x) && (47..191).contains(&y) {
+                let row = stage / MAPS_PER_PAGE * MAPS_PER_PAGE + ((y - 47) / 18) as usize;
+                if row < self.ladder_names.len() {
+                    self.ladder_stage = Some(row);
+                }
+            } else if (210..226).contains(&y) && (12..89).contains(&x) {
+                return self.key(VK_PRIOR, settings);
+            } else if (210..226).contains(&y) && (96..173).contains(&x) {
+                return self.key(VK_NEXT, settings);
+            } else if (313..416).contains(&x) && (210..226).contains(&y) {
+                return self.ladder_launch(stage, settings);
+            }
+            return Action::None;
+        }
         if let Some(setup) = &mut self.match_setup {
             let [left, top, width, _] = ui.match_rect(size);
             let (x, y) = (x - left, y - top);
@@ -941,7 +1108,10 @@ impl Menu {
                 );
             }
         }
-        let nav_active = !self.preferences && self.match_setup.is_none() && self.quit.is_none();
+        let nav_active = !self.preferences
+            && self.match_setup.is_none()
+            && self.quit.is_none()
+            && self.ladder_stage.is_none();
         for (item, caption) in self.session.entries().iter().enumerate() {
             let x = item as i32 * NAV_BUTTON_WIDTH;
             if nav_active && self.nav_hover.unwrap_or(self.nav_focus) == item {
@@ -959,6 +1129,66 @@ impl Menu {
                 }
             }
             label(frame, x + 7, 1, caption);
+        }
+        if let Some(stage) = self.ladder_stage {
+            let rect @ [x, y, _, _] = ui.match_rect(size);
+            ui.window(frame, art, rect);
+            label(frame, x + 5, y + 1, "Tournament");
+            label(frame, x + 12, y + 29, "Assault");
+            ui.tile(frame, None, [x + 12, y + 47, 404, 144], FIELD_COLOR);
+            let page = stage / MAPS_PER_PAGE * MAPS_PER_PAGE;
+            for (row, (map, installed)) in self
+                .ladder_names
+                .iter()
+                .enumerate()
+                .skip(page)
+                .take(MAPS_PER_PAGE)
+            {
+                let top = y + 47 + 18 * (row - page) as i32;
+                if row == stage {
+                    let selected = [x + 12, top, 404, 18];
+                    ui.tile(frame, art.highlight.as_ref(), selected, [0.52, 0.64, 0.81]);
+                    ui.solid_outline(frame, selected);
+                }
+                label(frame, x + 18, top + 2, map);
+                let status = if !installed {
+                    "Map unavailable"
+                } else if row < settings.assault_progress {
+                    "Complete"
+                } else if row > settings.assault_progress {
+                    "Locked"
+                } else {
+                    "Ready"
+                };
+                label(frame, x + 318, top + 2, status);
+            }
+            for (left, width, caption, enabled) in [
+                (12, 77, "Previous", page > 0),
+                (
+                    96,
+                    77,
+                    "Next",
+                    page + MAPS_PER_PAGE < self.ladder_names.len(),
+                ),
+                (222, 83, "Back", true),
+                (
+                    313,
+                    103,
+                    "Start match",
+                    self.ladder_launch(stage, settings) != Action::None,
+                ),
+            ] {
+                if enabled {
+                    ui.button(frame, art, [x + left, y + 210, width, 16]);
+                    label(frame, x + left + 8, y + 211, caption);
+                }
+            }
+            if self.ladder_names.is_empty() {
+                label(frame, x + 12, y + 235, "Assault ladder data unavailable");
+            } else if !self.status.is_empty() {
+                label(frame, x + 12, y + 235, &self.status);
+            }
+            return;
         }
         if let Some(setup) = &self.match_setup {
             let rect @ [x, y, _, _] = ui.match_rect(size);
@@ -1443,7 +1673,7 @@ mod tests {
         assert!(menu.key(VK_RETURN, &mut settings) == Action::StartMatch(0, Mode::Deathmatch));
         menu.key(VK_ESCAPE, &mut settings);
 
-        assert!(click(&mut menu, 1, &mut settings) == Action::None);
+        assert!(click(&mut menu, 2, &mut settings) == Action::None);
         assert!(menu.preferences);
         menu.key(VK_TAB, &mut settings);
         assert!(menu.key(VK_LEFT, &mut settings) == Action::Changed);
@@ -1471,7 +1701,7 @@ mod tests {
         let mut menu = Menu::default();
         let size = [900, 600];
         let [x, y] = Layout::new(size, menu.dpi).panel;
-        assert!(menu.activate(1, &settings) == Action::None);
+        assert!(menu.activate(2, &settings) == Action::None);
         let resolution_y = y + 16 + row_y(1);
         let combo_x = x + CHOICE_LEFT + 10;
         menu.click(size, combo_x, resolution_y + 8, VK_LBUTTON, &mut settings);
@@ -1484,6 +1714,30 @@ mod tests {
         assert_eq!(settings.bot_difficulty, 3);
         menu.key(VK_ESCAPE, &mut settings);
         assert!(!menu.preferences);
+    }
+
+    #[test]
+    fn assault_tournament_selects_the_checkpoint_and_blocks_locked_or_missing_maps() {
+        let mut settings = Settings::default();
+        let mut menu = Menu::default();
+        menu.ladder_names = vec![
+            ("AS-Tutorial".into(), true),
+            ("AS-Frigate".into(), true),
+            ("AS-HiSpeed".into(), false),
+        ];
+        assert!(menu.activate(1, &settings) == Action::None);
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::StartLadder(0));
+        menu.key(VK_DOWN, &mut settings);
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::None);
+        menu.key(VK_ESCAPE, &mut settings);
+        assert!(settings.record_assault_win(0));
+        assert!(!settings.record_assault_win(0));
+        assert!(!settings.record_assault_win(2));
+        menu.activate(1, &settings);
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::StartLadder(1));
+        assert!(settings.record_assault_win(1));
+        menu.key(VK_DOWN, &mut settings);
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::None);
     }
     #[test]
     fn deathmatch_setup_applies_draft_rules_only_after_successful_launch() {

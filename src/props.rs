@@ -317,7 +317,7 @@ impl VisualProperties {
     }
 }
 
-fn class_properties<'p, 'a>(
+pub(crate) fn class_properties<'p, 'a>(
     package: &'p Package<'a>,
     class: &Export,
 ) -> io::Result<Properties<'p, 'a>> {

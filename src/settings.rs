@@ -37,6 +37,7 @@ pub struct Settings {
     pub bot_count: u32,
     pub frag_limit: u32,
     pub match_minutes: u32,
+    pub assault_progress: usize,
     pub gui_skin: usize,
     pub field_of_view: u32,
     pub hud_scale: u32,
@@ -64,6 +65,7 @@ impl Default for Settings {
             bot_count: 3,
             frag_limit: 10,
             match_minutes: 5,
+            assault_progress: 0,
             gui_skin: 0,
             field_of_view: 90,
             hud_scale: 100,
@@ -77,6 +79,14 @@ impl Default for Settings {
 }
 
 impl Settings {
+    pub fn record_assault_win(&mut self, stage: usize) -> bool {
+        if stage != self.assault_progress {
+            return false;
+        }
+        self.assault_progress += 1;
+        true
+    }
+
     pub fn load(path: &Path) -> io::Result<Self> {
         let text = match fs::read_to_string(path) {
             Ok(text) => text,
@@ -107,6 +117,7 @@ impl Settings {
                 "bot_count" => settings.bot_count = value.min(8),
                 "frag_limit" => settings.frag_limit = value.min(100),
                 "match_minutes" => settings.match_minutes = value.min(60),
+                "assault_progress" => settings.assault_progress = value.min(32) as usize,
                 "gui_skin" => settings.gui_skin = (value as usize).min(GUI_SKINS.len() - 1),
                 "fov" => settings.field_of_view = value.clamp(75, 120),
                 "hud_scale" => settings.hud_scale = value.clamp(50, 150),
@@ -171,8 +182,8 @@ impl Settings {
         use std::fmt::Write;
         let _ = writeln!(
             text,
-            "bot_count={}\nfrag_limit={}\nmatch_minutes={}",
-            self.bot_count, self.frag_limit, self.match_minutes
+            "bot_count={}\nfrag_limit={}\nmatch_minutes={}\nassault_progress={}",
+            self.bot_count, self.frag_limit, self.match_minutes, self.assault_progress
         );
         for (index, key) in self.bindings.iter().enumerate() {
             let _ = writeln!(text, "bind{index}={key}");
@@ -235,6 +246,8 @@ mod tests {
         settings.bot_count = 5;
         settings.frag_limit = 25;
         settings.match_minutes = 12;
+        assert!(settings.record_assault_win(0));
+        assert!(settings.record_assault_win(1));
         settings.bind(0, b'I' as u16);
         settings.bind(6, 2);
         settings.save(&path).unwrap();

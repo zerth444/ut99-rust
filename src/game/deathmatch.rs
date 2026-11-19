@@ -800,6 +800,7 @@ impl shock::Targets for ShockTargets<'_> {
 }
 
 pub struct Match {
+    assault_allies: Option<usize>,
     rules: Rules,
     objectives: objectives::Objectives,
     assault: Option<assault::Round>,
@@ -846,8 +847,18 @@ pub struct AssaultStatus<'a> {
 
 impl Match {
     pub fn new(map: &Map, start: usize, rules: Rules) -> Self {
+        Self::with_assault_allies(map, start, rules, None)
+    }
+
+    pub(crate) fn with_assault_allies(
+        map: &Map,
+        start: usize,
+        rules: Rules,
+        assault_allies: Option<usize>,
+    ) -> Self {
         let mut game = Self {
             rules,
+            assault_allies,
             objectives: objectives::Objectives::new(map, rules.mode),
             assault: map
                 .assault
@@ -1048,6 +1059,9 @@ impl Match {
         {
             return Some(usize::from(fighter > training.allies));
         }
+        if let Some(allies) = self.assault_allies {
+            return Some(usize::from(fighter > allies));
+        }
         self.rules.mode.team_based().then_some(fighter % 2)
     }
 
@@ -1075,6 +1089,11 @@ impl Match {
             .mode
             .team_based()
             .then_some(self.objectives.scores)
+    }
+    pub fn player_won_assault(&self) -> bool {
+        self.finished
+            && self.assault.is_some()
+            && self.objectives.scores[0] > self.objectives.scores[1]
     }
     pub fn flag_status(&self) -> Option<[&'static str; 2]> {
         self.objectives.flag_status()
@@ -5363,11 +5382,37 @@ mod tests {
         game.time += 2.0;
         let events = game.step(&mut map, Command::default(), dt);
         assert!(game.finished && game.winner() == Some(0));
+        assert!(game.player_won_assault());
         assert!(
             events
                 .waves()
                 .any(|wave| std::sync::Arc::ptr_eq(wave, &completion))
         );
+        #[cfg(windows)]
+        {
+            use crate::{
+                frontend::{Action, Frontend},
+                settings::Settings,
+            };
+            let frontend = Frontend::load(path, false);
+            let mut settings = Settings::default();
+            let next = frontend.next_ladder_stage(0, &game).unwrap();
+            assert!(settings.record_assault_win(0));
+            assert_eq!(next, settings.assault_progress);
+            let frigate = frontend.load_ladder(next).unwrap();
+            let rated = frontend.start_match(&frigate, 0, Action::StartLadder(next), &settings);
+            assert_eq!(rated.fighters.len(), 8);
+            assert_eq!(
+                rated
+                    .fighters
+                    .iter()
+                    .filter(|fighter| fighter.team == Some(0))
+                    .count(),
+                4
+            );
+            assert!(!rated.training_assault());
+            assert_eq!(frontend.next_ladder_stage(next, &rated), None);
+        }
         game.step(
             &mut map,
             Command {
@@ -8154,7 +8199,7 @@ mod tests {
             let mut frame = crate::render::Frame::new();
             frame.draw_deathmatch(&map, &camera, &game, 90.0, 1.0, false);
             let scene = frame.pixels.clone();
-            crate::hud::Hud::new().draw_deathmatch(&mut frame, &game, &map, false, false);
+            crate::hud::Hud::new().draw_deathmatch(&mut frame, &game, &map, false, false, "");
             let center = frame.width * (frame.height / 2) + frame.width / 2;
             let panel = frame.width * (frame.height / 2) + frame.width / 6;
             assert_ne!(
@@ -8185,7 +8230,7 @@ mod tests {
             let camera = game.player_view(&map);
             frame.draw_deathmatch(&map, &camera, &game, 90.0, 1.0, true);
             let scene = frame.pixels.clone();
-            crate::hud::Hud::new().draw_deathmatch(&mut frame, &game, &map, true, true);
+            crate::hud::Hud::new().draw_deathmatch(&mut frame, &game, &map, true, true, "");
             let center = frame.width * (frame.height / 2) + frame.width / 2;
             assert_ne!(frame.pixels[center], scene[center]);
             assert_eq!(frame.pixels[0], scene[0]);
