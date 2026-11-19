@@ -1891,6 +1891,12 @@ impl Match {
                 .filter(|fighter| fighter.health > 0)
                 .map(|fighter| &mut fighter.walker)
                 .collect();
+            let mut cargo = self
+                .dm_training
+                .as_mut()
+                .zip(map.dm_training.as_ref())
+                .map(|(session, data)| session.platform_cargo(data))
+                .unwrap_or_default();
             for (mover, request) in map.movers.iter_mut().zip(requests) {
                 let stop = request.map(|(_, stop)| stop);
                 if let Some(round) = &mut self.assault {
@@ -1899,8 +1905,10 @@ impl Match {
                     {
                         round.emit(self.time, event, attacker);
                     }
-                } else {
+                } else if cargo.is_empty() {
                     mover.tick_many(&mut map.collision, &mut walkers, dt, stop);
+                } else {
+                    mover.tick_with_cargo(&mut map.collision, &mut walkers, &mut cargo, dt, stop);
                 }
             }
         }

@@ -69,6 +69,50 @@ pub(crate) enum LiftStop {
     Away,
 }
 
+pub(crate) struct Cargo<'a> {
+    pub position: &'a mut Vec3,
+    pub radius: f32,
+    pub height: f32,
+    pub resting: bool,
+}
+
+impl Cargo<'_> {
+    fn supported_by(&self, world: &Collision, hull: usize) -> bool {
+        self.resting
+            && world
+                .projectile_contact(
+                    *self.position + Vec3(0.0, 0.0, 0.2),
+                    Vec3(0.0, 0.0, -1.2),
+                    self.radius,
+                    self.height,
+                )
+                .is_some_and(|(_, normal, hit)| hit == hull && normal.2 > 0.7)
+    }
+
+    fn overlaps(&self, min: Vec3, max: Vec3) -> bool {
+        let Vec3(x, y, z) = *self.position;
+        let radius = (self.radius - 0.5).max(0.0);
+        let dx = x - x.clamp(min.0, max.0);
+        let dy = y - y.clamp(min.1, max.1);
+        z + self.height > min.2 + 0.5
+            && z - self.height < max.2 - 0.5
+            && dx * dx + dy * dy < radius * radius
+    }
+
+    fn rests_on(&self, base: &Self) -> bool {
+        let offset = *self.position - *base.position;
+        self.resting
+            && (offset.2 - self.height - base.height).abs() <= 1.0
+            && offset.0.hypot(offset.1) < self.radius + base.radius
+    }
+
+    fn overlaps_cargo(&self, other: &Self, delta: Vec3) -> bool {
+        let offset = *self.position + delta - *other.position;
+        offset.2.abs() < self.height + other.height - 0.5
+            && offset.0.hypot(offset.1) < self.radius + other.radius - 0.5
+    }
+}
+
 impl LiftStop {
     pub fn opposite(self) -> Self {
         match self {
@@ -222,7 +266,18 @@ impl Mover {
         dt: f32,
         service: Option<LiftStop>,
     ) {
-        self.tick_motion(world, walkers, dt, service, false);
+        self.tick_motion(world, walkers, &mut [], dt, service, false);
+    }
+
+    pub(crate) fn tick_with_cargo(
+        &mut self,
+        world: &mut Collision,
+        walkers: &mut [&mut Walker],
+        cargo: &mut [Cargo<'_>],
+        dt: f32,
+        service: Option<LiftStop>,
+    ) {
+        self.tick_motion(world, walkers, cargo, dt, service, false);
     }
 
     pub(crate) fn signal(&mut self, tag: usize, attacker: bool) {
@@ -278,7 +333,7 @@ impl Mover {
         service: Option<LiftStop>,
     ) -> Option<(usize, bool)> {
         let before = self.fraction;
-        self.tick_motion(world, walkers, dt, service, true);
+        self.tick_motion(world, walkers, &mut [], dt, service, true);
         self.event
             .filter(|_| before != 1.0 && self.fraction == 1.0)
             .map(|event| (event, self.signaled.unwrap_or(false)))
@@ -288,6 +343,7 @@ impl Mover {
         &mut self,
         world: &mut Collision,
         walkers: &mut [&mut Walker],
+        cargo: &mut [Cargo<'_>],
         dt: f32,
         service: Option<LiftStop>,
         scripted: bool,
@@ -364,6 +420,45 @@ impl Mover {
                 self.opening = !self.opening;
                 return;
             }
+            let mut carried: Vec<_> = cargo
+                .iter()
+                .map(|item| item.supported_by(world, id))
+                .collect();
+            for _ in 0..cargo.len() {
+                let mut changed = false;
+                for (index, item) in cargo.iter().enumerate() {
+                    if !carried[index]
+                        && cargo
+                            .iter()
+                            .zip(&carried)
+                            .any(|(base, moved)| *moved && item.rests_on(base))
+                    {
+                        carried[index] = true;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            for (item, &rider) in cargo.iter().zip(&carried) {
+                if rider {
+                    if !world.has_clear_cargo_path(
+                        *item.position,
+                        delta,
+                        item.radius,
+                        item.height,
+                        id,
+                    ) || cargo.iter().zip(&carried).any(|(other, &other_rider)| {
+                        !other_rider && item.overlaps_cargo(other, delta)
+                    }) {
+                        return;
+                    }
+                } else if item.overlaps(new_min, new_max) {
+                    self.opening = !self.opening;
+                    return;
+                }
+            }
             let riders: Vec<_> = walkers
                 .iter()
                 .enumerate()
@@ -381,6 +476,11 @@ impl Mover {
                         walkers[index].position = position;
                     }
                     return;
+                }
+            }
+            for (item, rider) in cargo.iter_mut().zip(carried) {
+                if rider {
+                    *item.position = *item.position + delta;
                 }
             }
         }
@@ -718,5 +818,75 @@ mod tests {
             lift.offset,
             lift.triggers
         );
+    }
+
+    #[test]
+    #[ignore = "requires the local GOTY Deck16 map"]
+    fn deck16_lift_carries_a_stack_and_stops_before_crushing_it() {
+        let bytes = std::fs::read("local/goty/Maps/DM-Deck16][.unr").unwrap();
+        let package = Package::read(&bytes).unwrap();
+        let mut map = Map::load(&package, None).unwrap();
+        let lift = map
+            .movers
+            .iter_mut()
+            .find(|mover| mover.travel.2 > 64.0)
+            .unwrap();
+        let center = (lift.min + lift.max) * 0.5;
+        let mut lower = Vec3(center.0, center.1, lift.max.2 + 6.2);
+        let mut upper = lower + Vec3(0.0, 0.0, 12.2);
+        let origin = [lower, upper];
+        // A short ceiling is placed partway through the lift's travel.
+        let ceiling = upper.2 + 30.0;
+        map.collision.add_box(
+            Vec3(center.0 - 20.0, center.1 - 20.0, ceiling),
+            Vec3(center.0 + 20.0, center.1 + 20.0, ceiling + 8.0),
+        );
+        let mut cargo = [
+            Cargo {
+                position: &mut lower,
+                radius: 6.0,
+                height: 6.0,
+                resting: true,
+            },
+            Cargo {
+                position: &mut upper,
+                radius: 6.0,
+                height: 6.0,
+                resting: true,
+            },
+        ];
+        for _ in 0..240 {
+            lift.tick_with_cargo(
+                &mut map.collision,
+                &mut [],
+                &mut cargo,
+                1.0 / 120.0,
+                Some(LiftStop::Away),
+            );
+        }
+        assert!(
+            lift.offset.2 > 18.0 && lift.offset.2 <= 24.0,
+            "{:?}",
+            lift.offset
+        );
+        for (item, start) in cargo.iter().zip(origin) {
+            let error = *item.position - start - lift.offset;
+            assert!(error.dot(error) < 0.01);
+        }
+        assert!(cargo[1].position.2 + cargo[1].height <= ceiling);
+        for _ in 0..240 {
+            lift.tick_with_cargo(
+                &mut map.collision,
+                &mut [],
+                &mut cargo,
+                1.0 / 120.0,
+                Some(LiftStop::Home),
+            );
+        }
+        assert!(lift.offset.dot(lift.offset) < 0.01);
+        for (item, start) in cargo.iter().zip(origin) {
+            let error = *item.position - start;
+            assert!(error.dot(error) < 0.01);
+        }
     }
 }

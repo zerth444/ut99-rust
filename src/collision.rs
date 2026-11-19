@@ -125,12 +125,23 @@ impl Collision {
     }
 
     fn sweep(&self, start: Vec3, delta: Vec3, extent: Vec3) -> Option<Hit> {
+        self.sweep_except(start, delta, extent, None)
+    }
+
+    fn sweep_except(
+        &self,
+        start: Vec3,
+        delta: Vec3,
+        extent: Vec3,
+        ignored: Option<usize>,
+    ) -> Option<Hit> {
         let end = start + delta;
         let lo = Vec3(start.0.min(end.0), start.1.min(end.1), start.2.min(end.2)) - extent;
         let hi = Vec3(start.0.max(end.0), start.1.max(end.1), start.2.max(end.2)) + extent;
         let mut best: Option<Hit> = None;
         for (index, hull) in self.hulls.iter().enumerate() {
-            if hi.0 < hull.min.0
+            if ignored == Some(index)
+                || hi.0 < hull.min.0
                 || hi.1 < hull.min.1
                 || hi.2 < hull.min.2
                 || lo.0 > hull.max.0
@@ -149,6 +160,18 @@ impl Collision {
             }
         }
         best
+    }
+
+    pub(crate) fn has_clear_cargo_path(
+        &self,
+        origin: Vec3,
+        delta: Vec3,
+        radius: f32,
+        height: f32,
+        support: usize,
+    ) -> bool {
+        self.sweep_except(origin, delta, Vec3(radius, radius, height), Some(support))
+            .is_none()
     }
 
     pub fn ray(&self, start: Vec3, delta: Vec3) -> Option<Vec3> {

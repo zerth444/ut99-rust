@@ -658,12 +658,14 @@ pub fn load(
         if !faces.is_empty() {
             if dm_training && map.object_name(actor.class) == Some("Barrel") {
                 let (mut health, mut pushable, mut fixed) = (0, false, false);
+                let mut mass = 100.0_f32;
                 let mut read_rules = |mut properties: Properties<'_, '_>| -> io::Result<()> {
                     while let Some(mut property) = properties.next_tag()? {
                         match property.name {
                             "Health" => health = property.value.u32()? as i32,
                             "bPushable" => pushable = property.boolean.unwrap_or(false),
                             "bStatic" => fixed = property.boolean.unwrap_or(false),
+                            "Mass" => mass = property.value.f32()?.max(1.0),
                             _ => {}
                         }
                     }
@@ -684,6 +686,7 @@ pub fn load(
                     health,
                     pushable,
                     fixed,
+                    mass,
                 });
             }
             let mut properties = map.properties(actor)?;

@@ -8,11 +8,9 @@ use crate::{
 };
 
 use super::{Command, Fighter};
+mod barrels;
 pub(crate) mod gibs;
-use crate::{
-    collision::{PLAYER_HEIGHT, PLAYER_RADIUS},
-    sound::CONTACT_SOUND_RADIUS,
-};
+use crate::sound::CONTACT_SOUND_RADIUS;
 
 pub(crate) struct Lesson {
     pub text: String,
@@ -25,6 +23,7 @@ pub(crate) struct Barrel {
     pub health: i32,
     pub pushable: bool,
     pub fixed: bool,
+    pub mass: f32,
 }
 
 pub(super) struct BarrelState {
@@ -75,6 +74,23 @@ pub(super) struct Session {
 }
 
 impl Session {
+    pub fn platform_cargo(&mut self, data: &Data) -> Vec<crate::mover::Cargo<'_>> {
+        if !self.barrels_revealed {
+            return Vec::new();
+        }
+        self.barrels
+            .iter_mut()
+            .zip(&data.barrels)
+            .filter(|(barrel, _)| barrel.health >= 0)
+            .map(|(barrel, data)| crate::mover::Cargo {
+                position: &mut barrel.volume.position,
+                radius: barrel.volume.radius,
+                height: barrel.volume.height,
+                resting: !barrel.falling && !data.fixed,
+            })
+            .collect()
+    }
+
     pub fn new(data: &Data) -> Self {
         Self {
             current: None,
@@ -229,109 +245,6 @@ impl Session {
                             .then_some((index + 1, barrel.volume))
                     }),
             )
-    }
-
-    pub fn move_barrels(
-        &mut self,
-        map: &Map,
-        fighters: &mut [Fighter],
-        time: f32,
-        dt: f32,
-        sounds: &mut SoundEvents,
-    ) {
-        let Some(data) = map.dm_training.as_ref().filter(|_| self.barrels_revealed) else {
-            return;
-        };
-        for (index, (state, barrel)) in self.barrels.iter_mut().zip(&data.barrels).enumerate() {
-            if state.health < 0 {
-                continue;
-            }
-            if state.push_until.is_some_and(|until| time >= until) {
-                state.push_until = None;
-                sounds.extend_at(
-                    data.push_sounds[1].iter().cloned(),
-                    state.volume.position,
-                    CONTACT_SOUND_RADIUS,
-                    1.0,
-                );
-            }
-            if state.falling {
-                let start = state.volume.position;
-                state.velocity = state.velocity + map.collision.regions.at(start).gravity * dt;
-                let travel = state.velocity * dt;
-                if let Some((point, normal)) = map.collision.projectile_surface(
-                    start,
-                    travel,
-                    state.volume.radius,
-                    state.volume.height,
-                ) {
-                    state.volume.position = point + normal * 0.2;
-                    if state.velocity.2 < -200.0 {
-                        state.health = state.health.saturating_sub(100);
-                        if state.health < 0 {
-                            self.debris.break_decoration(
-                                &data.debris,
-                                index,
-                                time,
-                                state.volume.position,
-                                normal * 10_000.0,
-                                1.75,
-                            );
-                            continue;
-                        }
-                    }
-                    state.velocity = Vec3::default();
-                    state.falling = false;
-                } else {
-                    state.volume.position = start + travel;
-                }
-            }
-            for fighter in fighters.iter_mut().filter(|fighter| fighter.health > 0) {
-                let delta = fighter.walker.position - state.volume.position;
-                let distance = delta.0.hypot(delta.1);
-                let radius = PLAYER_RADIUS + state.volume.radius;
-                if distance >= radius || delta.2.abs() >= PLAYER_HEIGHT + state.volume.height {
-                    continue;
-                }
-                let velocity = fighter.walker.velocity();
-                let outward = if distance > 0.001 {
-                    Vec3(delta.0 / distance, delta.1 / distance, 0.0)
-                } else {
-                    Vec3(-fighter.yaw.cos(), -fighter.yaw.sin(), 0.0)
-                };
-                fighter
-                    .walker
-                    .carry(&map.collision, outward * (radius - distance));
-                if barrel.fixed
-                    || !barrel.pushable
-                    || map.collision.profile.mass <= 40.0
-                    || velocity.dot(outward) >= 0.0
-                {
-                    continue;
-                }
-                let speed = velocity.dot(velocity).sqrt();
-                let push = velocity * ((20.0 + speed).min(120.0) / speed);
-                state.velocity = Vec3(
-                    push.0,
-                    push.1,
-                    if state.falling {
-                        state.velocity.2
-                    } else {
-                        25.0
-                    },
-                );
-                state.falling = true;
-                if state.push_until.is_none() {
-                    sounds.extend_at(
-                        data.push_sounds[0].iter().cloned(),
-                        state.volume.position,
-                        CONTACT_SOUND_RADIUS,
-                        0.25,
-                    );
-                }
-                state.push_until = Some(time + 0.3);
-            }
-        }
     }
 
     pub fn trace(&self, data: &Data, start: Vec3, delta: Vec3) -> Option<(f32, usize)> {
