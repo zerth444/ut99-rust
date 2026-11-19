@@ -32,6 +32,7 @@ pub struct Frontend {
     pub pending_arena: Option<Map>,
     assault_ladder: ladder::Campaign,
     deathmatch_ladder: ladder::Campaign,
+    ctf_ladder: ladder::Campaign,
     art: MenuArt,
 }
 
@@ -114,6 +115,7 @@ impl Frontend {
             pending_arena: None,
             assault_ladder: load_ladder(Mode::Assault),
             deathmatch_ladder: load_ladder(Mode::Deathmatch),
+            ctf_ladder: load_ladder(Mode::CaptureTheFlag),
             art: MenuArt::load(
                 &maps.join("../System/UMenu.u"),
                 &maps.join("../Textures/UWindowFonts.utx"),
@@ -155,6 +157,7 @@ impl Frontend {
         match mode {
             Mode::Assault => &self.assault_ladder,
             Mode::Deathmatch => &self.deathmatch_ladder,
+            Mode::CaptureTheFlag => &self.ctf_ladder,
             _ => unreachable!("invalid tournament track"),
         }
     }
@@ -198,8 +201,8 @@ impl Frontend {
         self.campaign(mode).stages.len()
     }
 
-    pub fn ladder_teams(&self) -> Vec<String> {
-        self.assault_ladder
+    pub fn ladder_teams(&self, mode: Mode) -> Vec<String> {
+        self.campaign(mode)
             .teams
             .iter()
             .map(|team| team.name.clone())
@@ -230,7 +233,7 @@ impl Frontend {
             Action::StartLadder(mode, index) => {
                 let campaign = self.campaign(mode);
                 let entry = &campaign.stages[index];
-                let roster = campaign.roster(mode, entry, settings.assault_team);
+                let roster = campaign.roster(mode, entry, settings.ladder_team(mode));
                 Match::with_rated_roster(map, start, entry.rules(mode, settings), Some(roster))
             }
             _ => unreachable!("starting a match requires a launch action"),
@@ -413,7 +416,9 @@ pub struct Menu {
     pub match_names: Vec<String>,
     pub ladder_names: Vec<(String, bool)>,
     pub deathmatch_ladder_names: Vec<(String, bool)>,
-    deathmatch_ladder_active: bool,
+    pub ctf_ladder_names: Vec<(String, bool)>,
+    pub ctf_ladder_teams: Vec<String>,
+    ladder_index: usize,
     pub ladder_teams: Vec<String>,
     pub ladder_stage: Option<usize>,
     pub ladder_team: usize,
@@ -743,18 +748,14 @@ impl Menu {
     }
 
     fn ladder_mode(&self) -> Mode {
-        if self.deathmatch_ladder_active {
-            Mode::Deathmatch
-        } else {
-            Mode::Assault
-        }
+        [Mode::Assault, Mode::Deathmatch, Mode::CaptureTheFlag][self.ladder_index]
     }
 
     fn current_ladder_names(&self) -> &[(String, bool)] {
-        if self.deathmatch_ladder_active {
-            &self.deathmatch_ladder_names
-        } else {
-            &self.ladder_names
+        match self.ladder_mode() {
+            Mode::Deathmatch => &self.deathmatch_ladder_names,
+            Mode::CaptureTheFlag => &self.ctf_ladder_names,
+            _ => &self.ladder_names,
         }
     }
 
@@ -763,8 +764,19 @@ impl Menu {
         self.ladder_stage = Some(progress.min(self.current_ladder_names().len().saturating_sub(1)));
     }
 
-    fn switch_ladder(&mut self, settings: &Settings) {
-        self.deathmatch_ladder_active = !self.deathmatch_ladder_active;
+    fn current_ladder_teams(&self) -> &[String] {
+        match self.ladder_mode() {
+            Mode::Assault => &self.ladder_teams,
+            Mode::CaptureTheFlag => &self.ctf_ladder_teams,
+            _ => &[],
+        }
+    }
+
+    fn switch_ladder(&mut self, settings: &Settings, direction: i32) {
+        self.ladder_index = (self.ladder_index as i32 + direction).rem_euclid(3) as usize;
+        self.ladder_team = settings
+            .ladder_team(self.ladder_mode())
+            .min(self.current_ladder_teams().len().saturating_sub(1));
         self.select_ladder_checkpoint(settings);
     }
 
@@ -782,8 +794,8 @@ impl Menu {
     }
 
     fn shift_ladder_team(&mut self, settings: &Settings, direction: i32) {
-        let count = self.ladder_teams.len() as i32;
-        if !self.deathmatch_ladder_active && settings.assault_progress == 0 && count > 1 {
+        let count = self.current_ladder_teams().len() as i32;
+        if settings.ladder_progress(self.ladder_mode()) == 0 && count > 1 {
             self.ladder_team = (self.ladder_team as i32 + direction).rem_euclid(count) as usize;
         }
     }
@@ -793,7 +805,7 @@ impl Menu {
             self.status.clear();
             match key {
                 VK_ESCAPE => self.ladder_stage = None,
-                VK_TAB => self.switch_ladder(settings),
+                VK_TAB => self.switch_ladder(settings, 1),
                 VK_LEFT => self.shift_ladder_team(settings, -1),
                 VK_RIGHT => self.shift_ladder_team(settings, 1),
                 VK_UP => self.ladder_stage = Some(stage.saturating_sub(1)),
@@ -938,9 +950,9 @@ impl Menu {
                 || ((222..305).contains(&x) && (210..226).contains(&y))
             {
                 self.ladder_stage = None;
-            } else if (26..45).contains(&y) && (12..126).contains(&x) {
-                self.switch_ladder(settings);
-            } else if (26..45).contains(&y) && (128..151).contains(&x) {
+            } else if (26..45).contains(&y) && (12..160).contains(&x) {
+                self.switch_ladder(settings, if x < 34 { -1 } else { 1 });
+            } else if (26..45).contains(&y) && (164..187).contains(&x) {
                 self.shift_ladder_team(settings, -1);
             } else if (26..45).contains(&y) && (391..415).contains(&x) {
                 self.shift_ladder_team(settings, 1);
@@ -1208,17 +1220,16 @@ impl Menu {
             let mode = self.ladder_mode();
             let progress = settings.ladder_progress(mode);
             let names = self.current_ladder_names();
-            ui.tile(frame, None, [x + 12, y + 26, 113, 18], FIELD_COLOR);
+            ui.tile(frame, None, [x + 12, y + 26, 148, 18], FIELD_COLOR);
             label(frame, x + 16, y + 29, "<");
             label(frame, x + 30, y + 29, mode.label());
-            label(frame, x + 113, y + 29, ">");
-            if mode == Mode::Assault
-                && let Some(team) = self.ladder_teams.get(self.ladder_team)
-            {
-                ui.tile(frame, None, [x + 129, y + 26, 286, 18], FIELD_COLOR);
-                label(frame, x + 156, y + 29, &format!("Team  {team}"));
-                if progress == 0 && self.ladder_teams.len() > 1 {
-                    label(frame, x + 136, y + 29, "<");
+            label(frame, x + 148, y + 29, ">");
+            let teams = self.current_ladder_teams();
+            if let Some(team) = teams.get(self.ladder_team) {
+                ui.tile(frame, None, [x + 164, y + 26, 251, 18], FIELD_COLOR);
+                label(frame, x + 192, y + 29, &format!("Team  {team}"));
+                if progress == 0 && teams.len() > 1 {
+                    label(frame, x + 171, y + 29, "<");
                     label(frame, x + 398, y + 29, ">");
                 }
             }
@@ -1838,6 +1849,7 @@ mod tests {
             ("DM-Oblivion".into(), true),
             ("DM-Stalwart".into(), true),
         ];
+        menu.ctf_ladder_names = vec![("CTF-Niven".into(), true), ("CTF-Face".into(), true)];
         menu.activate(1, &settings);
         assert!(menu.key(VK_RETURN, &mut settings) == Action::StartLadder(Mode::Assault, 1));
         menu.key(VK_TAB, &mut settings);
@@ -1846,6 +1858,9 @@ mod tests {
         assert!(menu.key(VK_RETURN, &mut settings) == Action::None);
         assert!(settings.record_ladder_win(Mode::Deathmatch, 0));
         assert!(menu.key(VK_RETURN, &mut settings) == Action::StartLadder(Mode::Deathmatch, 1));
+        menu.key(VK_TAB, &mut settings);
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::StartLadder(Mode::CaptureTheFlag, 0));
+        assert!(settings.record_ladder_win(Mode::CaptureTheFlag, 0));
         menu.key(VK_TAB, &mut settings);
         assert_eq!(settings.assault_progress, 1);
         assert!(menu.key(VK_RETURN, &mut settings) == Action::StartLadder(Mode::Assault, 1));

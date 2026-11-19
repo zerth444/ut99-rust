@@ -176,6 +176,7 @@ pub(super) fn load(system: &Path, maps: &[String], mode: Mode) -> io::Result<Cam
     let ladder_name = match mode {
         Mode::Assault => "LadderAS",
         Mode::Deathmatch => "LadderDM",
+        Mode::CaptureTheFlag => "LadderCTF",
         _ => return Err(invalid("Unsupported tournament mode")),
     };
     let mut ladder = defaults(find_class(ladder_name)?)?;
@@ -184,6 +185,7 @@ pub(super) fn load(system: &Path, maps: &[String], mode: Mode) -> io::Result<Cam
     let mut map_names: [String; 32] = Default::default();
     let mut configs: [String; 32] = Default::default();
     let mut frag_limits = [0; 32];
+    let mut team_goals = [0; 32];
     let mut time_limits = [0; 32];
     let mut demo_only = [false; 32];
     while let Some(property) = ladder.next_tag()? {
@@ -201,6 +203,9 @@ pub(super) fn load(system: &Path, maps: &[String], mode: Mode) -> io::Result<Cam
             "FragLimits" if index < frag_limits.len() => {
                 frag_limits[index] = (value.u32()? as i32).clamp(0, i32::from(i16::MAX)) as i16;
             }
+            "GoalTeamScore" if index < team_goals.len() => {
+                team_goals[index] = (value.u32()? as i32).clamp(0, i32::from(i16::MAX)) as i16;
+            }
             "TimeLimits" if index < time_limits.len() => {
                 time_limits[index] =
                     (value.u32()? as i32).clamp(0, i32::from(u16::MAX) / 60) as u16 * 60;
@@ -217,7 +222,15 @@ pub(super) fn load(system: &Path, maps: &[String], mode: Mode) -> io::Result<Cam
         .zip(configs)
         .take(count)
         .enumerate()
-        .filter(|(index, _)| !demo_only[*index])
+        .filter(|(index, (_, class))| {
+            // TrainingCTF has its own script and is not a rated capture match.
+            !demo_only[*index]
+                && (mode != Mode::CaptureTheFlag
+                    || !class
+                        .rsplit('.')
+                        .next()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("RatedMatchCTFTUT")))
+        })
         .map(|(index, (map, class))| {
             if map.is_empty() {
                 return Err(invalid("Missing tournament map"));
@@ -235,8 +248,11 @@ pub(super) fn load(system: &Path, maps: &[String], mode: Mode) -> io::Result<Cam
             while let Some(property) = config.next_tag()? {
                 let mut value = property.value;
                 match property.name {
-                    "NumBots" => bots = (value.u32()? as i32).clamp(0, 8) as usize,
-                    "NumAllies" => allies = (value.u32()? as i32).clamp(0, 8) as usize,
+                    "NumBots" => {
+                        let limit = if mode.team_based() { 15 } else { 8 };
+                        bots = (value.u32()? as i32).clamp(0, limit) as usize;
+                    }
+                    "NumAllies" => allies = (value.u32()? as i32).clamp(0, 7) as usize,
                     "ModifiedDifficulty" => difficulty = value.f32()?,
                     "EnemyTeam" => enemy = read_team(value.compact()?).ok(),
                     "BotNames" if property.array_index < names.len() => {
@@ -255,12 +271,16 @@ pub(super) fn load(system: &Path, maps: &[String], mode: Mode) -> io::Result<Cam
                     .position(|entry| entry.eq_ignore_ascii_case(&map)),
                 map,
                 bots,
-                allies: allies.min(bots),
+                allies: allies.clamp(bots.saturating_sub(8), bots.min(7)),
                 difficulty,
                 enemy,
                 names,
                 weapons,
-                frag_limit: frag_limits[index],
+                frag_limit: if mode == Mode::CaptureTheFlag {
+                    team_goals[index]
+                } else {
+                    frag_limits[index]
+                },
                 seconds: time_limits[index],
             })
         })
@@ -275,6 +295,51 @@ pub(super) fn load(system: &Path, maps: &[String], mode: Mode) -> io::Result<Cam
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires the local reference-client installation"]
+    fn reads_ranked_ctf_maps_capture_goals_and_rosters() {
+        let root = Path::new("local/reference-client");
+        let maps = fs::read_dir(root.join("Maps"))
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .path()
+                    .file_stem()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        let mode = Mode::CaptureTheFlag;
+        let campaign = load(&root.join("System"), &maps, mode).unwrap();
+        for stage in &campaign.stages {
+            let roster = campaign.roster(mode, stage, 0);
+            assert!(stage.installed.is_some(), "{}", stage.map);
+            assert_eq!((stage.frag_limit, stage.seconds), (3, 0));
+            assert!(roster.teams.iter().all(Option::is_some));
+            assert!(roster.bots.iter().all(Option::is_some));
+        }
+        assert_eq!(
+            campaign
+                .stages
+                .iter()
+                .map(|stage| (stage.map.as_str(), stage.bots, stage.allies))
+                .collect::<Vec<_>>(),
+            [
+                ("CTF-Niven", 3, 1),
+                ("CTF-Face", 7, 3),
+                ("CTF-EternalCave", 7, 3),
+                ("CTF-Coret", 7, 3),
+                ("CTF-Gauntlet", 7, 3),
+                ("CTF-Dreary", 9, 4),
+                ("CTF-Command", 7, 3),
+                ("CTF-LavaGiant", 9, 4),
+                ("CTF-November", 9, 4),
+            ]
+        );
+    }
 
     #[test]
     #[ignore = "requires the local reference-client installation"]
@@ -371,7 +436,7 @@ mod tests {
                 ("AS-Rook", 7, 3, 1.5),
                 ("AS-Mazon", 7, 3, 2.0),
                 ("AS-OceanFloor", 7, 3, 2.5),
-                ("AS-Overlord", 8, 4, 3.0),
+                ("AS-Overlord", 9, 4, 3.0),
             ],
         );
         assert!(stages.iter().all(|stage| stage.installed.is_some()));

@@ -42,6 +42,8 @@ pub struct Settings {
     pub deathmatch_progress: usize,
     pub deathmatch_training_complete: bool,
     pub assault_team: usize,
+    pub ctf_progress: usize,
+    pub ctf_team: usize,
     pub gui_skin: usize,
     pub field_of_view: u32,
     pub hud_scale: u32,
@@ -73,6 +75,8 @@ impl Default for Settings {
             deathmatch_progress: 0,
             deathmatch_training_complete: false,
             assault_team: 0,
+            ctf_progress: 0,
+            ctf_team: 0,
             gui_skin: 0,
             field_of_view: 90,
             hud_scale: 100,
@@ -89,6 +93,7 @@ impl Settings {
     pub fn ladder_progress(&self, mode: Mode) -> usize {
         match mode {
             Mode::Assault => self.assault_progress,
+            Mode::CaptureTheFlag => self.ctf_progress,
             Mode::Deathmatch => {
                 self.deathmatch_progress
                     + usize::from(self.deathmatch_training_complete || self.deathmatch_progress > 0)
@@ -103,10 +108,35 @@ impl Settings {
         }
         match mode {
             Mode::Assault => self.assault_progress += 1,
+            Mode::CaptureTheFlag => self.ctf_progress += 1,
             Mode::Deathmatch if stage == 0 => self.deathmatch_training_complete = true,
             Mode::Deathmatch => self.deathmatch_progress += 1,
             _ => return false,
         }
+        true
+    }
+
+    pub fn ladder_team(&self, mode: Mode) -> usize {
+        match mode {
+            Mode::Assault => self.assault_team,
+            Mode::CaptureTheFlag => self.ctf_team,
+            _ => 0,
+        }
+    }
+
+    pub fn set_ladder_team(&mut self, mode: Mode, team: usize) -> bool {
+        if self.ladder_progress(mode) != 0 {
+            return false;
+        }
+        let saved = match mode {
+            Mode::Assault => &mut self.assault_team,
+            Mode::CaptureTheFlag => &mut self.ctf_team,
+            _ => return false,
+        };
+        if *saved == team {
+            return false;
+        }
+        *saved = team;
         true
     }
 
@@ -146,6 +176,8 @@ impl Settings {
                     settings.deathmatch_training_complete = value != 0
                 }
                 "assault_team" => settings.assault_team = value.min(31) as usize,
+                "ctf_progress" => settings.ctf_progress = value.min(32) as usize,
+                "ctf_team" => settings.ctf_team = value.min(31) as usize,
                 "gui_skin" => settings.gui_skin = (value as usize).min(GUI_SKINS.len() - 1),
                 "fov" => settings.field_of_view = value.clamp(75, 120),
                 "hud_scale" => settings.hud_scale = value.clamp(50, 150),
@@ -210,14 +242,16 @@ impl Settings {
         use std::fmt::Write;
         let _ = writeln!(
             text,
-            "bot_count={}\nfrag_limit={}\nmatch_minutes={}\nassault_progress={}\nassault_team={}\ndeathmatch_progress={}\ndeathmatch_training_complete={}",
+            "bot_count={}\nfrag_limit={}\nmatch_minutes={}\nassault_progress={}\nassault_team={}\ndeathmatch_progress={}\ndeathmatch_training_complete={}\nctf_progress={}\nctf_team={}",
             self.bot_count,
             self.frag_limit,
             self.match_minutes,
             self.assault_progress,
             self.assault_team,
             self.deathmatch_progress,
-            u8::from(self.deathmatch_training_complete)
+            u8::from(self.deathmatch_training_complete),
+            self.ctf_progress,
+            self.ctf_team
         );
         for (index, key) in self.bindings.iter().enumerate() {
             let _ = writeln!(text, "bind{index}={key}");
@@ -294,6 +328,9 @@ mod tests {
         assert!(settings.record_ladder_win(Mode::Assault, 1));
         assert!(settings.record_ladder_win(Mode::Deathmatch, 0));
         settings.assault_team = 3;
+        assert!(settings.set_ladder_team(Mode::CaptureTheFlag, 2));
+        assert!(settings.record_ladder_win(Mode::CaptureTheFlag, 0));
+        assert!(!settings.set_ladder_team(Mode::CaptureTheFlag, 1));
         settings.bind(0, b'I' as u16);
         settings.bind(6, 2);
         settings.save(&path).unwrap();

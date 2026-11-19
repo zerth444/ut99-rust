@@ -408,6 +408,7 @@ pub struct Scene {
     pub player: crate::movement::Profile,
     pub player_audio: crate::movement::PlayerAudio,
     pub match_announcer: [Option<Arc<Wave>>; 5],
+    pub ctf_announcer: [Option<Arc<Wave>>; 3],
     pub player_deaths: [Motion; 3],
     pub player_idle: Motion,
     pub player_clips: ActorClips,
@@ -1174,6 +1175,26 @@ pub fn load(
             find_export(&assets, "announcer", name, "Sound"),
         )
     });
+    let ctf_announcer = (|| {
+        let class = find_export(&assets, "botpack", "CTFGame", "Class")?;
+        let (package, export) = assets.object(class);
+        let mut properties = class_properties(package, export).ok()?;
+        let mut refs = [0; 3];
+        while let Some(mut property) = properties.next_tag().ok()? {
+            match property.name {
+                "CaptureSound" if property.array_index < 2 => {
+                    refs[property.array_index] = property.value.compact().ok()?;
+                }
+                "ReturnSound" => refs[2] = property.value.compact().ok()?,
+                _ => {}
+            }
+        }
+        Some(refs.map(|reference| {
+            let sound = assets.resolve(class.package, reference);
+            cached_wave(&assets, &mut waves, sound)
+        }))
+    })()
+    .unwrap_or_default();
     let dm_training = dm_training
         .then(|| {
             deathmatch_training(
@@ -1198,6 +1219,7 @@ pub fn load(
         player,
         player_audio,
         match_announcer,
+        ctf_announcer,
         player_deaths,
         player_idle,
         player_clips,

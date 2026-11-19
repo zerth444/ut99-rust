@@ -789,6 +789,13 @@ unsafe fn message_loop(
                     } else {
                         let result_help = if ladder_error {
                             "Next map unavailable    Enter to retry"
+                        } else if game.finished
+                            && game.rated_capture_required()
+                            && game
+                                .team_scores()
+                                .is_some_and(|[own, opponent]| own > opponent)
+                        {
+                            "Capture a flag yourself    Enter to retry"
                         } else if let Some(((mode, stage), menu)) =
                             won_ladder.zip(frontend.as_deref())
                         {
@@ -1141,7 +1148,9 @@ fn run_frontend(
     menu.match_names = frontend.match_names();
     menu.ladder_names = frontend.ladder_names(deathmatch::Mode::Assault);
     menu.deathmatch_ladder_names = frontend.ladder_names(deathmatch::Mode::Deathmatch);
-    menu.ladder_teams = frontend.ladder_teams();
+    menu.ctf_ladder_names = frontend.ladder_names(deathmatch::Mode::CaptureTheFlag);
+    menu.ladder_teams = frontend.ladder_teams(deathmatch::Mode::Assault);
+    menu.ctf_ladder_teams = frontend.ladder_teams(deathmatch::Mode::CaptureTheFlag);
     menu.ladder_team = settings
         .assault_team
         .min(menu.ladder_teams.len().saturating_sub(1));
@@ -1261,11 +1270,7 @@ fn run_frontend(
                         Action::StartLadder(mode, stage) => match frontend.load_ladder(mode, stage)
                         {
                             Ok(arena) => {
-                                if mode == deathmatch::Mode::Assault
-                                    && settings.assault_progress == 0
-                                    && settings.assault_team != menu.ladder_team
-                                {
-                                    settings.assault_team = menu.ladder_team;
+                                if settings.set_ladder_team(mode, menu.ladder_team) {
                                     save_settings(settings, settings_path);
                                 }
                                 frontend.pending_arena = Some(arena);

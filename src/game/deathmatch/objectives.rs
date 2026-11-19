@@ -82,9 +82,35 @@ pub(crate) enum Marker {
 
 pub(super) struct Objectives {
     pub scores: [i16; 2],
+    pub player_captured: bool,
     flags: Option<[Flag; 2]>,
     zones: Vec<(Vec3, Option<usize>)>,
     next_score: f32,
+}
+
+pub(super) enum FlagNotice {
+    Taken,
+    Returned,
+    Captured(usize),
+}
+
+impl FlagNotice {
+    pub fn message(&self) -> &'static str {
+        match self {
+            Self::Taken => "Flag taken",
+            Self::Returned => "Flag returned",
+            Self::Captured(0) => "Red scored a capture",
+            Self::Captured(_) => "Blue scored a capture",
+        }
+    }
+
+    pub fn sound(&self) -> Option<usize> {
+        match *self {
+            Self::Captured(team) => Some(team),
+            Self::Returned => Some(2),
+            Self::Taken => None,
+        }
+    }
 }
 
 fn touching(map: &Map, position: Vec3, fighter: &Fighter) -> bool {
@@ -117,6 +143,7 @@ impl Objectives {
         };
         Self {
             scores: [0; 2],
+            player_captured: false,
             flags,
             zones,
             next_score: 2.0,
@@ -126,9 +153,9 @@ impl Objectives {
     pub(super) fn tick(
         &mut self,
         map: &Map,
-        fighters: &[Fighter],
+        fighters: &mut [Fighter],
         time: f32,
-    ) -> Option<&'static str> {
+    ) -> Option<FlagNotice> {
         let mut notice = None;
         if let Some(flags) = &mut self.flags {
             for (team, flag) in flags.iter_mut().enumerate() {
@@ -139,7 +166,7 @@ impl Objectives {
                             let point = fighter.walker.position;
                             flag.state =
                                 if map.collision.ray(point, Vec3(0.0, 0.0, -250.0)).is_some() {
-                                    FlagState::Dropped(point, time + 20.0)
+                                    FlagState::Dropped(point, time + 25.0)
                                 } else {
                                     FlagState::Home
                                 };
@@ -171,9 +198,9 @@ impl Objectives {
                         FlagState::Held(id)
                     };
                     notice = Some(if fighter.team == Some(team) {
-                        "Flag returned"
+                        FlagNotice::Returned
                     } else {
-                        "Flag taken"
+                        FlagNotice::Taken
                     });
                 }
             }
@@ -184,11 +211,9 @@ impl Objectives {
                 {
                     flags[1 - team].state = FlagState::Home;
                     self.scores[team] = self.scores[team].saturating_add(1);
-                    notice = Some(if team == 0 {
-                        "Red scored a capture"
-                    } else {
-                        "Blue scored a capture"
-                    });
+                    self.player_captured |= owner == 0;
+                    fighters[owner].score = fighters[owner].score.saturating_add(7);
+                    notice = Some(FlagNotice::Captured(team));
                 }
             }
         }
@@ -214,6 +239,14 @@ impl Objectives {
             }
         }
         notice
+    }
+
+    pub(super) fn carries_flag(&self, id: usize) -> bool {
+        self.flags.as_ref().is_some_and(|flags| {
+            flags
+                .iter()
+                .any(|flag| matches!(flag.state, FlagState::Held(owner) if owner == id))
+        })
     }
 
     pub(super) fn destination(&self, fighters: &[Fighter], id: usize) -> Option<Vec3> {

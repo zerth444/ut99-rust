@@ -131,6 +131,15 @@ impl Hud {
                 &format!("Red flag: {red}    Blue flag: {blue}"),
                 white,
             );
+            if game.rated_capture_required() {
+                self.centered(
+                    frame,
+                    (64.0 * scale) as i32,
+                    0.83 * scale,
+                    "Capture a flag yourself to advance",
+                    accent,
+                );
+            }
         }
         if !has_art {
             self.text(
@@ -374,7 +383,7 @@ impl Hud {
             &details,
             dim,
         );
-        if let Some((allies, enemy)) = game.named_assault_teams() {
+        if let Some((allies, enemy)) = game.named_rated_teams() {
             self.text(
                 frame,
                 left + px(22.0),
@@ -399,7 +408,15 @@ impl Hud {
         } else {
             "Deaths"
         };
-        for (x, title) in columns.into_iter().zip(["Player", "Frags", last_column]) {
+        let score_column = if game.flag_status().is_some() {
+            "Score"
+        } else {
+            "Frags"
+        };
+        for (x, title) in columns
+            .into_iter()
+            .zip(["Player", score_column, last_column])
+        {
             self.text(
                 frame,
                 left + px(x),

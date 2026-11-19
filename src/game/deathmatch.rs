@@ -1242,10 +1242,22 @@ impl Match {
     }
 
     pub fn player_won_rated_match(&self) -> bool {
-        if self.mode() == Mode::Assault {
-            return self.player_won_assault();
+        match self.mode() {
+            Mode::Assault => self.player_won_assault(),
+            Mode::CaptureTheFlag => {
+                self.finished
+                    && self.objectives.player_captured
+                    && self.objectives.scores[0] > self.objectives.scores[1]
+                    && self.objectives.scores[0] >= self.rules.frag_limit
+            }
+            _ => self.finished && self.winner() == Some(0),
         }
-        self.finished && self.winner() == Some(0)
+    }
+
+    pub fn rated_capture_required(&self) -> bool {
+        self.mode() == Mode::CaptureTheFlag
+            && self.rated_roster.is_some()
+            && !self.objectives.player_captured
     }
     pub fn flag_status(&self) -> Option<[&'static str; 2]> {
         self.objectives.flag_status()
@@ -1514,7 +1526,7 @@ impl Match {
             .unwrap_or(if team == 0 { "Red team" } else { "Blue team" })
     }
 
-    pub fn named_assault_teams(&self) -> Option<(&str, &str)> {
+    pub fn named_rated_teams(&self) -> Option<(&str, &str)> {
         let roster = self.rated_roster.as_ref()?;
         Some((roster.teams[0].as_deref()?, roster.teams[1].as_deref()?))
     }
@@ -2173,8 +2185,14 @@ impl Match {
                 dm_training::Event::StartDuel => self.add_fighter(map),
             }
         }
-        if let Some(message) = self.objectives.tick(map, &self.fighters, self.time) {
-            self.announcement = Some((message, self.time + 2.0));
+        if let Some(notice) = self.objectives.tick(map, &mut self.fighters, self.time) {
+            self.announcement = Some((notice.message(), self.time + 2.0));
+            if let Some(wave) = notice
+                .sound()
+                .and_then(|index| map.ctf_announcer[index].as_ref())
+            {
+                sounds.push(wave.clone());
+            }
         }
         self.decals.update(self.time);
         self.decals.follow_movers(&map.movers);
@@ -4243,7 +4261,11 @@ impl Match {
                 .map(|(owner, _)| owner)
         });
         if let Some(owner) = owner.filter(|&owner| owner != hit.victim) {
-            self.fighters[owner].score += 1;
+            let carrier_bonus = self.objectives.carries_flag(hit.victim)
+                && !allied(self.fighters[owner].team, self.fighters[hit.victim].team);
+            self.fighters[owner].score = self.fighters[owner]
+                .score
+                .saturating_add(if carrier_bonus { 5 } else { 1 });
             if self.rules.mode == Mode::TeamDeathmatch
                 && let Some(team) = self.fighters[owner].team
             {
@@ -5752,7 +5774,7 @@ mod tests {
                 frontend.next_ladder_stage(Mode::Assault, next, &rated),
                 None
             );
-            let (allies, enemies) = rated.named_assault_teams().unwrap();
+            let (allies, enemies) = rated.named_rated_teams().unwrap();
             assert_ne!(allies, enemies);
             assert!(
                 rated
@@ -6130,6 +6152,97 @@ mod tests {
         assert_eq!(
             inventory.preferred_with_favorite(550.0, Some(Weapon::Shock)),
             Weapon::Pulse
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires the local reference-client map installation"]
+    fn rated_ctf_ladder_requires_a_personal_capture_on_all_stock_maps() {
+        use crate::{
+            frontend::{Action, Frontend},
+            settings::Settings,
+        };
+        let path = std::path::Path::new("local/reference-client/Maps/CTF-Niven.unr");
+        let frontend = Frontend::load(path, false);
+        let mode = Mode::CaptureTheFlag;
+        let mut settings = Settings {
+            ctf_team: 1,
+            frag_limit: 1,
+            bot_count: 0,
+            match_minutes: 1,
+            ..Settings::default()
+        };
+        let mut time = 1.0;
+        for stage in 0..frontend.ladder_len(mode) {
+            let mut map = frontend.load_ladder(mode, stage).unwrap();
+            let mut game =
+                frontend.start_match(&map, 0, Action::StartLadder(mode, stage), &settings);
+            let [home, away] = map.flag_bases.map(Option::unwrap);
+            let goal = game.rules.frag_limit;
+            assert_eq!(goal, 3);
+            assert_eq!(game.rules.seconds, 0);
+            assert!(map.ctf_announcer.iter().all(Option::is_some));
+            assert!(game.rated_capture_required());
+            assert!(game.named_rated_teams().is_some());
+            let ally = game
+                .fighters
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find(|(_, fighter)| fighter.team == Some(0))
+                .unwrap()
+                .0;
+
+            let capture = |game: &mut Match, id, time: &mut f32, map: &Map| {
+                for (index, fighter) in game.fighters.iter_mut().enumerate() {
+                    fighter.health = if index == id { 100 } else { 0 };
+                }
+                game.fighters.get_mut(id).unwrap().walker.position = away;
+                game.objectives.tick(map, &mut game.fighters, *time);
+                assert!(game.objectives.carries_flag(id));
+                *time += 0.25;
+                game.fighters.get_mut(id).unwrap().walker.position = home;
+                game.objectives.tick(map, &mut game.fighters, *time);
+                *time += 0.25;
+            };
+            for _ in 0..goal {
+                capture(&mut game, ally, &mut time, &map);
+            }
+            game.time = time;
+            game.step(&mut map, Command::default(), 1.0 / 120.0);
+            assert_eq!(game.team_scores(), Some([goal, 0]));
+            assert_eq!(game.fighters[ally].score, 7 * goal);
+            assert!(game.finished && !game.player_won_rated_match());
+            assert_eq!(frontend.next_ladder_stage(mode, stage, &game), None);
+
+            game.step(
+                &mut map,
+                Command {
+                    restart: true,
+                    ..Command::default()
+                },
+                1.0 / 120.0,
+            );
+            assert_eq!(game.team_scores(), Some([0, 0]));
+            capture(&mut game, 0, &mut time, &map);
+            assert!(!game.rated_capture_required());
+            for _ in 1..goal {
+                capture(&mut game, ally, &mut time, &map);
+            }
+            game.time = time;
+            game.step(&mut map, Command::default(), 1.0 / 120.0);
+            assert!(game.player_won_rated_match(), "stage {stage}");
+            assert!(settings.record_ladder_win(mode, stage));
+            assert_eq!(settings.ladder_progress(mode), stage + 1);
+            assert_eq!(
+                frontend.next_ladder_stage(mode, stage, &game),
+                (stage + 1 < frontend.ladder_len(mode)).then_some(stage + 1),
+            );
+        }
+        assert_eq!(
+            (settings.assault_progress, settings.deathmatch_progress),
+            (0, 0)
         );
     }
 
@@ -6548,38 +6661,38 @@ mod tests {
         map.flag_bases = [Some(red), Some(blue)];
         let mut game = new_match(&map, Mode::CaptureTheFlag, 1);
         game.fighters[0].walker.position = blue;
-        game.objectives.tick(&map, &game.fighters, 1.0);
+        game.objectives.tick(&map, &mut game.fighters, 1.0);
         assert!(
             distance_squared(game.objectives.destination(&game.fighters, 0).unwrap(), red) < 0.01
         );
         game.fighters[0].walker.position = red;
-        game.objectives.tick(&map, &game.fighters, 1.1);
+        game.objectives.tick(&map, &mut game.fighters, 1.1);
         assert_eq!(game.team_scores(), Some([1, 0]));
         game.restart(&mut map);
         assert_eq!(game.team_scores(), Some([0, 0]));
         game.fighters[0].walker.position = blue;
-        game.objectives.tick(&map, &game.fighters, 1.0);
+        game.objectives.tick(&map, &mut game.fighters, 1.0);
         game.fighters[0].walker.position = Vec3(160.0, 0.0, 39.2);
         game.fighters[0].health = 0;
-        game.objectives.tick(&map, &game.fighters, 1.1);
+        game.objectives.tick(&map, &mut game.fighters, 1.1);
         assert!(
             distance_squared(
                 game.objectives.destination(&game.fighters, 1).unwrap(),
                 Vec3(160.0, 0.0, 39.2)
             ) < 0.01
         );
-        game.objectives.tick(&map, &game.fighters, 22.0);
+        game.objectives.tick(&map, &mut game.fighters, 26.2);
         assert!(distance_squared(game.objective_markers(&map).nth(1).unwrap().0, blue) < 0.01);
 
         map.control_points = vec![red];
         let mut game = new_match(&map, Mode::Domination, 1);
-        game.objectives.tick(&map, &game.fighters, 1.0);
+        game.objectives.tick(&map, &mut game.fighters, 1.0);
         assert_eq!(game.team_scores(), Some([0, 0]));
-        game.objectives.tick(&map, &game.fighters, 2.1);
+        game.objectives.tick(&map, &mut game.fighters, 2.1);
         assert_eq!(game.team_scores(), Some([1, 0]));
         game.fighters[0].walker.position = blue;
         game.fighters[1].walker.position = red;
-        game.objectives.tick(&map, &game.fighters, 4.1);
+        game.objectives.tick(&map, &mut game.fighters, 4.1);
         assert_eq!(game.team_scores(), Some([1, 1]));
     }
 
