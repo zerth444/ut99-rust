@@ -147,7 +147,8 @@ impl Match {
         let alt = input.alternate && !input.primary;
         if alt {
             if let Some(module) = &fighter.translocator {
-                self.objectives.drop_for_teleport(id, start, self.time, map);
+                self.objectives
+                    .drop_for_teleport(id, fighter, self.time, map);
                 let dest =
                     module.point + Vec3(0.0, 0.0, if module.landed.is_some() { 40.0 } else { 0.0 });
                 let clear = map.collision.player_fits(dest)

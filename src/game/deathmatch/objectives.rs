@@ -2,6 +2,8 @@ use crate::map::{Map, Vec3};
 
 use super::{Fighter, distance_squared};
 
+const OBJECTIVE_TOUCH_HEIGHT: f32 = 72.0;
+
 #[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
 pub enum Mode {
     #[default]
@@ -65,11 +67,66 @@ impl Mode {
 enum FlagState {
     Home,
     Held(usize),
-    Dropped(Vec3, f32),
+    Dropped(FlagDrop),
+}
+
+#[derive(Clone, Copy)]
+struct FlagDrop {
+    position: Vec3,
+    velocity: Vec3,
+    until: f32,
+    resting: bool,
+}
+
+impl FlagDrop {
+    fn from_carrier(map: &Map, fighter: &Fighter, time: f32) -> FlagState {
+        let position = fighter.walker.position;
+        let foot = position - Vec3(0.0, 0.0, crate::collision::PLAYER_HEIGHT);
+        if [position, foot].into_iter().any(|point| {
+            let zone = map.collision.regions.at(point);
+            zone.pain && zone.damage_per_second > 0
+        }) {
+            return FlagState::Home;
+        }
+        let velocity = if fighter.walker.grounded {
+            Vec3::default()
+        } else {
+            fighter.walker.velocity() * 0.5
+        };
+        FlagState::Dropped(Self {
+            position,
+            velocity,
+            until: time + 25.0,
+            resting: false,
+        })
+    }
+
+    fn advance(&mut self, map: &Map, dt: f32) {
+        if self.resting {
+            return;
+        }
+        let zone = map.collision.regions.at(self.position);
+        if zone.water {
+            self.velocity = self.velocity * (1.0 - zone.fluid_friction * dt).max(0.0);
+        }
+        self.velocity = self.velocity + zone.gravity * dt;
+        let delta = (self.velocity + zone.flow * 25.0) * dt;
+        if let Some((point, normal)) =
+            map.collision
+                .projectile_surface(self.position, delta, 18.0, 20.0)
+        {
+            self.position = point + normal * 0.5;
+            self.resting = normal.2 >= 0.7;
+            self.velocity = super::ordnance::ricochet(self.velocity, normal, 0.4);
+        } else {
+            self.position = self.position + delta;
+        }
+    }
 }
 
 struct Flag {
     base: Vec3,
+    approach: Vec3,
     state: FlagState,
     previous_carrier: Option<(usize, f32)>,
 }
@@ -131,7 +188,7 @@ fn touching(map: &Map, position: Vec3, fighter: &Fighter) -> bool {
     let offset = fighter.walker.position - position;
     fighter.health > 0
         && offset.0.hypot(offset.1) < 50.0
-        && offset.2.abs() < 72.0
+        && offset.2.abs() < OBJECTIVE_TOUCH_HEIGHT
         && map.collision.ray(position, offset).is_none()
 }
 
@@ -141,6 +198,14 @@ impl Objectives {
             map.flag_bases[0].zip(map.flag_bases[1]).map(|(red, blue)| {
                 [red, blue].map(|base| Flag {
                     base,
+                    approach: if map.collision.regions.at(base).water {
+                        base
+                    } else {
+                        // A flag model can stand above the navigable floor.
+                        map.collision
+                            .floor_position(base, OBJECTIVE_TOUCH_HEIGHT - 4.0)
+                            .unwrap_or(base)
+                    },
                     state: FlagState::Home,
                     previous_carrier: None,
                 })
@@ -186,21 +251,15 @@ impl Objectives {
                     FlagState::Held(owner) => {
                         let fighter = &fighters[owner];
                         if fighter.health == 0 {
-                            let point = fighter.walker.position;
-                            flag.state =
-                                if map.collision.ray(point, Vec3(0.0, 0.0, -250.0)).is_some() {
-                                    FlagState::Dropped(point, time + 25.0)
-                                } else {
-                                    FlagState::Home
-                                };
+                            flag.state = FlagDrop::from_carrier(map, fighter, time);
                         }
                         continue;
                     }
-                    FlagState::Dropped(_, until) if time >= until => {
+                    FlagState::Dropped(drop) if time >= drop.until => {
                         flag.state = FlagState::Home;
                         continue;
                     }
-                    FlagState::Dropped(position, _) => position,
+                    FlagState::Dropped(drop) => drop.position,
                     FlagState::Home => flag.base,
                 };
                 if let Some((id, fighter)) = fighters
@@ -319,7 +378,26 @@ impl Objectives {
         })
     }
 
-    pub(super) fn drop_for_teleport(&mut self, id: usize, point: Vec3, time: f32, map: &Map) {
+    pub(super) fn flag_base_floor(&self, team: usize, target: Vec3) -> Option<Vec3> {
+        let flag = self.flags.as_ref()?.get(team)?;
+        (distance_squared(target, flag.base) < 1.0
+            && distance_squared(target, flag.approach) >= 1.0)
+            .then_some(flag.approach)
+    }
+
+    pub(super) fn fall_dropped_flags(&mut self, map: &Map, dt: f32, kill_z: f32) {
+        for flag in self.flags.iter_mut().flatten() {
+            if let FlagState::Dropped(drop) = &mut flag.state {
+                drop.advance(map, dt);
+                let zone = map.collision.regions.at(drop.position);
+                if drop.position.2 < kill_z || (zone.pain && zone.damage_per_second > 0) {
+                    flag.state = FlagState::Home;
+                }
+            }
+        }
+    }
+
+    pub(super) fn drop_for_teleport(&mut self, id: usize, fighter: &Fighter, time: f32, map: &Map) {
         let Some(flag) = self
             .flags
             .iter_mut()
@@ -328,29 +406,33 @@ impl Objectives {
         else {
             return;
         };
-        flag.state = if map.collision.ray(point, Vec3(0.0, 0.0, -250.0)).is_some() {
-            FlagState::Dropped(point, time + 25.0)
-        } else {
-            FlagState::Home
-        };
+        flag.state = FlagDrop::from_carrier(map, fighter, time);
         flag.previous_carrier = Some((id, time + 0.5));
     }
 
-    pub(super) fn destination(&self, fighters: &[Fighter], id: usize) -> Option<Vec3> {
+    pub(super) fn destination(&self, map: &Map, fighters: &[Fighter], id: usize) -> Option<Vec3> {
         let fighter = &fighters[id];
         let team = fighter.team?;
         if let Some(flags) = &self.flags {
             if matches!(flags[1 - team].state, FlagState::Held(owner) if owner == id) {
+                let position = fighter.walker.position;
+                if let FlagState::Dropped(drop) = flags[team].state
+                    && drop.resting
+                    && distance_squared(position, drop.position) < 520.0_f32.powi(2)
+                    && super::navigation::walk_link(&map.collision, position, drop.position)
+                {
+                    return Some(drop.position);
+                }
                 return Some(flags[team].base);
             }
             match flags[team].state {
-                FlagState::Dropped(point, _) => return Some(point),
+                FlagState::Dropped(drop) => return Some(drop.position),
                 FlagState::Held(carrier) => return Some(fighters[carrier].walker.position),
                 FlagState::Home => {}
             }
             return Some(match flags[1 - team].state {
                 FlagState::Home => flags[1 - team].base,
-                FlagState::Dropped(point, _) => point,
+                FlagState::Dropped(drop) => drop.position,
                 FlagState::Held(owner) => {
                     let carrier = fighters[owner].walker.position;
                     let route = flags[team].base - carrier;
@@ -408,7 +490,7 @@ impl Objectives {
             let flag = &self.flags.as_ref()?[team];
             Some(match flag.state {
                 FlagState::Home => (flag.base, map.flag_yaws[team], true),
-                FlagState::Dropped(point, _) => (point, map.flag_yaws[team], false),
+                FlagState::Dropped(drop) => (drop.position, map.flag_yaws[team], false),
                 FlagState::Held(0) => return None,
                 FlagState::Held(id) => {
                     let (point, yaw) = fighters[id].body_transform(blend);
@@ -430,7 +512,7 @@ impl Objectives {
             .map(move |(team, flag)| {
                 let position = match flag.state {
                     FlagState::Home => flag.base,
-                    FlagState::Dropped(position, _) => position,
+                    FlagState::Dropped(drop) => drop.position,
                     FlagState::Held(owner) => fighters[owner].walker.position,
                 };
                 (position, Marker::Flag, Some(team))

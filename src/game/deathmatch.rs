@@ -2313,6 +2313,7 @@ impl Match {
                 dm_training::Event::StartDuel => self.add_fighter(map),
             }
         }
+        self.objectives.fall_dropped_flags(map, dt, self.kill_z);
         if let Some(notice) = self.objectives.tick(map, &mut self.fighters, self.time) {
             self.announcement = Some((notice.message(), self.time + 2.0));
             if let Some(wave) = notice
@@ -4679,7 +4680,7 @@ impl Match {
                 {
                     Some(point)
                 } else {
-                    self.objectives.destination(&self.fighters, id)
+                    self.objectives.destination(map, &self.fighters, id)
                 }
             });
         let carrying_flag = self.objectives.carries_flag(id);
@@ -5129,6 +5130,19 @@ impl Match {
                     .and_then(|point| {
                         self.navigation
                             .next_step_avoiding(&map.collision, position, point, blocked)
+                            .or_else(|| {
+                                if !carrying_flag {
+                                    return None;
+                                }
+                                let grounded =
+                                    self.objectives.flag_base_floor(fighter.team?, point)?;
+                                self.navigation.next_step_avoiding(
+                                    &map.collision,
+                                    position,
+                                    grounded,
+                                    blocked,
+                                )
+                            })
                     })
                     .or_else(|| {
                         assault.and_then(|(fort, attacking)| {
@@ -7212,7 +7226,12 @@ mod tests {
         game.fighters[0].walker.position = blue;
         game.objectives.tick(&map, &mut game.fighters, 1.0);
         assert!(
-            distance_squared(game.objectives.destination(&game.fighters, 0).unwrap(), red) < 0.01
+            distance_squared(
+                game.objectives
+                    .destination(&map, &game.fighters, 0)
+                    .unwrap(),
+                red
+            ) < 0.01
         );
         game.fighters[0].walker.position = red;
         game.objectives.tick(&map, &mut game.fighters, 1.1);
@@ -7226,7 +7245,9 @@ mod tests {
         game.objectives.tick(&map, &mut game.fighters, 1.1);
         assert!(
             distance_squared(
-                game.objectives.destination(&game.fighters, 1).unwrap(),
+                game.objectives
+                    .destination(&map, &game.fighters, 1)
+                    .unwrap(),
                 Vec3(160.0, 0.0, 39.2)
             ) < 0.01
         );
@@ -9729,6 +9750,63 @@ mod tests {
 
     #[test]
     #[ignore = "requires local GOTY data"]
+    fn ctf_carrier_recovers_own_flag_after_it_falls() {
+        let (mut map, _) = flight_fixture();
+        let red = Vec3(-300.0, 0.0, 40.0);
+        let blue = Vec3(300.0, 0.0, 40.0);
+        map.flag_bases = [Some(red), Some(blue)];
+        let mut game = Match::new(
+            &map,
+            0,
+            Rules {
+                mode: Mode::CaptureTheFlag,
+                bots: 1,
+                ..Rules::default()
+            },
+        );
+        game.fighters[0].walker.position = blue;
+        game.fighters[1].walker.position = red;
+        game.objectives.tick(&map, &mut game.fighters, 1.0);
+        assert_eq!(game.flag_icon_states(), Some([1, 1]));
+
+        game.fighters[1].walker.position = Vec3(0.0, 0.0, 300.0);
+        game.fighters[1].health = 0;
+        game.objectives.tick(&map, &mut game.fighters, 1.25);
+        assert_eq!(game.flag_icon_states(), Some([2, 1]));
+        for _ in 0..240 {
+            game.objectives
+                .fall_dropped_flags(&map, 1.0 / 120.0, game.kill_z);
+        }
+        let (position, _, _) = game.flag_models(&map, 1.0)[0].unwrap();
+        assert!((19.0..22.0).contains(&position.2), "{position:?}");
+        let recovery = game
+            .objectives
+            .destination(&map, &game.fighters, 0)
+            .unwrap();
+        assert!(distance_squared(recovery, position) < 0.01);
+        game.fighters[0].walker.position = Vec3(position.0, position.1, 39.2);
+        game.objectives.tick(&map, &mut game.fighters, 3.25);
+        assert_eq!(game.flag_icon_states(), Some([0, 1]));
+        game.fighters[0].walker.position = red;
+        game.objectives.tick(&map, &mut game.fighters, 3.5);
+        assert_eq!(game.team_scores(), Some([1, 0]));
+
+        game.fighters[0].walker.position = blue;
+        game.objectives.tick(&map, &mut game.fighters, 4.0);
+        assert_eq!(game.flag_icon_states(), Some([0, 1]));
+        game.fighters[0].walker.position = Vec3(1100.0, 0.0, 10.0);
+        game.fighters[0].health = 0;
+        game.objectives.tick(&map, &mut game.fighters, 4.25);
+        assert_eq!(game.flag_icon_states(), Some([0, 2]));
+        for _ in 0..240 {
+            game.objectives
+                .fall_dropped_flags(&map, 1.0 / 120.0, -150.0);
+        }
+        assert_eq!(game.flag_icon_states(), Some([0, 0]));
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY data"]
     fn audit_objective_bots() {
         let mut arenas: Vec<_> = std::fs::read_dir("local/reference-client/Maps")
             .unwrap()
@@ -9815,8 +9893,13 @@ mod tests {
                 game.team_scores()
             );
             let progressed = match name {
-                "CTF-Face.unr" => carried > 0,
-                "CTF-Coret.unr" => {
+                "CTF-Coret.unr"
+                | "CTF-Cybrosis][.unr"
+                | "CTF-Dreary.unr"
+                | "CTF-EternalCave.unr"
+                | "CTF-Face.unr"
+                | "CTF-Gauntlet.unr"
+                | "CTF-Hydro16.unr" => {
                     carried > 0
                         && game.finished
                         && game

@@ -266,6 +266,11 @@ impl Collision {
             .filter(|hit| hit.normal.2 >= FLOOR_NORMAL)
             .map(|hit| (hit.fraction * distance - SKIN).max(0.0))
     }
+
+    pub(crate) fn floor_position(&self, position: Vec3, distance: f32) -> Option<Vec3> {
+        self.floor(position, distance)
+            .map(|gap| position - UP * gap)
+    }
 }
 
 fn box_planes(min: Vec3, max: Vec3) -> [Plane; 6] {
