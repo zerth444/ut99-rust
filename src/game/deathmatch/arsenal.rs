@@ -92,10 +92,17 @@ impl Inventory {
     }
 
     pub fn preferred(&self, distance: f32) -> Weapon {
+        self.preferred_with_favorite(distance, None)
+    }
+
+    pub fn preferred_with_favorite(&self, distance: f32, favorite: Option<Weapon>) -> Weapon {
+        // Stock Bot.SwitchToBestWeapon adds 0.22 on a 0–1 rating scale.
+        let score =
+            |weapon| rating(weapon, distance) + if Some(weapon) == favorite { 22.0 } else { 0.0 };
         Weapon::ALL
             .into_iter()
             .filter(|&weapon| self.usable(weapon))
-            .max_by(|&a, &b| rating(a, distance).total_cmp(&rating(b, distance)))
+            .max_by(|&a, &b| score(a).total_cmp(&score(b)))
             .unwrap_or(Weapon::Hammer)
     }
 }

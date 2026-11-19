@@ -30,7 +30,8 @@ pub struct Frontend {
     pub logo: Option<(Map, Camera)>,
     match_maps: Vec<PathBuf>,
     pub pending_arena: Option<Map>,
-    ladder: ladder::Campaign,
+    assault_ladder: ladder::Campaign,
+    deathmatch_ladder: ladder::Campaign,
     art: MenuArt,
 }
 
@@ -94,22 +95,25 @@ impl Frontend {
                 .chain(std::iter::once(reference_maps.as_path())),
         );
         let names = map_names(&match_maps);
-        let ladder = std::iter::once(maps)
-            .chain(installed_maps.as_deref())
-            .chain(std::iter::once(reference_maps.as_path()))
-            .find_map(|maps| {
-                let system = maps.join("../System");
-                ladder::load(&system, &names)
-                    .map_err(|error| optional(&system, error))
-                    .ok()
-            })
-            .unwrap_or_default();
+        let load_ladder = |mode| {
+            std::iter::once(maps)
+                .chain(installed_maps.as_deref())
+                .chain(std::iter::once(reference_maps.as_path()))
+                .find_map(|maps| {
+                    let system = maps.join("../System");
+                    ladder::load(&system, &names, mode)
+                        .map_err(|error| optional(&system, error))
+                        .ok()
+                })
+                .unwrap_or_default()
+        };
         Self {
             intro,
             logo,
             match_maps,
             pending_arena: None,
-            ladder,
+            assault_ladder: load_ladder(Mode::Assault),
+            deathmatch_ladder: load_ladder(Mode::Deathmatch),
             art: MenuArt::load(
                 &maps.join("../System/UMenu.u"),
                 &maps.join("../Textures/UWindowFonts.utx"),
@@ -147,9 +151,17 @@ impl Frontend {
         Map::load(&package, Some(path))
     }
 
-    pub fn load_ladder(&self, stage: usize) -> io::Result<Map> {
+    fn campaign(&self, mode: Mode) -> &ladder::Campaign {
+        match mode {
+            Mode::Assault => &self.assault_ladder,
+            Mode::Deathmatch => &self.deathmatch_ladder,
+            _ => unreachable!("invalid tournament track"),
+        }
+    }
+
+    pub fn load_ladder(&self, mode: Mode, stage: usize) -> io::Result<Map> {
         let index = self
-            .ladder
+            .campaign(mode)
             .stages
             .get(stage)
             .and_then(|entry| entry.installed)
@@ -157,8 +169,9 @@ impl Frontend {
                 io::Error::new(io::ErrorKind::NotFound, "Tournament map is unavailable")
             })?;
         let map = self.read_map(index)?;
-        if !map.supports_mode(Mode::Assault)
-            || (stage == 0
+        if !map.supports_mode(mode)
+            || (mode == Mode::Assault
+                && stage == 0
                 && map
                     .assault
                     .as_ref()
@@ -172,29 +185,29 @@ impl Frontend {
         Ok(map)
     }
 
-    pub fn ladder_names(&self) -> Vec<(String, bool)> {
-        self.ladder
+    pub fn ladder_names(&self, mode: Mode) -> Vec<(String, bool)> {
+        self.campaign(mode)
             .stages
             .iter()
             .map(|stage| (stage.map.clone(), stage.installed.is_some()))
             .collect()
     }
 
-    pub fn ladder_len(&self) -> usize {
-        self.ladder.stages.len()
+    pub fn ladder_len(&self, mode: Mode) -> usize {
+        self.campaign(mode).stages.len()
     }
 
     pub fn ladder_teams(&self) -> Vec<String> {
-        self.ladder
+        self.assault_ladder
             .teams
             .iter()
             .map(|team| team.name.clone())
             .collect()
     }
 
-    pub fn next_ladder_stage(&self, stage: usize, game: &Match) -> Option<usize> {
+    pub fn next_ladder_stage(&self, mode: Mode, stage: usize, game: &Match) -> Option<usize> {
         let next = stage + 1;
-        (next < self.ladder_len() && game.player_won_assault()).then_some(next)
+        (next < self.ladder_len(mode) && game.player_won_rated_match()).then_some(next)
     }
 
     pub fn start_match(
@@ -213,10 +226,11 @@ impl Frontend {
                     ..settings.match_rules()
                 },
             ),
-            Action::StartLadder(index) => {
-                let entry = &self.ladder.stages[index];
-                let roster = self.ladder.roster(entry, settings.assault_team);
-                Match::with_assault_roster(map, start, entry.rules(settings), Some(roster))
+            Action::StartLadder(mode, index) => {
+                let campaign = self.campaign(mode);
+                let entry = &campaign.stages[index];
+                let roster = campaign.roster(mode, entry, settings.assault_team);
+                Match::with_rated_roster(map, start, entry.rules(mode, settings), Some(roster))
             }
             _ => unreachable!("starting a match requires a launch action"),
         }
@@ -327,16 +341,16 @@ pub enum Action {
     None,
     Resume,
     StartMatch(usize, Mode),
-    StartLadder(usize),
+    StartLadder(Mode, usize),
     LeaveMatch,
     Quit,
     Changed,
 }
 
 impl Action {
-    pub fn ladder_stage(self) -> Option<usize> {
+    pub fn ladder_stage(self) -> Option<(Mode, usize)> {
         match self {
-            Self::StartLadder(stage) => Some(stage),
+            Self::StartLadder(mode, stage) => Some((mode, stage)),
             _ => None,
         }
     }
@@ -397,6 +411,8 @@ pub struct Menu {
     pub session: MenuSession,
     pub match_names: Vec<String>,
     pub ladder_names: Vec<(String, bool)>,
+    pub deathmatch_ladder_names: Vec<(String, bool)>,
+    deathmatch_ladder_active: bool,
     pub ladder_teams: Vec<String>,
     pub ladder_stage: Option<usize>,
     pub ladder_team: usize,
@@ -709,11 +725,7 @@ impl Menu {
             }
             (true, 1) => Action::LeaveMatch,
             (false, 1) => {
-                self.ladder_stage = Some(
-                    settings
-                        .assault_progress
-                        .min(self.ladder_names.len().saturating_sub(1)),
-                );
+                self.select_ladder_checkpoint(settings);
                 Action::None
             }
             (_, 2) => {
@@ -729,21 +741,48 @@ impl Menu {
         }
     }
 
+    fn ladder_mode(&self) -> Mode {
+        if self.deathmatch_ladder_active {
+            Mode::Deathmatch
+        } else {
+            Mode::Assault
+        }
+    }
+
+    fn current_ladder_names(&self) -> &[(String, bool)] {
+        if self.deathmatch_ladder_active {
+            &self.deathmatch_ladder_names
+        } else {
+            &self.ladder_names
+        }
+    }
+
+    fn select_ladder_checkpoint(&mut self, settings: &Settings) {
+        let progress = settings.ladder_progress(self.ladder_mode());
+        self.ladder_stage = Some(progress.min(self.current_ladder_names().len().saturating_sub(1)));
+    }
+
+    fn switch_ladder(&mut self, settings: &Settings) {
+        self.deathmatch_ladder_active = !self.deathmatch_ladder_active;
+        self.select_ladder_checkpoint(settings);
+    }
+
     fn ladder_launch(&self, stage: usize, settings: &Settings) -> Action {
-        if stage <= settings.assault_progress
+        let mode = self.ladder_mode();
+        if stage <= settings.ladder_progress(mode)
             && self
-                .ladder_names
+                .current_ladder_names()
                 .get(stage)
                 .is_some_and(|(_, installed)| *installed)
         {
-            return Action::StartLadder(stage);
+            return Action::StartLadder(mode, stage);
         }
         Action::None
     }
 
     fn shift_ladder_team(&mut self, settings: &Settings, direction: i32) {
         let count = self.ladder_teams.len() as i32;
-        if settings.assault_progress == 0 && count > 1 {
+        if !self.deathmatch_ladder_active && settings.assault_progress == 0 && count > 1 {
             self.ladder_team = (self.ladder_team as i32 + direction).rem_euclid(count) as usize;
         }
     }
@@ -753,17 +792,20 @@ impl Menu {
             self.status.clear();
             match key {
                 VK_ESCAPE => self.ladder_stage = None,
+                VK_TAB => self.switch_ladder(settings),
                 VK_LEFT => self.shift_ladder_team(settings, -1),
                 VK_RIGHT => self.shift_ladder_team(settings, 1),
                 VK_UP => self.ladder_stage = Some(stage.saturating_sub(1)),
                 VK_DOWN => {
                     self.ladder_stage =
-                        Some((stage + 1).min(self.ladder_names.len().saturating_sub(1)))
+                        Some((stage + 1).min(self.current_ladder_names().len().saturating_sub(1)))
                 }
                 VK_PRIOR => self.ladder_stage = Some(stage.saturating_sub(MAPS_PER_PAGE)),
                 VK_NEXT => {
-                    self.ladder_stage =
-                        Some((stage + MAPS_PER_PAGE).min(self.ladder_names.len().saturating_sub(1)))
+                    self.ladder_stage = Some(
+                        (stage + MAPS_PER_PAGE)
+                            .min(self.current_ladder_names().len().saturating_sub(1)),
+                    )
                 }
                 VK_RETURN | VK_SPACE => return self.ladder_launch(stage, settings),
                 _ => {}
@@ -895,13 +937,15 @@ impl Menu {
                 || ((222..305).contains(&x) && (210..226).contains(&y))
             {
                 self.ladder_stage = None;
+            } else if (26..45).contains(&y) && (12..126).contains(&x) {
+                self.switch_ladder(settings);
             } else if (26..45).contains(&y) && (128..151).contains(&x) {
                 self.shift_ladder_team(settings, -1);
             } else if (26..45).contains(&y) && (391..415).contains(&x) {
                 self.shift_ladder_team(settings, 1);
             } else if (12..416).contains(&x) && (47..191).contains(&y) {
                 let row = stage / MAPS_PER_PAGE * MAPS_PER_PAGE + ((y - 47) / 18) as usize;
-                if row < self.ladder_names.len() {
+                if row < self.current_ladder_names().len() {
                     self.ladder_stage = Some(row);
                 }
             } else if (210..226).contains(&y) && (12..89).contains(&x) {
@@ -1160,24 +1204,26 @@ impl Menu {
             let rect @ [x, y, _, _] = ui.match_rect(size);
             ui.window(frame, art, rect);
             label(frame, x + 5, y + 1, "Tournament");
-            label(frame, x + 12, y + 29, "Assault");
-            if let Some(team) = self.ladder_teams.get(self.ladder_team) {
+            let mode = self.ladder_mode();
+            let progress = settings.ladder_progress(mode);
+            let names = self.current_ladder_names();
+            ui.tile(frame, None, [x + 12, y + 26, 113, 18], FIELD_COLOR);
+            label(frame, x + 16, y + 29, "<");
+            label(frame, x + 30, y + 29, mode.label());
+            label(frame, x + 113, y + 29, ">");
+            if mode == Mode::Assault
+                && let Some(team) = self.ladder_teams.get(self.ladder_team)
+            {
                 ui.tile(frame, None, [x + 129, y + 26, 286, 18], FIELD_COLOR);
                 label(frame, x + 156, y + 29, &format!("Team  {team}"));
-                if settings.assault_progress == 0 && self.ladder_teams.len() > 1 {
+                if progress == 0 && self.ladder_teams.len() > 1 {
                     label(frame, x + 136, y + 29, "<");
                     label(frame, x + 398, y + 29, ">");
                 }
             }
             ui.tile(frame, None, [x + 12, y + 47, 404, 144], FIELD_COLOR);
             let page = stage / MAPS_PER_PAGE * MAPS_PER_PAGE;
-            for (row, (map, installed)) in self
-                .ladder_names
-                .iter()
-                .enumerate()
-                .skip(page)
-                .take(MAPS_PER_PAGE)
-            {
+            for (row, (map, installed)) in names.iter().enumerate().skip(page).take(MAPS_PER_PAGE) {
                 let top = y + 47 + 18 * (row - page) as i32;
                 if row == stage {
                     let selected = [x + 12, top, 404, 18];
@@ -1187,9 +1233,9 @@ impl Menu {
                 label(frame, x + 18, top + 2, map);
                 let status = if !installed {
                     "Map unavailable"
-                } else if row < settings.assault_progress {
+                } else if row < progress {
                     "Complete"
-                } else if row > settings.assault_progress {
+                } else if row > progress {
                     "Locked"
                 } else {
                     "Ready"
@@ -1198,12 +1244,7 @@ impl Menu {
             }
             for (left, width, caption, enabled) in [
                 (12, 77, "Previous", page > 0),
-                (
-                    96,
-                    77,
-                    "Next",
-                    page + MAPS_PER_PAGE < self.ladder_names.len(),
-                ),
+                (96, 77, "Next", page + MAPS_PER_PAGE < names.len()),
                 (222, 83, "Back", true),
                 (
                     313,
@@ -1217,8 +1258,8 @@ impl Menu {
                     label(frame, x + left + 8, y + 211, caption);
                 }
             }
-            if self.ladder_names.is_empty() {
-                label(frame, x + 12, y + 235, "Assault ladder data unavailable");
+            if names.is_empty() {
+                label(frame, x + 12, y + 235, "Tournament data unavailable");
             } else if !self.status.is_empty() {
                 label(frame, x + 12, y + 235, &self.status);
             }
@@ -1763,20 +1804,43 @@ mod tests {
         assert!(menu.activate(1, &settings) == Action::None);
         menu.key(VK_RIGHT, &mut settings);
         assert_eq!(menu.ladder_team, 1);
-        assert!(menu.key(VK_RETURN, &mut settings) == Action::StartLadder(0));
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::StartLadder(Mode::Assault, 0));
         menu.key(VK_DOWN, &mut settings);
         assert!(menu.key(VK_RETURN, &mut settings) == Action::None);
         menu.key(VK_ESCAPE, &mut settings);
-        assert!(settings.record_assault_win(0));
-        assert!(!settings.record_assault_win(0));
-        assert!(!settings.record_assault_win(2));
+        assert!(settings.record_ladder_win(Mode::Assault, 0));
+        assert!(!settings.record_ladder_win(Mode::Assault, 0));
+        assert!(!settings.record_ladder_win(Mode::Assault, 2));
         menu.activate(1, &settings);
         menu.key(VK_LEFT, &mut settings);
         assert_eq!(menu.ladder_team, 1);
-        assert!(menu.key(VK_RETURN, &mut settings) == Action::StartLadder(1));
-        assert!(settings.record_assault_win(1));
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::StartLadder(Mode::Assault, 1));
+        assert!(settings.record_ladder_win(Mode::Assault, 1));
         menu.key(VK_DOWN, &mut settings);
         assert!(menu.key(VK_RETURN, &mut settings) == Action::None);
+    }
+
+    #[test]
+    fn tournament_tabs_use_separate_checkpoints() {
+        let mut settings = Settings {
+            assault_progress: 1,
+            ..Settings::default()
+        };
+        let mut menu = Menu::default();
+        menu.ladder_names = vec![("AS-Tutorial".into(), true), ("AS-Frigate".into(), true)];
+        menu.deathmatch_ladder_names =
+            vec![("DM-Oblivion".into(), true), ("DM-Stalwart".into(), true)];
+        menu.activate(1, &settings);
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::StartLadder(Mode::Assault, 1));
+        menu.key(VK_TAB, &mut settings);
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::StartLadder(Mode::Deathmatch, 0));
+        menu.key(VK_DOWN, &mut settings);
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::None);
+        assert!(settings.record_ladder_win(Mode::Deathmatch, 0));
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::StartLadder(Mode::Deathmatch, 1));
+        menu.key(VK_TAB, &mut settings);
+        assert_eq!(settings.assault_progress, 1);
+        assert!(menu.key(VK_RETURN, &mut settings) == Action::StartLadder(Mode::Assault, 1));
     }
     #[test]
     fn deathmatch_setup_applies_draft_rules_only_after_successful_launch() {

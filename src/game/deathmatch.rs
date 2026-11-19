@@ -799,14 +799,15 @@ impl shock::Targets for ShockTargets<'_> {
     }
 }
 
-pub(crate) struct AssaultRoster {
+pub(crate) struct RatedRoster {
     pub allies: usize,
     pub teams: [Option<String>; 2],
     pub bots: Vec<Option<String>>,
+    pub favorites: Vec<Option<Weapon>>,
 }
 
 pub struct Match {
-    assault_roster: Option<AssaultRoster>,
+    rated_roster: Option<RatedRoster>,
     rules: Rules,
     objectives: objectives::Objectives,
     assault: Option<assault::Round>,
@@ -853,18 +854,18 @@ pub struct AssaultStatus<'a> {
 
 impl Match {
     pub fn new(map: &Map, start: usize, rules: Rules) -> Self {
-        Self::with_assault_roster(map, start, rules, None)
+        Self::with_rated_roster(map, start, rules, None)
     }
 
-    pub(crate) fn with_assault_roster(
+    pub(crate) fn with_rated_roster(
         map: &Map,
         start: usize,
         rules: Rules,
-        assault_roster: Option<AssaultRoster>,
+        rated_roster: Option<RatedRoster>,
     ) -> Self {
         let mut game = Self {
             rules,
-            assault_roster,
+            rated_roster,
             objectives: objectives::Objectives::new(map, rules.mode),
             assault: map
                 .assault
@@ -1065,7 +1066,9 @@ impl Match {
         {
             return Some(usize::from(fighter > training.allies));
         }
-        if let Some(roster) = &self.assault_roster {
+        if let Some(roster) = &self.rated_roster
+            && self.rules.mode.team_based()
+        {
             return Some(usize::from(fighter > roster.allies));
         }
         self.rules.mode.team_based().then_some(fighter % 2)
@@ -1100,6 +1103,13 @@ impl Match {
         self.finished
             && self.assault.is_some()
             && self.objectives.scores[0] > self.objectives.scores[1]
+    }
+
+    pub fn player_won_rated_match(&self) -> bool {
+        if self.mode() == Mode::Assault {
+            return self.player_won_assault();
+        }
+        self.finished && self.winner() == Some(0)
     }
     pub fn flag_status(&self) -> Option<[&'static str; 2]> {
         self.objectives.flag_status()
@@ -1347,7 +1357,7 @@ impl Match {
         if id == 0 {
             return "Player (you)".into();
         }
-        self.assault_roster
+        self.rated_roster
             .as_ref()
             .and_then(|roster| roster.bots.get(id - 1))
             .and_then(|name| name.clone())
@@ -1355,7 +1365,7 @@ impl Match {
     }
 
     pub fn team_label(&self, team: usize) -> &str {
-        self.assault_roster
+        self.rated_roster
             .as_ref()
             .and_then(|roster| roster.teams.get(team))
             .and_then(|name| name.as_deref())
@@ -1363,7 +1373,7 @@ impl Match {
     }
 
     pub fn named_assault_teams(&self) -> Option<(&str, &str)> {
-        let roster = self.assault_roster.as_ref()?;
+        let roster = self.rated_roster.as_ref()?;
         Some((roster.teams[0].as_deref()?, roster.teams[1].as_deref()?))
     }
 
@@ -2039,7 +2049,7 @@ impl Match {
                 && self.time >= result_at
             {
                 // A rated match ends if the player's opening attack runs out of time.
-                let opening_loss = self.assault_roster.is_some()
+                let opening_loss = self.rated_roster.is_some()
                     && round.first_attack.is_none()
                     && conquered.is_none();
                 if round.tutorial.is_some() || opening_loss {
@@ -4155,6 +4165,15 @@ impl Match {
     }
 
     fn bot_command(&mut self, map: &Map, id: usize, dt: f32) -> Command {
+        let favorite = self
+            .rated_roster
+            .as_ref()
+            .and_then(|roster| {
+                id.checked_sub(1)
+                    .and_then(|index| roster.favorites.get(index))
+            })
+            .copied()
+            .flatten();
         let fighter = &self.fighters[id];
         if fighter.health == 0 {
             return Command::default();
@@ -4358,7 +4377,7 @@ impl Match {
             {
                 fighter.weapon
             } else {
-                fighter.inventory.preferred(range)
+                fighter.inventory.preferred_with_favorite(range, favorite)
             };
             let (alt, shot) = if shock_combo.is_some() {
                 (false, arsenal::shot(Weapon::Shock, false))
@@ -4557,7 +4576,10 @@ impl Match {
                 .then_some(chase)
                 .flatten()
                 .and_then(|point| self.navigation.next_step(&map.collision, position, point));
-            let stocked = fighter.inventory.preferred(560.0).switch_priority()
+            let stocked = fighter
+                .inventory
+                .preferred_with_favorite(560.0, favorite)
+                .switch_priority()
                 > Weapon::Enforcer.switch_priority();
             let objective_step = (!stalled)
                 .then_some(objective)
@@ -5459,11 +5481,16 @@ mod tests {
             };
             let frontend = Frontend::load(path, false);
             let mut settings = Settings::default();
-            let next = frontend.next_ladder_stage(0, &game).unwrap();
-            assert!(settings.record_assault_win(0));
+            let next = frontend.next_ladder_stage(Mode::Assault, 0, &game).unwrap();
+            assert!(settings.record_ladder_win(Mode::Assault, 0));
             assert_eq!(next, settings.assault_progress);
-            let frigate = frontend.load_ladder(next).unwrap();
-            let rated = frontend.start_match(&frigate, 0, Action::StartLadder(next), &settings);
+            let frigate = frontend.load_ladder(Mode::Assault, next).unwrap();
+            let rated = frontend.start_match(
+                &frigate,
+                0,
+                Action::StartLadder(Mode::Assault, next),
+                &settings,
+            );
             assert_eq!(rated.fighters.len(), 8);
             assert_eq!(
                 rated
@@ -5474,7 +5501,10 @@ mod tests {
                 4
             );
             assert!(!rated.training_assault());
-            assert_eq!(frontend.next_ladder_stage(next, &rated), None);
+            assert_eq!(
+                frontend.next_ladder_stage(Mode::Assault, next, &rated),
+                None
+            );
             let (allies, enemies) = rated.named_assault_teams().unwrap();
             assert_ne!(allies, enemies);
             assert!(
@@ -5501,6 +5531,91 @@ mod tests {
     #[cfg(windows)]
     #[test]
     #[ignore = "requires the local reference-client map installation"]
+    fn ranked_deathmatch_uses_stock_rules_and_only_advances_after_a_win() {
+        use crate::{
+            frontend::{Action, Frontend},
+            settings::Settings,
+        };
+        let path = std::path::Path::new("local/reference-client/Maps/DM-Oblivion.unr");
+        let frontend = Frontend::load(path, false);
+        let mode = Mode::Deathmatch;
+        let mut settings = Settings {
+            bot_count: 0,
+            frag_limit: 1,
+            match_minutes: 1,
+            ..Settings::default()
+        };
+        let dt = 1.0 / 120.0;
+        for stage in 0..frontend.ladder_len(mode) {
+            let mut map = frontend.load_ladder(mode, stage).unwrap();
+            let mut game =
+                frontend.start_match(&map, 0, Action::StartLadder(mode, stage), &settings);
+            assert!(game.fighters.iter().all(|fighter| fighter.team.is_none()));
+            assert!(game.fighters.len() > 1);
+            assert!(game.rules.frag_limit >= 10);
+            assert_eq!(game.rules.seconds, 0);
+            assert_eq!(frontend.next_ladder_stage(mode, stage, &game), None);
+            if stage == 0 {
+                assert_eq!(game.fighter_label(1), "Blake");
+                game.fighters[1].score = game.rules.frag_limit;
+                game.step(&mut map, Command::default(), dt);
+                assert!(game.finished);
+                assert!(!game.player_won_rated_match());
+                assert_eq!(frontend.next_ladder_stage(mode, stage, &game), None);
+                game.step(
+                    &mut map,
+                    Command {
+                        restart: true,
+                        ..Command::default()
+                    },
+                    dt,
+                );
+                assert!(!game.finished);
+            }
+            game.time = 2.0;
+            game.fighters[0].score = game.rules.frag_limit - 1;
+            game.apply_hit(
+                &map,
+                Hit {
+                    victim: 1,
+                    owner: Some(0),
+                    damage: 1000,
+                    impulse: Vec3::default(),
+                    bypass_armor: true,
+                },
+                &mut SoundEvents::default(),
+            );
+            game.step(&mut map, Command::default(), dt);
+            assert!(game.player_won_rated_match(), "stage {stage}");
+            assert!(settings.record_ladder_win(mode, stage));
+            assert_eq!(settings.ladder_progress(mode), stage + 1);
+            let expected = (stage + 1 < frontend.ladder_len(mode)).then_some(stage + 1);
+            assert_eq!(frontend.next_ladder_stage(mode, stage, &game), expected);
+        }
+        assert_eq!(settings.assault_progress, 0);
+    }
+
+    #[test]
+    fn rated_favorite_weapon_bonus_only_applies_to_usable_weapons() {
+        let map = arena();
+        let mut inventory = Inventory::new(&map);
+        inventory.pickup(&map.arsenal, Weapon::Pulse);
+        inventory.pickup(&map.arsenal, Weapon::Shock);
+        assert_eq!(inventory.preferred(550.0), Weapon::Pulse);
+        assert_eq!(
+            inventory.preferred_with_favorite(550.0, Some(Weapon::Shock)),
+            Weapon::Shock
+        );
+        assert!(inventory.spend(Weapon::Shock, inventory.ammo(Weapon::Shock)));
+        assert_eq!(
+            inventory.preferred_with_favorite(550.0, Some(Weapon::Shock)),
+            Weapon::Pulse
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires the local reference-client map installation"]
     fn assault_tournament_advances_every_stock_stage_and_recovers_after_losses() {
         use crate::{
             assault::Target,
@@ -5519,17 +5634,28 @@ mod tests {
         let mut stage = 0;
         let mut cameras = 0;
         loop {
-            let mut map = frontend.load_ladder(stage).unwrap();
-            let mut game = frontend.start_match(&map, 0, Action::StartLadder(stage), &settings);
+            let mut map = frontend.load_ladder(Mode::Assault, stage).unwrap();
+            let mut game = frontend.start_match(
+                &map,
+                0,
+                Action::StartLadder(Mode::Assault, stage),
+                &settings,
+            );
             assert_eq!(settings.assault_progress, stage);
-            assert_eq!(frontend.next_ladder_stage(stage, &game), None);
+            assert_eq!(
+                frontend.next_ladder_stage(Mode::Assault, stage, &game),
+                None
+            );
             if stage == 1 {
                 game.time = game.assault.as_ref().unwrap().limit;
                 game.step(&mut map, Command::default(), dt);
                 assert!(game.finished && !game.player_won_assault());
                 assert_eq!(game.assault_status(&map).unwrap().half, 1);
                 assert_eq!(game.team_scores(), Some([0, 1]));
-                assert_eq!(frontend.next_ladder_stage(stage, &game), None);
+                assert_eq!(
+                    frontend.next_ladder_stage(Mode::Assault, stage, &game),
+                    None
+                );
                 game.step(
                     &mut map,
                     Command {
@@ -5606,7 +5732,10 @@ mod tests {
                     game.time = captured + result_delay;
                     game.step(&mut map, Command::default(), dt);
                     assert!(game.finished && !game.player_won_assault());
-                    assert_eq!(frontend.next_ladder_stage(stage, &game), None);
+                    assert_eq!(
+                        frontend.next_ladder_stage(Mode::Assault, stage, &game),
+                        None
+                    );
                     game.step(
                         &mut map,
                         Command {
@@ -5624,14 +5753,17 @@ mod tests {
                 game.step(&mut map, Command::default(), dt);
             }
             assert!(game.player_won_assault(), "stage {stage}");
-            let next = frontend.next_ladder_stage(stage, &game);
-            assert!(settings.record_assault_win(stage));
+            let next = frontend.next_ladder_stage(Mode::Assault, stage, &game);
+            assert!(settings.record_ladder_win(Mode::Assault, stage));
             settings.save(&preferences).unwrap();
             settings = Settings::load(&preferences).unwrap();
             assert_eq!(settings.assault_progress, stage + 1);
             assert_eq!(settings.assault_team, 1);
             let Some(next) = next else {
-                assert_eq!(settings.assault_progress, frontend.ladder_len());
+                assert_eq!(
+                    settings.assault_progress,
+                    frontend.ladder_len(Mode::Assault)
+                );
                 break;
             };
             assert_eq!(next, settings.assault_progress);

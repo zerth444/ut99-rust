@@ -1,3 +1,4 @@
+use crate::game::deathmatch::Mode;
 use std::{fs, io, path::Path};
 
 pub const RESOLUTIONS: [(u32, u32); 6] = [
@@ -38,6 +39,7 @@ pub struct Settings {
     pub frag_limit: u32,
     pub match_minutes: u32,
     pub assault_progress: usize,
+    pub deathmatch_progress: usize,
     pub assault_team: usize,
     pub gui_skin: usize,
     pub field_of_view: u32,
@@ -67,6 +69,7 @@ impl Default for Settings {
             frag_limit: 10,
             match_minutes: 5,
             assault_progress: 0,
+            deathmatch_progress: 0,
             assault_team: 0,
             gui_skin: 0,
             field_of_view: 90,
@@ -81,11 +84,24 @@ impl Default for Settings {
 }
 
 impl Settings {
-    pub fn record_assault_win(&mut self, stage: usize) -> bool {
-        if stage != self.assault_progress {
+    pub fn ladder_progress(&self, mode: Mode) -> usize {
+        match mode {
+            Mode::Assault => self.assault_progress,
+            Mode::Deathmatch => self.deathmatch_progress,
+            _ => 0,
+        }
+    }
+
+    pub fn record_ladder_win(&mut self, mode: Mode, stage: usize) -> bool {
+        let progress = match mode {
+            Mode::Assault => &mut self.assault_progress,
+            Mode::Deathmatch => &mut self.deathmatch_progress,
+            _ => return false,
+        };
+        if stage != *progress {
             return false;
         }
-        self.assault_progress += 1;
+        *progress += 1;
         true
     }
 
@@ -120,6 +136,7 @@ impl Settings {
                 "frag_limit" => settings.frag_limit = value.min(100),
                 "match_minutes" => settings.match_minutes = value.min(60),
                 "assault_progress" => settings.assault_progress = value.min(32) as usize,
+                "deathmatch_progress" => settings.deathmatch_progress = value.min(32) as usize,
                 "assault_team" => settings.assault_team = value.min(31) as usize,
                 "gui_skin" => settings.gui_skin = (value as usize).min(GUI_SKINS.len() - 1),
                 "fov" => settings.field_of_view = value.clamp(75, 120),
@@ -185,12 +202,13 @@ impl Settings {
         use std::fmt::Write;
         let _ = writeln!(
             text,
-            "bot_count={}\nfrag_limit={}\nmatch_minutes={}\nassault_progress={}\nassault_team={}",
+            "bot_count={}\nfrag_limit={}\nmatch_minutes={}\nassault_progress={}\nassault_team={}\ndeathmatch_progress={}",
             self.bot_count,
             self.frag_limit,
             self.match_minutes,
             self.assault_progress,
-            self.assault_team
+            self.assault_team,
+            self.deathmatch_progress
         );
         for (index, key) in self.bindings.iter().enumerate() {
             let _ = writeln!(text, "bind{index}={key}");
@@ -253,8 +271,9 @@ mod tests {
         settings.bot_count = 5;
         settings.frag_limit = 25;
         settings.match_minutes = 12;
-        assert!(settings.record_assault_win(0));
-        assert!(settings.record_assault_win(1));
+        assert!(settings.record_ladder_win(Mode::Assault, 0));
+        assert!(settings.record_ladder_win(Mode::Assault, 1));
+        assert!(settings.record_ladder_win(Mode::Deathmatch, 0));
         settings.assault_team = 3;
         settings.bind(0, b'I' as u16);
         settings.bind(6, 2);
