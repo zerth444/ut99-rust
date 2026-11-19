@@ -84,6 +84,16 @@ fn overlaps(portal: &Teleporter, position: Vec3) -> bool {
         && offset.2.abs() <= portal.height + 39.0
 }
 
+pub(crate) fn clear_radius(
+    portals: &[Teleporter],
+    occupied: Option<usize>,
+    entry: Vec3,
+) -> Option<f32> {
+    let portal = portals.get(occupied?)?;
+    let delta = portal.position - entry;
+    (delta.dot(delta) < 1.0).then_some(portal.radius + crate::collision::PLAYER_RADIUS)
+}
+
 pub struct Arrival<'a> {
     source: &'a Teleporter,
     destination: &'a Teleporter,

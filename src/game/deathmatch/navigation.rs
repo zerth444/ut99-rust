@@ -489,7 +489,9 @@ impl Navigation {
                 }
             }
             for edge in &self.edges[id] {
-                if !allowed(self.points[edge.to]) {
+                if !allowed(self.points[edge.to])
+                    || matches!(edge.step, Step::Teleport(entry) if !allowed(entry))
+                {
                     continue;
                 }
                 let length = costs[id] + edge.cost;
@@ -596,6 +598,58 @@ pub(super) fn walk_link(world: &Collision, from: Vec3, to: Vec3) -> bool {
     })
 }
 
+pub(super) fn portal_clearance(
+    world: &Collision,
+    from: Vec3,
+    portal: Vec3,
+    radius: f32,
+) -> Option<Vec3> {
+    let offset = from - portal;
+    let angle = offset.1.atan2(offset.0);
+    (0_usize..16)
+        .map(|index| {
+            let turn = index.div_ceil(2) as f32 * std::f32::consts::TAU / 16.0;
+            let (sin, cos) = (angle + if index % 2 == 0 { turn } else { -turn }).sin_cos();
+            Vec3(portal.0, portal.1, from.2) + Vec3(cos, sin, 0.0) * (radius + 24.0)
+        })
+        .find(|&point| {
+            world
+                .projectile_surface(
+                    from,
+                    point - from,
+                    crate::collision::PLAYER_RADIUS,
+                    crate::collision::PLAYER_HEIGHT,
+                )
+                .is_none()
+                && walk_link(world, from, point)
+        })
+}
+
+pub(super) fn swim_to_surface(
+    world: &Collision,
+    from: Vec3,
+    blocked: &[(Vec3, f32)],
+) -> Option<Step> {
+    if !world.regions.at(from).water {
+        return None;
+    }
+    // Look up and around an overhead ledge when no authored route is accessible.
+    let vertical = Vec3(0.0, 0.0, 112.0);
+    std::iter::once(from + vertical)
+        .chain((0..8).map(|index| {
+            let (sin, cos) = (index as f32 * std::f32::consts::TAU / 8.0).sin_cos();
+            from + vertical + Vec3(cos, sin, 0.0) * 96.0
+        }))
+        .filter(|&point| {
+            blocked
+                .iter()
+                .all(|&(failed, _)| distance_squared(point, failed) > 40.0_f32.powi(2))
+        })
+        .filter_map(|point| Some((point, approach_step(world, from, point)?)))
+        .min_by_key(|(point, _)| world.regions.at(*point).water)
+        .map(|(_, step)| step)
+}
+
 pub(super) fn walk_around_wall(world: &Collision, from: Vec3, to: Vec3) -> Option<Vec<Vec3>> {
     use crate::collision::{PLAYER_HEIGHT, PLAYER_RADIUS};
     const SIDE: usize = 29;
@@ -603,7 +657,7 @@ pub(super) fn walk_around_wall(world: &Collision, from: Vec3, to: Vec3) -> Optio
     let delta = to - from;
     let horizontal = Vec3(delta.0, delta.1, 0.0);
     if delta.2.abs() > world.profile.step_height + 16.0
-        || !(30.0_f32.powi(2)..=320.0_f32.powi(2)).contains(&horizontal.dot(horizontal))
+        || !(30.0_f32.powi(2)..=440.0_f32.powi(2)).contains(&horizontal.dot(horizontal))
     {
         return None;
     }

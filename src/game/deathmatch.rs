@@ -580,6 +580,7 @@ struct Bot {
     blocked_waypoints: Vec<(Vec3, f32)>,
     last_waypoint: Option<Vec3>,
     wall_detour: Vec<Vec3>,
+    portal_clear: Option<Vec3>,
     navigation_objective: Option<Vec3>,
     retreat: Option<Retreat>,
     retreat_retry_at: f32,
@@ -2212,6 +2213,7 @@ impl Match {
                 fighter.airborne_since = None;
                 fighter.power.boosted_airborne = false;
                 fighter.bot.goal = None;
+                fighter.bot.portal_clear = None;
                 fighter.bot.wall_detour.clear();
                 fighter.bot.lift = None;
                 fighter.bot.jump_until = None;
@@ -4818,8 +4820,26 @@ impl Match {
                 .min_by(|a, b| a.1.total_cmp(&b.1))
                 .map(|(ray, _)| ray)
         });
+        let keep_route = carrying_flag
+            || (self.rules.mode == Mode::CaptureTheFlag
+                && fighter.bot.goal.and_then(Step::movement_goal).is_some()
+                && target.is_some_and(|(opponent, point, _, distance, _)| {
+                    // Pass a distant opponent when a teammate is already fighting them.
+                    distance > 520.0_f32.powi(2)
+                        && self.fighters.iter().enumerate().any(|(other, ally)| {
+                            other != id
+                                && ally.health > 0
+                                && allied(fighter.team, ally.team)
+                                && ally.bot.target == Some(opponent)
+                                && ally
+                                    .bot
+                                    .last_seen
+                                    .is_some_and(|(_, at)| self.time - at < 0.25)
+                                && distance_squared(ally.walker.position, point) < 400.0_f32.powi(2)
+                        })
+                }));
         let fighter = &mut self.fighters[id];
-        if !carrying_flag
+        if !keep_route
             && let Some(command) = try_retreat(
                 &self.navigation,
                 map,
@@ -4833,7 +4853,7 @@ impl Match {
             return command;
         }
         let bot = &mut fighter.bot;
-        let mut fire_while_carrying = None;
+        let mut covering_fire = None;
         if let Some((other, target_position, delta, distance, velocity)) = target {
             let reacquired = bot.target == Some(other)
                 && bot
@@ -4841,7 +4861,7 @@ impl Match {
                     .is_some_and(|since| self.time - since > 0.12);
             bot.hidden_since = None;
             bot.last_seen = Some((target_position, self.time));
-            if !carrying_flag {
+            if !keep_route {
                 bot.plan_origin = None;
             }
             if bot.target != Some(other) || reacquired {
@@ -4996,12 +5016,12 @@ impl Match {
                 preferred: (weapon != fighter.weapon).then_some(weapon),
                 ..Command::default()
             };
-            if !carrying_flag {
+            if !keep_route {
                 return combat;
             }
-            fire_while_carrying = Some(combat);
+            covering_fire = Some(combat);
         }
-        if !carrying_flag
+        if !keep_route
             && let Some((point, seen)) = bot.last_seen
             && tracked_alive
             && self.time - seen < 0.28
@@ -5017,7 +5037,7 @@ impl Match {
                 ..Command::default()
             };
         }
-        if fire_while_carrying.is_none() && bot.target.take().is_some() {
+        if covering_fire.is_none() && bot.target.take().is_some() {
             bot.goal = None;
             bot.rethink_at = self.time;
             bot.hidden_since = None;
@@ -5190,6 +5210,9 @@ impl Match {
                     .recovery(&map.collision, position, objective, blocked);
             }
             if bot.goal.is_none() {
+                bot.goal = navigation::swim_to_surface(&map.collision, position, blocked);
+            }
+            if bot.goal.is_none() {
                 bot.goal = (0..12).find_map(|offset| {
                     let yaw = fighter.yaw
                         + (offset as f32 + id as f32 + self.time.floor()) * std::f32::consts::TAU
@@ -5216,9 +5239,11 @@ impl Match {
             let delta = goal - position;
             let (yaw, pitch) = aim_error(delta, fighter.yaw, fighter.pitch);
             let turn = 4.6 * dt;
+            let steer_yaw = yaw.clamp(-turn, turn);
+            let steer_pitch = pitch.clamp(-turn, turn);
             return Command {
-                look: [yaw.clamp(-turn, turn), pitch.clamp(-turn, turn)],
-                movement: [0.8, 0.0],
+                look: [steer_yaw, steer_pitch],
+                movement: [0.8 * (yaw - steer_yaw).cos().max(0.0), 0.0],
                 jump: delta.2 > 18.0 && delta.0.hypot(delta.1) < 120.0,
                 normal_jump: true,
                 ..Command::default()
@@ -5226,7 +5251,7 @@ impl Match {
         }
         if let Some(goal) = fighter.bot.goal.and_then(Step::movement_goal) {
             let route = steer(fighter, goal, dt);
-            if let Some(mut fire) = fire_while_carrying {
+            if let Some(mut fire) = covering_fire {
                 let [forward, strafe] = route.movement;
                 let (sin, cos) = (fighter.yaw + route.look[0]).sin_cos();
                 let direction = Vec3(
@@ -5240,7 +5265,7 @@ impl Match {
             return route;
         }
         if self.rules.mode.team_based() {
-            if let Some(fire) = fire_while_carrying {
+            if let Some(fire) = covering_fire {
                 return fire;
             }
             let limit = 1.8 * dt;
@@ -5479,9 +5504,28 @@ fn follow_transfer(map: &Map, fighter: &mut Fighter, time: f32, dt: f32) -> Opti
             }
             Step::Teleport(position) => {
                 if time >= fighter.bot.rethink_at {
+                    fighter.bot.avoid_waypoint(position, time + 4.0);
                     fighter.bot.goal = None;
+                    fighter.bot.portal_clear = None;
                     return None;
                 }
+                if let Some(radius) =
+                    crate::teleport::clear_radius(&map.teleporters, fighter.portal, position)
+                {
+                    let current = fighter.walker.position;
+                    let clear = fighter.bot.portal_clear.or_else(|| {
+                        navigation::portal_clearance(&map.collision, current, position, radius)
+                    });
+                    if let Some(clear) = clear {
+                        if fighter.bot.portal_clear.is_none() {
+                            fighter.bot.rethink_at = time + 2.5;
+                        }
+                        fighter.bot.portal_clear = Some(clear);
+                        return Some(steer(fighter, clear, dt));
+                    }
+                    return Some(Command::default());
+                }
+                fighter.bot.portal_clear = None;
                 return Some(steer(fighter, position, dt));
             }
             Step::Lift(ride) => {
@@ -9639,24 +9683,81 @@ mod tests {
 
     #[test]
     #[ignore = "requires local GOTY data"]
+    fn overlord_bot_leaves_portal_overlap_before_reusing_it() {
+        let path = std::path::Path::new("local/reference-client/Maps/AS-Overlord.unr");
+        let bytes = std::fs::read(path).unwrap();
+        let mut map = Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap();
+        let links: Vec<_> = crate::teleport::links(&map.teleporters).collect();
+        let (entry, exit) = links
+            .iter()
+            .copied()
+            .find(|&(entry, exit)| {
+                exit.2 - entry.2 > 900.0
+                    && links.iter().any(|&(back, home)| {
+                        distance_squared(back, exit) < 1.0 && distance_squared(entry, home) < 1.0
+                    })
+            })
+            .expect("a two-way portal between the bunker and the lower passage");
+        let mut game = Match::new(
+            &map,
+            0,
+            Rules {
+                mode: Mode::Assault,
+                bots: 1,
+                ..Rules::default()
+            },
+        );
+        game.fighters[0].protected_until = f32::INFINITY;
+        let bot = &mut game.fighters[1];
+        bot.walker = Walker::spawn(&map.collision, entry);
+        bot.bot.goal = Some(Step::Teleport(entry));
+        bot.bot.rethink_at = 1.0;
+        game.step(&mut map, Command::default(), 1.0 / 120.0);
+        let bot = &mut game.fighters[1];
+        assert!(distance_squared(bot.walker.position, exit) < 22.0_f32.powi(2));
+        assert!(crate::teleport::clear_radius(&map.teleporters, bot.portal, exit).is_some());
+        bot.bot.goal = Some(Step::Teleport(exit));
+        bot.bot.rethink_at = game.time + 1.35;
+        for _ in 0..(3 * 120) {
+            game.step(&mut map, Command::default(), 1.0 / 120.0);
+            if distance_squared(game.fighters[1].walker.position, entry) < 22.0_f32.powi(2) {
+                return;
+            }
+        }
+        panic!("bot did not leave and reenter the portal");
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY data"]
     fn audit_objective_bots() {
-        for (name, mode) in [
-            ("CTF-Face.unr", Mode::CaptureTheFlag),
-            ("CTF-Niven.unr", Mode::CaptureTheFlag),
-            ("CTF-Coret.unr", Mode::CaptureTheFlag),
-            ("AS-Frigate.unr", Mode::Assault),
-            ("AS-Overlord.unr", Mode::Assault),
-            ("AS-Guardia.unr", Mode::Assault),
-            ("DOM-Sesmar.unr", Mode::Domination),
-        ] {
-            let path = std::path::Path::new("local/reference-client/Maps").join(name);
+        let mut arenas: Vec<_> = std::fs::read_dir("local/reference-client/Maps")
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("unr"))
+            })
+            .collect();
+        arenas.sort();
+        let mut checked = 0;
+        let mut stalled_regressions = Vec::new();
+        for path in arenas {
+            let name = path.file_name().and_then(|name| name.to_str()).unwrap();
+            let mode = match name.split_once('-') {
+                Some((_, "Tutorial.unr")) => continue,
+                Some(("CTF", _)) => Mode::CaptureTheFlag,
+                Some(("AS", _)) => Mode::Assault,
+                Some(("DOM", _)) => Mode::Domination,
+                _ => continue,
+            };
+            checked += 1;
             let bytes = std::fs::read(&path).unwrap();
             let mut map = Map::load(&Package::read(&bytes).unwrap(), Some(&path)).unwrap();
             assert!(
                 !map.reach_links.is_empty(),
                 "{name} has no authored bot routes"
             );
-            if mode == Mode::Domination {
+            if name == "DOM-Sesmar.unr" {
                 assert_eq!(map.control_points.len(), 3);
                 assert!(
                     map.control_points
@@ -9713,8 +9814,9 @@ mod tests {
                 game.time,
                 game.team_scores()
             );
-            match name {
-                "CTF-Coret.unr" => assert!(
+            let progressed = match name {
+                "CTF-Face.unr" => carried > 0,
+                "CTF-Coret.unr" => {
                     carried > 0
                         && game.finished
                         && game
@@ -9722,19 +9824,24 @@ mod tests {
                             .unwrap()
                             .into_iter()
                             .any(|score| score > 0)
-                ),
-                "AS-Frigate.unr" => assert_eq!((game.finished, by_half), (true, [3, 3])),
-                "DOM-Sesmar.unr" => assert!(
+                }
+                "AS-Frigate.unr" => game.finished && by_half == [3, 3],
+                "DOM-Sesmar.unr" => {
                     game.finished
                         && game
                             .team_scores()
                             .unwrap()
                             .into_iter()
                             .any(|score| score >= 3)
-                ),
-                _ => {}
+                }
+                _ => true,
+            };
+            if !progressed {
+                stalled_regressions.push(name.to_owned());
             }
         }
+        assert!(checked >= 36, "only {checked} objective maps found");
+        assert!(stalled_regressions.is_empty(), "{stalled_regressions:?}");
     }
 
     #[test]
