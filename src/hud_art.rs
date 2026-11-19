@@ -5,11 +5,13 @@ use crate::render::Frame;
 use crate::texture::{Texture, TextureImage};
 
 const BLUE: [f32; 3] = [0.0, 0.0, 254.0 / 255.0];
+const TEAM_COLORS: [[f32; 3]; 2] = [[1.0, 0.0, 0.0], BLUE];
 const WHITE: [f32; 3] = [1.0; 3];
 const GOLD: [f32; 3] = [1.0, 1.0, 0.0];
 
 pub struct State {
     pub hud_scale: f32,
+    pub team: Option<usize>,
     pub time: f32,
     pub pickup_time: f32,
     pub score: i16,
@@ -27,6 +29,13 @@ pub struct State {
 }
 
 impl State {
+    fn tint(&self) -> [f32; 3] {
+        TEAM_COLORS
+            .get(self.team.unwrap_or(1))
+            .copied()
+            .unwrap_or(BLUE)
+    }
+
     pub fn practice(game: &Practice, arsenal: &HashMap<Weapon, WeaponAssets>) -> Self {
         let mut owned = [false; Weapon::ALL.len()];
         for weapon in game.owned() {
@@ -34,6 +43,7 @@ impl State {
         }
         Self {
             hud_scale: game.hud_scale,
+            team: None,
             time: game.time,
             pickup_time: game.pickup_time,
             score: game.score,
@@ -68,6 +78,42 @@ impl Art {
         self.elements.is_some() && self.weapons.is_some()
     }
 
+    pub fn draw_ctf_info(
+        &self,
+        frame: &mut Frame,
+        icons: [&Texture; 2],
+        scores: [i16; 2],
+        hud_scale: f32,
+    ) {
+        let width = frame.width as f32;
+        let height = frame.height as f32;
+        let scale = hud_scale * width / 1280.0;
+        for (team, ((icon, score), tint)) in
+            icons.into_iter().zip(scores).zip(TEAM_COLORS).enumerate()
+        {
+            let y = height - (350.0 + 150.0 * team as f32) * scale;
+            let (w, h) = icon.size();
+            art(
+                frame,
+                icon.image(0.0),
+                [width - 70.0 * scale, y, w * 2.0 * scale, h * 2.0 * scale],
+                [0.0, 0.0, w, h],
+                tint,
+            );
+            if let Some(elements) = &self.elements {
+                number(
+                    frame,
+                    elements.image(0.0),
+                    i32::from(score),
+                    width - 144.0 * scale,
+                    y + 14.0 * scale,
+                    scale,
+                    tint,
+                );
+            }
+        }
+    }
+
     pub fn draw(&self, frame: &mut Frame, game: &State, arsenal: &HashMap<Weapon, WeaponAssets>) {
         let width = frame.width as f32;
         let height = frame.height as f32;
@@ -90,7 +136,7 @@ impl Art {
                 elements,
                 [ammo_x, ammo_y, 128.0 * scale, 64.0 * scale],
                 [128.0, 192.0, 128.0, 64.0],
-                BLUE,
+                game.tint(),
             );
             if let Some(ammo) = game.ammo {
                 number(
@@ -117,7 +163,7 @@ impl Art {
                 elements,
                 [0.0, ammo_y, 128.0 * scale, 64.0 * scale],
                 [0.0, 128.0, 128.0, 64.0],
-                BLUE,
+                game.tint(),
             );
             number(
                 frame,
@@ -184,7 +230,7 @@ impl Art {
                 doll,
                 [doll_x, 0.0, 128.0 * scale, 256.0 * scale],
                 [0.0, 0.0, 128.0, 256.0],
-                BLUE,
+                game.tint(),
             );
             for (y, amount) in [
                 (
@@ -203,7 +249,7 @@ impl Art {
                         doll,
                         [doll_x, y * scale, 128.0 * scale, 64.0 * scale],
                         [128.0, y, 128.0, 64.0],
-                        BLUE.map(|channel| channel * amount.min(1.0)),
+                        game.tint().map(|channel| channel * amount.min(1.0)),
                     );
                 }
             }
@@ -246,9 +292,9 @@ impl Art {
             0.0
         };
         let panel_tint = if game.health < 50 {
-            BLUE.map(|color| 1.0 - blink + (color - 1.0) * blink)
+            game.tint().map(|color| 1.0 - blink + (color - 1.0) * blink)
         } else {
-            BLUE
+            game.tint()
         };
         let health_tint = if game.health < 50 {
             panel_tint.map(|color| color * (1.0 - blink) + (1.0 - color) * blink)
@@ -260,7 +306,7 @@ impl Art {
             elements,
             [x, 0.0, 128.0 * scale, 64.0 * scale],
             [0.0, 192.0, 128.0, 64.0],
-            BLUE,
+            game.tint(),
         );
         art(
             frame,
@@ -332,9 +378,9 @@ fn weapon_bar(
         let x = base + index as f32 * row_width * 0.1;
         let active = weapon == Some(current);
         let tint = if active || weapon == Some(pending) {
-            BLUE
+            game.tint()
         } else {
-            BLUE.map(|c| c * 0.5)
+            game.tint().map(|c| c * 0.5)
         };
         let icon = weapon.and_then(|weapon| arsenal.get(&weapon)?.status_icon.as_deref());
         if (active || index == 9)

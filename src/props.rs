@@ -418,6 +418,8 @@ pub struct Scene {
     pub powerups: crate::game::PowerupArt,
     pub liquid_audio: Vec<[Option<Arc<Wave>>; 2]>,
     pub dm_training: Option<crate::game::deathmatch::dm_training::Data>,
+    pub ctf_training: Option<crate::game::deathmatch::ctf_training::Data>,
+    pub ctf_icons: [Option<Arc<Texture>>; 3],
 }
 
 pub fn load(
@@ -438,6 +440,9 @@ pub fn load(
     let dm_training = path
         .file_stem()
         .is_some_and(|stem| stem.eq_ignore_ascii_case("DM-Tutorial"));
+    let ctf_training = path
+        .file_stem()
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("CTF-Tutorial"));
     let mut packages: Vec<_> = [
         ("../System", "u"),
         ("../Textures", "utx"),
@@ -471,6 +476,7 @@ pub fn load(
                 | "ladrstatic"
         ) && !(training && name == "tutvoiceas")
             && !(dm_training && name == "tutvoicedm")
+            && !(ctf_training && name == "tutvoicectf")
             && !map.imports.iter().any(|import| {
                 import.outer == 0 && map.names[import.name].eq_ignore_ascii_case(&name)
             })
@@ -1212,6 +1218,13 @@ pub fn load(
             props[barrel.prop].visible = false;
         }
     }
+    let ctf_training = ctf_training
+        .then(|| capture_training(&assets, &mut waves, folder))
+        .flatten();
+    let ctf_icons = ["I_Home", "I_Capt", "I_Down"].map(|name| {
+        let object = find_export(&assets, "botpack", name, "Texture")?;
+        cached_texture(&assets, &mut textures, object)
+    });
     Ok(Scene {
         props,
         arsenal,
@@ -1229,6 +1242,8 @@ pub fn load(
         powerups,
         liquid_audio,
         dm_training,
+        ctf_training,
+        ctf_icons,
     })
 }
 
@@ -1822,6 +1837,72 @@ fn assault_briefing(
                 .then_some(crate::assault::ObjectivePage { description, image })
         })
         .collect())
+}
+
+fn capture_training(
+    assets: &Assets<'_>,
+    waves: &mut HashMap<Object, Option<Arc<Wave>>>,
+    folder: &Path,
+) -> Option<crate::game::deathmatch::ctf_training::Data> {
+    use crate::game::deathmatch::ctf_training::{Data, LESSON_COUNT};
+    let class = find_export(assets, "botpack", "TrainingCTF", "Class")?;
+    let (package, export) = assets.object(class);
+    let mut props = class_properties(package, export).ok()?;
+    let mut voices: [String; LESSON_COUNT] = Default::default();
+    let mut subtitles: [String; LESSON_COUNT] = Default::default();
+    while let Some(mut prop) = props.next_tag().ok()? {
+        if prop.array_index >= LESSON_COUNT {
+            continue;
+        }
+        match prop.name {
+            "CTF" => voices[prop.array_index] = prop.value.string(package.version).ok()?,
+            "TutMessage" => {
+                subtitles[prop.array_index] = prop.value.string(package.version).ok()?
+            }
+            _ => {}
+        }
+    }
+    let localized = localized_section(folder, "Botpack.int", "TrainingCTF");
+    let lines = voices
+        .into_iter()
+        .zip(subtitles)
+        .enumerate()
+        .map(|(index, (voice, text))| {
+            let (package, _) = voice.split_once('.')?;
+            let name = voice.rsplit('.').next()?;
+            let sound = find_export(assets, &package.to_ascii_lowercase(), name, "Sound");
+            let text = localized
+                .get(&format!("tutmessage[{index}]"))
+                .cloned()
+                .unwrap_or(text);
+            Some((text, cached_wave(assets, waves, sound)?))
+        })
+        .collect::<Option<Vec<_>>>()?
+        .try_into()
+        .ok()?;
+
+    let roster = find_export(assets, "botpack", "RatedMatchCTFTUT", "Class")?;
+    let (package, export) = assets.object(roster);
+    let mut props = class_properties(package, export).ok()?;
+    let (mut bots, mut allies) = (0, 0);
+    while let Some(mut prop) = props.next_tag().ok()? {
+        match prop.name {
+            "NumBots" => bots = (prop.value.u32().ok()? as i32).clamp(0, 15) as usize,
+            "NumAllies" => allies = (prop.value.u32().ok()? as i32).clamp(0, 7) as usize,
+            _ => {}
+        }
+    }
+    let teleport = cached_wave(
+        assets,
+        waves,
+        find_export(assets, "botpack", "Resp2A", "Sound"),
+    );
+    Some(Data {
+        lines,
+        bots,
+        allies: allies.min(bots),
+        teleport,
+    })
 }
 
 fn deathmatch_training(

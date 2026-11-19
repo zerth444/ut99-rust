@@ -42,12 +42,21 @@ impl Hud {
         result_help: &str,
     ) {
         frame.begin_ui(false);
+        let scale = (game.hud_scale * frame.width as f32 / 1280.0).clamp(0.55, 1.6);
         if scoreboard || game.finished {
-            self.draw_match_board(frame, game, map, result_help);
-            if game.finished
+            if let Some(scores) = game
+                .team_scores()
+                .filter(|_| game.flag_icon_states().is_some())
+            {
+                self.draw_ctf_board(frame, game, scores, result_help);
+            } else {
+                self.draw_match_board(frame, game, map, result_help);
+            }
+            if let Some(subtitle) = game.ctf_tutorial_subtitle(map) {
+                self.draw_tutorial_subtitle(frame, subtitle, scale);
+            } else if game.finished
                 && let Some(subtitle) = game.dm_tutorial_subtitle(map)
             {
-                let scale = (game.hud_scale * frame.width as f32 / 1280.0).clamp(0.55, 1.6);
                 self.draw_tutorial_subtitle(frame, &subtitle, scale);
             }
             return;
@@ -57,7 +66,12 @@ impl Hud {
             .arsenal
             .get(&Weapon::Redeemer)
             .is_some_and(|weapon| weapon.guided_hud[0].is_some());
-        let scale = (game.hud_scale * frame.width as f32 / 1280.0).clamp(0.55, 1.6);
+        let flag_icons = game.flag_icon_states().and_then(|[red, blue]| {
+            Some([
+                map.ctf_icons[red].as_deref()?,
+                map.ctf_icons[blue].as_deref()?,
+            ])
+        });
         let player = &game.fighters[0];
         let white = [0.92, 0.96, 1.0];
         let accent = [0.42, 0.87, 0.95];
@@ -97,18 +111,23 @@ impl Hud {
                 self.centered(frame, (47.0 * scale) as i32, scale, &objective, accent);
             }
         } else if let Some([red, blue]) = game.team_scores() {
-            let team = if player.team == Some(0) {
-                "Red"
+            if let Some(icons) = flag_icons {
+                map.hud
+                    .draw_ctf_info(frame, icons, [red, blue], game.hud_scale);
             } else {
-                "Blue"
-            };
-            self.centered(
-                frame,
-                (22.0 * scale) as i32,
-                scale,
-                &format!("Red {red}   -   {blue} Blue    |    Team {team}"),
-                white,
-            );
+                let team = if player.team == Some(0) {
+                    "Red"
+                } else {
+                    "Blue"
+                };
+                self.centered(
+                    frame,
+                    (22.0 * scale) as i32,
+                    scale,
+                    &format!("Red {red}   -   {blue} Blue    |    Team {team}"),
+                    white,
+                );
+            }
         } else if let Some(lives) = game.lives_left(0) {
             self.centered(
                 frame,
@@ -118,19 +137,23 @@ impl Hud {
                 white,
             );
         }
-        if let Some(subtitle) = game.dm_tutorial_subtitle(map) {
+        if let Some(subtitle) = game.ctf_tutorial_subtitle(map) {
+            self.draw_tutorial_subtitle(frame, subtitle, scale);
+        } else if let Some(subtitle) = game.dm_tutorial_subtitle(map) {
             self.draw_tutorial_subtitle(frame, &subtitle, scale);
         } else if let Some(subtitle) = game.tutorial_subtitle(map) {
             self.draw_tutorial_subtitle(frame, subtitle, scale);
         }
         if let Some([red, blue]) = game.flag_status() {
-            self.centered(
-                frame,
-                (45.0 * scale) as i32,
-                0.83 * scale,
-                &format!("Red flag: {red}    Blue flag: {blue}"),
-                white,
-            );
+            if flag_icons.is_none() {
+                self.centered(
+                    frame,
+                    (45.0 * scale) as i32,
+                    0.83 * scale,
+                    &format!("Red flag: {red}    Blue flag: {blue}"),
+                    white,
+                );
+            }
             if game.rated_capture_required() {
                 self.centered(
                     frame,
@@ -480,6 +503,124 @@ impl Hud {
                 scale * 0.8,
                 result_help,
                 white,
+            );
+        }
+    }
+
+    fn draw_ctf_board(&self, frame: &mut Frame, game: &Match, scores: [i16; 2], result_help: &str) {
+        let standings = game.standings();
+        let teams = [0, 1].map(|team| {
+            standings
+                .iter()
+                .copied()
+                .filter(|&id| game.fighters[id].team == Some(team))
+                .collect::<Vec<_>>()
+        });
+        let rows = teams[0].len().max(teams[1].len());
+        let height = 107.0 + rows as f32 * 27.0;
+        let scale = (frame.width as f32 / 720.0)
+            .min(frame.height as f32 / (height + 92.0))
+            .min(1.5);
+        let px = |value: f32| (value * scale).round() as i32;
+        let x = (frame.width as i32 - px(680.0)) / 2;
+        let y = (frame.height as i32 - px(height)) / 2;
+        let light = [0.95, 0.96, 0.98];
+        let title = if game.finished {
+            match game.winner().and_then(|winner| game.fighters[winner].team) {
+                Some(0) if game.training_ctf() => "Training complete".to_owned(),
+                Some(1) if game.training_ctf() => "Training failed".to_owned(),
+                Some(team) => format!("{} wins", game.team_label(team)),
+                None => "Match drawn".to_owned(),
+            }
+        } else if game.training_ctf() {
+            "Capture the Flag training".to_owned()
+        } else {
+            game.mode().label().to_owned()
+        };
+        self.centered(frame, y, 1.2 * scale, &title, light);
+        let elapsed = if game.limits().1 > 0 && !game.finished {
+            u32::from(game.remaining())
+        } else {
+            game.time as u32
+        };
+        self.centered(
+            frame,
+            y + px(25.0),
+            0.85 * scale,
+            &format!("{:02}:{:02}", elapsed / 60, elapsed % 60),
+            light,
+        );
+        for (team, players) in teams.into_iter().enumerate() {
+            let tint = [[1.0, 0.48, 0.47], [0.52, 0.73, 1.0]][team];
+            let left = x + px(team as f32 * 346.0);
+            let top = y + px(48.0);
+            frame.shade(
+                [left, top, px(334.0), px(54.0 + rows as f32 * 27.0)],
+                [0.045, 0.062, 0.078],
+                0.76,
+            );
+            frame.solid([left, top, px(334.0), px(2.0).max(1)], tint);
+            self.text(
+                frame,
+                left + px(16.0),
+                top + px(8.0),
+                scale,
+                game.team_label(team),
+                tint,
+            );
+            self.text(
+                frame,
+                left + px(286.0),
+                top + px(8.0),
+                scale,
+                &scores[team].to_string(),
+                tint,
+            );
+            for (column, heading) in [(22.0, "Player"), (224.0, "Score"), (280.0, "Deaths")] {
+                self.text(
+                    frame,
+                    left + px(column),
+                    top + px(33.0),
+                    0.78 * scale,
+                    heading,
+                    light,
+                );
+            }
+            for (row, id) in players.into_iter().enumerate() {
+                let y = top + px(54.0 + row as f32 * 27.0);
+                let fighter = &game.fighters[id];
+                if id == 0 {
+                    frame.shade([left, y, px(334.0), px(26.0)], tint, 0.2);
+                }
+                if game.fighter_carries_flag(id) {
+                    frame.solid(
+                        [left + px(9.0), y + px(11.0), px(5.0).max(1), px(5.0).max(1)],
+                        [1.0, 0.86, 0.32],
+                    );
+                }
+                for (column, text) in [
+                    (22.0, game.fighter_label(id)),
+                    (224.0, fighter.score.to_string()),
+                    (280.0, fighter.deaths.to_string()),
+                ] {
+                    self.text(
+                        frame,
+                        left + px(column),
+                        y + px(4.0),
+                        0.87 * scale,
+                        &text,
+                        light,
+                    );
+                }
+            }
+        }
+        if game.finished {
+            self.centered(
+                frame,
+                y + px(height + 11.0),
+                0.8 * scale,
+                result_help,
+                light,
             );
         }
     }

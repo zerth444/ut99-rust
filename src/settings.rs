@@ -43,6 +43,7 @@ pub struct Settings {
     pub deathmatch_training_complete: bool,
     pub assault_team: usize,
     pub ctf_progress: usize,
+    pub ctf_training_complete: bool,
     pub ctf_team: usize,
     pub gui_skin: usize,
     pub field_of_view: u32,
@@ -76,6 +77,7 @@ impl Default for Settings {
             deathmatch_training_complete: false,
             assault_team: 0,
             ctf_progress: 0,
+            ctf_training_complete: false,
             ctf_team: 0,
             gui_skin: 0,
             field_of_view: 90,
@@ -93,7 +95,9 @@ impl Settings {
     pub fn ladder_progress(&self, mode: Mode) -> usize {
         match mode {
             Mode::Assault => self.assault_progress,
-            Mode::CaptureTheFlag => self.ctf_progress,
+            Mode::CaptureTheFlag => {
+                self.ctf_progress + usize::from(self.ctf_training_complete || self.ctf_progress > 0)
+            }
             Mode::Deathmatch => {
                 self.deathmatch_progress
                     + usize::from(self.deathmatch_training_complete || self.deathmatch_progress > 0)
@@ -108,6 +112,7 @@ impl Settings {
         }
         match mode {
             Mode::Assault => self.assault_progress += 1,
+            Mode::CaptureTheFlag if stage == 0 => self.ctf_training_complete = true,
             Mode::CaptureTheFlag => self.ctf_progress += 1,
             Mode::Deathmatch if stage == 0 => self.deathmatch_training_complete = true,
             Mode::Deathmatch => self.deathmatch_progress += 1,
@@ -177,6 +182,7 @@ impl Settings {
                 }
                 "assault_team" => settings.assault_team = value.min(31) as usize,
                 "ctf_progress" => settings.ctf_progress = value.min(32) as usize,
+                "ctf_training_complete" => settings.ctf_training_complete = value != 0,
                 "ctf_team" => settings.ctf_team = value.min(31) as usize,
                 "gui_skin" => settings.gui_skin = (value as usize).min(GUI_SKINS.len() - 1),
                 "fov" => settings.field_of_view = value.clamp(75, 120),
@@ -242,7 +248,7 @@ impl Settings {
         use std::fmt::Write;
         let _ = writeln!(
             text,
-            "bot_count={}\nfrag_limit={}\nmatch_minutes={}\nassault_progress={}\nassault_team={}\ndeathmatch_progress={}\ndeathmatch_training_complete={}\nctf_progress={}\nctf_team={}",
+            "bot_count={}\nfrag_limit={}\nmatch_minutes={}\nassault_progress={}\nassault_team={}\ndeathmatch_progress={}\ndeathmatch_training_complete={}\nctf_progress={}\nctf_training_complete={}\nctf_team={}",
             self.bot_count,
             self.frag_limit,
             self.match_minutes,
@@ -251,6 +257,7 @@ impl Settings {
             self.deathmatch_progress,
             u8::from(self.deathmatch_training_complete),
             self.ctf_progress,
+            u8::from(self.ctf_training_complete),
             self.ctf_team
         );
         for (index, key) in self.bindings.iter().enumerate() {
@@ -276,6 +283,18 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_ctf_progress_keeps_the_same_ranked_checkpoint() {
+        let mode = Mode::CaptureTheFlag;
+        let mut settings = Settings::parse("ctf_progress=4\nctf_team=2");
+        assert_eq!(settings.ladder_progress(mode), 5);
+        assert!(!settings.record_ladder_win(mode, 0));
+        assert!(!settings.set_ladder_team(mode, 1));
+        assert!(settings.record_ladder_win(mode, 5));
+        assert_eq!(settings.ctf_progress, 5);
+        assert_eq!(settings.ladder_progress(mode), 6);
+    }
 
     #[test]
     fn old_deathmatch_progress_keeps_the_same_ranked_checkpoint() {

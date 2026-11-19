@@ -775,7 +775,9 @@ unsafe fn message_loop(
                     (frame.width, frame.height) = (size.0 as usize, size.1 as usize);
                     game.hud_scale = settings.hud_scale as f32 / 100.0;
                     game.show_decals = settings.show_decals;
-                    let scoreboard = active && briefing_page.is_none() && key(VK_TAB);
+                    let scoreboard = active
+                        && briefing_page.is_none()
+                        && (key(VK_TAB) || game.tutorial_forces_scoreboard());
                     frame.draw_deathmatch(
                         map,
                         &view,

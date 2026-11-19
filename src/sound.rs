@@ -21,7 +21,13 @@ struct SoundEvent {
     wave: Arc<Wave>,
     gain: f32,
     source: Option<SoundSource>,
-    bio_owner: Option<usize>,
+    slot: Option<SoundSlot>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SoundSlot {
+    BioCharge(usize),
+    Tutorial,
 }
 
 #[derive(Clone, Copy)]
@@ -56,7 +62,16 @@ impl SoundEvents {
             wave,
             gain: 1.0,
             source: None,
-            bio_owner: None,
+            slot: None,
+        });
+    }
+
+    pub fn tutorial(&mut self, wave: Arc<Wave>) {
+        self.0.push(SoundEvent {
+            wave,
+            gain: 1.0,
+            source: None,
+            slot: Some(SoundSlot::Tutorial),
         });
     }
 
@@ -76,7 +91,7 @@ impl SoundEvents {
             wave,
             gain,
             source: Some(SoundSource { position, radius }),
-            bio_owner: None,
+            slot: None,
         }));
     }
 
@@ -94,7 +109,7 @@ impl SoundEvents {
                     position,
                     radius: CONTACT_SOUND_RADIUS,
                 }),
-                bio_owner: Some(owner),
+                slot: Some(SoundSlot::BioCharge(owner)),
             });
         }
     }
@@ -433,9 +448,8 @@ impl Mixer {
         if !event.gain.is_finite() || event.gain <= 0.0 {
             return;
         }
-        if let Some(owner) = event.bio_owner {
-            self.voices
-                .retain(|voice| voice.event.bio_owner != Some(owner));
+        if event.slot.is_some() {
+            self.voices.retain(|voice| voice.event.slot != event.slot);
         }
         if self.voices.len() == 24 {
             if let Some(index) = self
@@ -454,8 +468,10 @@ impl Mixer {
     }
 
     fn keep_bio_charges(&mut self, mut active: impl FnMut(usize) -> bool) {
-        self.voices
-            .retain(|voice| voice.event.bio_owner.is_none_or(&mut active));
+        self.voices.retain(|voice| match voice.event.slot {
+            Some(SoundSlot::BioCharge(owner)) => active(owner),
+            _ => true,
+        });
     }
 
     fn mix_effects(
@@ -550,7 +566,7 @@ mod tests {
             wave: wave.clone(),
             gain,
             source: None,
-            bio_owner: None,
+            slot: None,
         });
     }
 
@@ -657,7 +673,8 @@ mod tests {
             mixer
                 .voices
                 .iter()
-                .any(|voice| voice.event.bio_owner == Some(1) && voice.cursor == 8.0)
+                .any(|voice| voice.event.slot == Some(SoundSlot::BioCharge(1))
+                    && voice.cursor == 8.0)
         );
         assert!(
             mixer
@@ -833,7 +850,7 @@ pub mod device {
                 wave,
                 gain,
                 source: None,
-                bio_owner: None,
+                slot: None,
             });
         }
 

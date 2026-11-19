@@ -90,6 +90,8 @@ pub struct Map {
     pub(crate) control_points: Vec<Vec3>,
     pub(crate) assault: Option<crate::assault::AssaultMap>,
     pub(crate) dm_training: Option<crate::game::deathmatch::dm_training::Data>,
+    pub(crate) ctf_training: Option<crate::game::deathmatch::ctf_training::Data>,
+    pub(crate) ctf_icons: [Option<Arc<Texture>>; 3],
     pub navigation_points: Vec<Vec3>,
     pub(crate) lift_exits: Vec<LiftExit>,
     pub collision: Collision,
@@ -171,6 +173,8 @@ impl Map {
             powerups,
             liquid_audio,
             dm_training,
+            ctf_training,
+            ctf_icons,
         } = path
             .map(|path| {
                 crate::props::load(
@@ -356,6 +360,8 @@ impl Map {
             control_points,
             assault,
             dm_training,
+            ctf_training,
+            ctf_icons,
             navigation_points,
             lift_exits,
             collision,

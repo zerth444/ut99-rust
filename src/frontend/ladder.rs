@@ -222,15 +222,7 @@ pub(super) fn load(system: &Path, maps: &[String], mode: Mode) -> io::Result<Cam
         .zip(configs)
         .take(count)
         .enumerate()
-        .filter(|(index, (_, class))| {
-            // TrainingCTF has its own script and is not a rated capture match.
-            !demo_only[*index]
-                && (mode != Mode::CaptureTheFlag
-                    || !class
-                        .rsplit('.')
-                        .next()
-                        .is_some_and(|name| name.eq_ignore_ascii_case("RatedMatchCTFTUT")))
-        })
+        .filter(|(index, _)| !demo_only[*index])
         .map(|(index, (map, class))| {
             if map.is_empty() {
                 return Err(invalid("Missing tournament map"));
@@ -314,7 +306,8 @@ mod tests {
             .collect::<Vec<_>>();
         let mode = Mode::CaptureTheFlag;
         let campaign = load(&root.join("System"), &maps, mode).unwrap();
-        for stage in &campaign.stages {
+        assert_eq!(campaign.stages[0].map, "CTF-Tutorial");
+        for stage in &campaign.stages[1..] {
             let roster = campaign.roster(mode, stage, 0);
             assert!(stage.installed.is_some(), "{}", stage.map);
             assert_eq!((stage.frag_limit, stage.seconds), (3, 0));
@@ -325,6 +318,7 @@ mod tests {
             campaign
                 .stages
                 .iter()
+                .skip(1)
                 .map(|stage| (stage.map.as_str(), stage.bots, stage.allies))
                 .collect::<Vec<_>>(),
             [

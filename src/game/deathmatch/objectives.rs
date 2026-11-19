@@ -287,6 +287,15 @@ impl Objectives {
         }))
     }
 
+    pub(super) fn flag_icon_states(&self) -> Option<[usize; 2]> {
+        let flags = self.flags.as_ref()?;
+        Some(std::array::from_fn(|team| match flags[team].state {
+            FlagState::Home => 0,
+            FlagState::Held(_) => 1,
+            FlagState::Dropped(..) => 2,
+        }))
+    }
+
     pub(super) fn markers<'a>(
         &'a self,
         fighters: &'a [Fighter],

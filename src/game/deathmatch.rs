@@ -5,6 +5,7 @@ mod arsenal;
 mod assault;
 mod assault_effects;
 mod breakables;
+pub(crate) mod ctf_training;
 pub(crate) mod dm_training;
 mod guidance;
 mod navigation;
@@ -814,6 +815,7 @@ pub(crate) struct RatedRoster {
 pub struct Match {
     rated_roster: Option<RatedRoster>,
     dm_training: Option<dm_training::Session>,
+    ctf_training: Option<ctf_training::Session>,
     training_keys: Option<[String; 7]>,
     rules: Rules,
     objectives: objectives::Objectives,
@@ -875,7 +877,12 @@ impl Match {
             .as_ref()
             .filter(|_| rules.mode == Mode::Deathmatch)
             .map(dm_training::Session::new);
-        if dm_training.is_some() {
+        let ctf_training = map
+            .ctf_training
+            .as_ref()
+            .filter(|_| rules.mode == Mode::CaptureTheFlag)
+            .map(ctf_training::Session::new);
+        if dm_training.is_some() || ctf_training.is_some() {
             rules.seconds = 0;
             rules.frag_limit = 3;
         }
@@ -883,6 +890,7 @@ impl Match {
             rules,
             rated_roster,
             dm_training,
+            ctf_training,
             training_keys: None,
             objectives: objectives::Objectives::new(map, rules.mode),
             assault: map
@@ -931,7 +939,7 @@ impl Match {
 
     fn spawn_all(&mut self, map: &Map) {
         self.fighters.clear();
-        let bots = if self.training_assault() || self.dm_training.is_some() {
+        let bots = if self.training_assault() || self.dm_training.is_some() || self.training_ctf() {
             0
         } else {
             self.rules.bots
@@ -1099,6 +1107,9 @@ impl Match {
             })
     }
     fn team_for(&self, fighter: usize) -> Option<usize> {
+        if let Some(training) = &self.ctf_training {
+            return Some(usize::from(fighter > training.allies));
+        }
         if let Some(training) = self
             .assault
             .as_ref()
@@ -1122,6 +1133,27 @@ impl Match {
 
     pub fn training_deathmatch(&self) -> bool {
         self.dm_training.is_some()
+    }
+
+    pub fn training_ctf(&self) -> bool {
+        self.ctf_training.is_some()
+    }
+
+    pub fn tutorial_forces_scoreboard(&self) -> bool {
+        self.ctf_training
+            .as_ref()
+            .and_then(|training| training.current)
+            .is_some_and(|index| (7..13).contains(&index))
+    }
+
+    pub fn ctf_tutorial_subtitle<'a>(&self, map: &'a Map) -> Option<&'a str> {
+        let training = self.ctf_training.as_ref()?;
+        let index = if self.player_won_rated_match() {
+            26
+        } else {
+            training.current?
+        };
+        Some(map.ctf_training.as_ref()?.lines[index].0.as_str())
     }
 
     pub fn set_training_keys(&mut self, keys: [String; 7]) {
@@ -1246,7 +1278,7 @@ impl Match {
             Mode::Assault => self.player_won_assault(),
             Mode::CaptureTheFlag => {
                 self.finished
-                    && self.objectives.player_captured
+                    && (self.training_ctf() || self.objectives.player_captured)
                     && self.objectives.scores[0] > self.objectives.scores[1]
                     && self.objectives.scores[0] >= self.rules.frag_limit
             }
@@ -1256,11 +1288,20 @@ impl Match {
 
     pub fn rated_capture_required(&self) -> bool {
         self.mode() == Mode::CaptureTheFlag
+            && !self.training_ctf()
             && self.rated_roster.is_some()
             && !self.objectives.player_captured
     }
     pub fn flag_status(&self) -> Option<[&'static str; 2]> {
         self.objectives.flag_status()
+    }
+
+    pub fn flag_icon_states(&self) -> Option<[usize; 2]> {
+        self.objectives.flag_icon_states()
+    }
+
+    pub fn fighter_carries_flag(&self, id: usize) -> bool {
+        self.objectives.carries_flag(id)
     }
     pub fn lives_left(&self, fighter: usize) -> Option<u16> {
         (self.rules.mode == Mode::LastManStanding).then(|| {
@@ -1292,6 +1333,9 @@ impl Match {
     }
 
     fn restart(&mut self, map: &mut Map) {
+        if self.ctf_training.is_some() {
+            self.ctf_training = map.ctf_training.as_ref().map(ctf_training::Session::new);
+        }
         self.dm_training = map
             .dm_training
             .as_ref()
@@ -1444,6 +1488,9 @@ impl Match {
         let player = &self.fighters[0];
         crate::hud_art::State {
             hud_scale: scale,
+            team: player
+                .team
+                .filter(|_| self.rules.mode == Mode::CaptureTheFlag),
             time: self.time,
             pickup_time: player.pickup_time,
             score: player.score,
@@ -2194,6 +2241,39 @@ impl Match {
                 sounds.push(wave.clone());
             }
         }
+        if let Some(data) = &map.ctf_training
+            && let Some(training) = &mut self.ctf_training
+            && let Some(event) = training.step(
+                data,
+                self.time,
+                self.objectives.carries_flag(0),
+                self.objectives.scores[0] > 0,
+                &mut sounds,
+            )
+        {
+            match event {
+                ctf_training::Event::ShowBases => {
+                    for mover in &mut map.movers {
+                        mover.trigger(true);
+                    }
+                    let player = &mut self.fighters[0];
+                    player.walker = Walker::spawn(&map.collision, Vec3(138.0, 1327.0, -84.0));
+                    let units = std::f32::consts::TAU / 65_536.0;
+                    player.yaw = 42_295.0 * units;
+                    player.pitch = f32::from(62_611_u16 as i16) * units;
+                    player.portal = None;
+                    player.airborne_since = None;
+                    player.capture_body();
+                    sounds.extend(data.teleport.iter().cloned());
+                }
+                ctf_training::Event::StartMatch => {
+                    self.objectives.scores = [0; 2];
+                    for _ in 0..data.bots {
+                        self.add_fighter(map);
+                    }
+                }
+            }
+        }
         self.decals.update(self.time);
         self.decals.follow_movers(&map.movers);
         self.ballistics
@@ -2299,6 +2379,10 @@ impl Match {
             .dm_training
             .as_ref()
             .is_some_and(|session| !session.duel)
+            || self
+                .ctf_training
+                .as_ref()
+                .is_some_and(|session| !session.practice)
         {
             return sounds;
         }
@@ -2341,6 +2425,12 @@ impl Match {
                         (4, "MATCH LOST")
                     };
                 self.announce(map, index, text, &mut sounds);
+                if self.training_ctf()
+                    && self.player_won_rated_match()
+                    && let Some(data) = &map.ctf_training
+                {
+                    sounds.tutorial(data.lines[26].1.clone());
+                }
                 if leader == 0
                     && self.training_deathmatch()
                     && let Some(lesson) = map
@@ -4155,7 +4245,7 @@ impl Match {
     }
 
     fn apply_hit_from(&mut self, map: &Map, hit: Hit, sounds: &mut SoundEvents, cannon: bool) {
-        if (self.training_assault() || self.training_deathmatch())
+        if (self.training_assault() || self.training_deathmatch() || self.training_ctf())
             && hit.victim == 0
             && hit.damage != u16::MAX
         {
@@ -6158,6 +6248,115 @@ mod tests {
     #[cfg(windows)]
     #[test]
     #[ignore = "requires the local reference-client map installation"]
+    fn ctf_tutorial_waits_for_flag_actions_and_opens_the_ranked_ladder() {
+        use crate::{
+            frontend::{Action, Frontend},
+            settings::Settings,
+        };
+        let path = std::path::Path::new("local/reference-client/Maps/CTF-Tutorial.unr");
+        let frontend = Frontend::load(path, false);
+        let mode = Mode::CaptureTheFlag;
+        let mut map = frontend.load_ladder(mode, 0).unwrap();
+        let mut settings = Settings::default();
+        let mut game = frontend.start_match(&map, 0, Action::StartLadder(mode, 0), &settings);
+        let tick =
+            |game: &mut Match, map: &mut Map| game.step(map, Command::default(), 1.0 / 120.0);
+        let advance = |game: &mut Match, map: &mut Map, lesson| {
+            game.time = game.ctf_training.as_ref().unwrap().next_at;
+            let sounds = tick(game, map);
+            let (text, voice) = &map.ctf_training.as_ref().unwrap().lines[lesson];
+            assert_eq!(game.ctf_training.as_ref().unwrap().current, Some(lesson));
+            assert!(
+                sounds
+                    .waves()
+                    .any(|sound| std::sync::Arc::ptr_eq(sound, voice))
+            );
+            assert_eq!(game.ctf_tutorial_subtitle(map), Some(text.as_str()));
+            assert!(!text.is_empty());
+            assert_eq!(game.tutorial_forces_scoreboard(), (7..13).contains(&lesson));
+        };
+        assert!(game.training_ctf());
+        assert_eq!(game.limits(), (3, 0));
+        assert_eq!(game.fighters.len(), 1);
+        assert_eq!(game.fighters[0].team, Some(0));
+        assert!(map.ctf_icons.iter().all(Option::is_some));
+        assert!(map.ctf_training.as_ref().unwrap().teleport.is_some());
+        let [home, away] = map.flag_bases.map(Option::unwrap);
+        for lesson in 0..=17 {
+            advance(&mut game, &mut map, lesson);
+            if lesson == 15 {
+                let position = game.fighters[0].walker.position;
+                assert_eq!((position.0, position.1), (138.0, 1327.0));
+                assert!((position.2 + 84.0).abs() < 26.0);
+            }
+        }
+        game.time += 30.0;
+        tick(&mut game, &mut map);
+        assert_eq!(game.ctf_training.as_ref().unwrap().current, Some(17));
+        game.fighters[0].walker.position = away;
+        advance(&mut game, &mut map, 18);
+        assert_eq!(game.flag_icon_states(), Some([0, 1]));
+        for lesson in 19..=20 {
+            advance(&mut game, &mut map, lesson);
+        }
+        game.time += 30.0;
+        tick(&mut game, &mut map);
+        assert_eq!(game.ctf_training.as_ref().unwrap().current, Some(20));
+        game.fighters[0].walker.position = home;
+        advance(&mut game, &mut map, 21);
+        assert_eq!(game.flag_icon_states(), Some([0, 0]));
+        assert_eq!(game.team_scores(), Some([1, 0]));
+        for lesson in 22..=25 {
+            advance(&mut game, &mut map, lesson);
+        }
+        game.time = game.ctf_training.as_ref().unwrap().next_at;
+        tick(&mut game, &mut map);
+        assert!(game.ctf_training.as_ref().unwrap().practice);
+        assert_eq!(game.team_scores(), Some([0, 0]));
+        assert_eq!(
+            game.fighters
+                .iter()
+                .map(|fighter| fighter.team)
+                .collect::<Vec<_>>(),
+            [Some(0), Some(0), Some(1), Some(1)]
+        );
+        assert!(game.ctf_tutorial_subtitle(&map).is_none());
+        assert!(!game.rated_capture_required());
+
+        for (id, fighter) in game.fighters.iter_mut().enumerate() {
+            fighter.health = if id == 1 { 100 } else { 0 };
+        }
+        game.objectives.player_captured = false;
+        for _ in 0..3 {
+            for position in [away, home] {
+                game.fighters[1].walker.position = position;
+                game.objectives.tick(&map, &mut game.fighters, game.time);
+                game.time += 0.25;
+            }
+        }
+        let sounds = tick(&mut game, &mut map);
+        assert_eq!(game.team_scores(), Some([3, 0]));
+        assert!(game.player_won_rated_match());
+        let victory = &map.ctf_training.as_ref().unwrap().lines[26].1;
+        assert!(
+            sounds
+                .waves()
+                .any(|sound| std::sync::Arc::ptr_eq(sound, victory))
+        );
+        assert_eq!(frontend.next_ladder_stage(mode, 0, &game), Some(1));
+        assert!(settings.record_ladder_win(mode, 0));
+        assert_eq!(settings.ladder_progress(mode), 1);
+        assert_eq!(settings.ctf_progress, 0);
+
+        game.restart(&mut map);
+        assert_eq!(game.fighters.len(), 1);
+        assert_eq!(game.team_scores(), Some([0, 0]));
+        assert!(!game.tutorial_forces_scoreboard());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires the local reference-client map installation"]
     fn rated_ctf_ladder_requires_a_personal_capture_on_all_stock_maps() {
         use crate::{
             frontend::{Action, Frontend},
@@ -6168,13 +6367,14 @@ mod tests {
         let mode = Mode::CaptureTheFlag;
         let mut settings = Settings {
             ctf_team: 1,
+            ctf_training_complete: true,
             frag_limit: 1,
             bot_count: 0,
             match_minutes: 1,
             ..Settings::default()
         };
         let mut time = 1.0;
-        for stage in 0..frontend.ladder_len(mode) {
+        for stage in 1..frontend.ladder_len(mode) {
             let mut map = frontend.load_ladder(mode, stage).unwrap();
             let mut game =
                 frontend.start_match(&map, 0, Action::StartLadder(mode, stage), &settings);

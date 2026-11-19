@@ -180,6 +180,7 @@ impl Frontend {
                     .as_ref()
                     .is_none_or(|data| data.tutorial.is_none()))
             || (mode == Mode::Deathmatch && stage == 0 && map.dm_training.is_none())
+            || (mode == Mode::CaptureTheFlag && stage == 0 && map.ctf_training.is_none())
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
