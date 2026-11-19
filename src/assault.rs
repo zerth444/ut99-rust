@@ -17,6 +17,26 @@ pub(crate) struct AssaultMap {
     pub turrets: Vec<Turret>,
     pub turret_smoke: Option<TurretSmoke>,
     pub effects: Effects,
+    pub tutorial: Option<Tutorial>,
+    pub briefing: Vec<ObjectivePage>,
+}
+
+pub(crate) struct ObjectivePage {
+    pub description: String,
+    pub image: Option<Arc<crate::texture::Texture>>,
+}
+
+pub(crate) struct Tutorial {
+    pub lessons: Vec<Lesson>,
+    pub completion: Option<Arc<crate::sound::Wave>>,
+    pub protected_fort: Option<usize>,
+    pub bots: usize,
+    pub allies: usize,
+}
+
+pub(crate) struct Lesson {
+    pub subtitle: String,
+    pub audio: Arc<crate::sound::Wave>,
 }
 
 pub(crate) struct TurretSmoke {
@@ -179,6 +199,8 @@ impl AssaultMap {
             turrets: Vec::new(),
             turret_smoke: None,
             effects: Effects::load(package, actors)?,
+            tutorial: None,
+            briefing: Vec::new(),
         };
         let mut paths = std::collections::HashMap::new();
         let mut destinations = Vec::new();

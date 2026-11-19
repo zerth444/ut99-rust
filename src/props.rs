@@ -429,46 +429,51 @@ pub fn load(
     let Some(folder) = path.parent() else {
         return Ok(Scene::default());
     };
-    let mut packages: Vec<_> =
-        [
-            ("../System", "u"),
-            ("../Textures", "utx"),
-            ("../Sounds", "uax"),
-        ]
-        .into_iter()
-        .flat_map(|(directory, extension)| {
-            fs::read_dir(folder.join(directory))
-                .into_iter()
-                .flatten()
-                .filter_map(Result::ok)
-                .map(move |entry| (entry.path(), extension))
-        })
-        .filter_map(|(path, extension)| {
-            path.extension()?
-                .to_str()?
-                .eq_ignore_ascii_case(extension)
-                .then_some(())?;
-            let name = path.file_stem()?.to_str()?.to_ascii_lowercase();
-            // Map imports and stock gameplay assets used independently of the level.
-            if !matches!(
-                name.as_str(),
-                "engine"
-                    | "core"
-                    | "botpack"
-                    | "dmatch"
-                    | "announcer"
-                    | "unrealshare"
-                    | "unreali"
-                    | "soldierskins"
-                    | "ladrstatic"
-            ) && !map.imports.iter().any(|import| {
+    let training = assault.is_some()
+        && path
+            .file_stem()
+            .is_some_and(|stem| stem.eq_ignore_ascii_case("AS-Tutorial"));
+    let mut packages: Vec<_> = [
+        ("../System", "u"),
+        ("../Textures", "utx"),
+        ("../Sounds", "uax"),
+    ]
+    .into_iter()
+    .flat_map(|(directory, extension)| {
+        fs::read_dir(folder.join(directory))
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(move |entry| (entry.path(), extension))
+    })
+    .filter_map(|(path, extension)| {
+        path.extension()?
+            .to_str()?
+            .eq_ignore_ascii_case(extension)
+            .then_some(())?;
+        let name = path.file_stem()?.to_str()?.to_ascii_lowercase();
+        // Map imports and stock gameplay assets used independently of the level.
+        if !matches!(
+            name.as_str(),
+            "engine"
+                | "core"
+                | "botpack"
+                | "dmatch"
+                | "announcer"
+                | "unrealshare"
+                | "unreali"
+                | "soldierskins"
+                | "ladrstatic"
+        ) && !(training && name == "tutvoiceas")
+            && !map.imports.iter().any(|import| {
                 import.outer == 0 && map.names[import.name].eq_ignore_ascii_case(&name)
-            }) {
-                return None;
-            }
-            Some((name, fs::read(path).ok()?))
-        })
-        .collect();
+            })
+        {
+            return None;
+        }
+        Some((name, fs::read(path).ok()?))
+    })
+    .collect();
     packages.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut assets = Assets {
         packages: vec![Package::read(map.data)?],
@@ -486,6 +491,10 @@ pub fn load(
     let mut textures = HashMap::<Object, Option<Arc<Texture>>>::new();
     let mut waves = HashMap::new();
     if let Some(assault) = assault.as_deref_mut() {
+        assault.briefing = assault_briefing(&mut assets, map, actors, path, folder, &mut textures)?;
+        if training {
+            assault.tutorial = assault_tutorial(&assets, map, folder, &mut waves);
+        }
         let effects = &mut assault.effects;
         if !effects.walls.is_empty() {
             breakable_art(
@@ -1632,6 +1641,161 @@ fn read_shock(
         })();
     }
     art
+}
+
+fn localized_section(folder: &Path, file: &str, section: &str) -> HashMap<String, String> {
+    for directory in ["../System", "../SystemLocalized/int"] {
+        let Ok(bytes) = fs::read(folder.join(directory).join(file)) else {
+            continue;
+        };
+        let source = String::from_utf8(bytes)
+            .unwrap_or_else(|error| error.as_bytes().iter().copied().map(char::from).collect());
+        let mut active = false;
+        let mut entries = HashMap::new();
+        for line in source.trim_start_matches('\u{feff}').lines().map(str::trim) {
+            if let Some(label) = line
+                .strip_prefix('[')
+                .and_then(|label| label.strip_suffix(']'))
+            {
+                active = label.eq_ignore_ascii_case(section);
+            } else if active
+                && !line.starts_with(';')
+                && let Some((key, value)) = line.split_once('=')
+            {
+                entries.insert(
+                    key.trim().to_ascii_lowercase(),
+                    value.trim().trim_matches('"').replace("\\n", "\n"),
+                );
+            }
+        }
+        if !entries.is_empty() {
+            return entries;
+        }
+    }
+    HashMap::new()
+}
+
+fn assault_briefing(
+    assets: &mut Assets<'_>,
+    map: &Package<'_>,
+    actors: &[&Export],
+    path: &Path,
+    folder: &Path,
+    textures: &mut HashMap<Object, Option<Arc<Texture>>>,
+) -> io::Result<Vec<crate::assault::ObjectivePage>> {
+    let Some(actor) = actors
+        .iter()
+        .find(|actor| map.object_name(actor.class) == Some("AssaultInfo"))
+    else {
+        return Ok(Vec::new());
+    };
+    let mut properties = map.properties(actor)?;
+    let mut desc: [String; 8] = Default::default();
+    let mut images = [0; 8];
+    let mut count = 0;
+    while let Some(property) = properties.next_tag()? {
+        let mut value = property.value;
+        match property.name {
+            "ObjDesc" if property.array_index < desc.len() => {
+                desc[property.array_index] = value.string(map.version)?;
+            }
+            "ObjShots" if property.array_index < images.len() => {
+                images[property.array_index] = value.compact()?;
+            }
+            "NumObjShots" => count = (value.u32()? as usize).min(images.len()),
+            _ => {}
+        }
+    }
+    let file = path.with_extension("int");
+    let localized = file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map_or_else(HashMap::new, |file| {
+            localized_section(folder, file, &map.names[actor.name])
+        });
+    Ok(desc
+        .into_iter()
+        .zip(images)
+        .enumerate()
+        .take(if count == 0 { 8 } else { count })
+        .filter_map(|(index, (text, image))| {
+            let description = localized
+                .get(&format!("objdesc[{index}]"))
+                .cloned()
+                .unwrap_or(text);
+            let image = assets
+                .resolve(0, image)
+                .and_then(|object| cached_texture(assets, textures, object));
+            (!description.trim().is_empty() || image.is_some())
+                .then_some(crate::assault::ObjectivePage { description, image })
+        })
+        .collect())
+}
+
+fn assault_tutorial(
+    assets: &Assets<'_>,
+    map: &Package<'_>,
+    folder: &Path,
+    waves: &mut HashMap<Object, Option<Arc<Wave>>>,
+) -> Option<crate::assault::Tutorial> {
+    let class = find_export(assets, "botpack", "TrainingAS", "Class")?;
+    let (package, export) = assets.object(class);
+    let mut properties = class_properties(package, export).ok()?;
+    let mut voices: [Option<String>; 13] = Default::default();
+    let mut messages: [String; 12] = Default::default();
+    while let Some(property) = properties.next_tag().ok()? {
+        let mut value = property.value;
+        match property.name {
+            "AS" if property.array_index < voices.len() => {
+                voices[property.array_index] = value.string(package.version).ok();
+            }
+            "TutMessage" if property.array_index < messages.len() => {
+                messages[property.array_index] = value.string(package.version).unwrap_or_default();
+            }
+            _ => {}
+        }
+    }
+    let mut localized = localized_section(folder, "Botpack.int", "TrainingAS");
+    for (index, subtitle) in messages.iter_mut().enumerate() {
+        if let Some(text) = localized.remove(&format!("tutmessage[{index}]")) {
+            *subtitle = text;
+        }
+    }
+    let mut get_voice = |qualified: &str| {
+        let (sound_package, _) = qualified.split_once('.')?;
+        let leaf = qualified.rsplit('.').next()?;
+        let object = find_export(assets, &sound_package.to_ascii_lowercase(), leaf, "Sound");
+        cached_wave(assets, waves, object)
+    };
+    let mut lessons = Vec::with_capacity(messages.len());
+    for (voice, subtitle) in voices.iter().zip(messages) {
+        lessons.push(crate::assault::Lesson {
+            subtitle,
+            audio: get_voice(voice.as_deref()?)?,
+        });
+    }
+    let completion = voices.last().and_then(Option::as_deref).and_then(get_voice);
+    let config = find_export(assets, "botpack", "RatedMatchASTUT", "Class")?;
+    let (package, export) = assets.object(config);
+    let mut properties = class_properties(package, export).ok()?;
+    let (mut bots, mut allies) = (0, 0);
+    while let Some((name, mut value)) = properties.next().ok()? {
+        match name {
+            "NumBots" => bots = (value.u32().ok()? as i32).clamp(0, 8) as usize,
+            "NumAllies" => allies = (value.u32().ok()? as i32).clamp(0, 8) as usize,
+            _ => {}
+        }
+    }
+    Some(crate::assault::Tutorial {
+        lessons,
+        completion,
+        bots,
+        allies: allies.min(bots),
+        protected_fort: map
+            .names
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case("lickbird")),
+    })
 }
 
 fn turret_smoke_art(

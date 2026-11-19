@@ -1643,6 +1643,37 @@ mod tests {
             let mut map = Map::load(&package, Some(path))
                 .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
             let data = map.assault.as_ref().unwrap();
+            assert!(
+                !data.briefing.is_empty(),
+                "{} has no objective briefing",
+                path.display()
+            );
+            assert!(
+                data.briefing
+                    .iter()
+                    .all(|page| !page.description.trim().is_empty()),
+                "{} has empty objective text",
+                path.display()
+            );
+            assert!(
+                data.briefing.iter().any(|page| page.image.is_some()),
+                "{} has no briefing images",
+                path.display()
+            );
+            let page = data
+                .briefing
+                .iter()
+                .position(|page| page.image.is_some())
+                .unwrap();
+            let mut briefing_frame = crate::render::Frame::new();
+            crate::hud::Hud::new().draw_assault_briefing(&mut briefing_frame, &map, page);
+            let colors: std::collections::HashSet<_> =
+                briefing_frame.pixels.iter().copied().collect();
+            assert!(
+                colors.len() > 32,
+                "{} briefing image was not drawn",
+                path.display()
+            );
             for turret in &data.turrets {
                 assert!(
                     !turret.activate.frames.is_empty() && turret.activate.duration() < 3.0,
@@ -1710,6 +1741,10 @@ mod tests {
             );
             game.time = f32::from(map.assault.as_ref().unwrap().seconds);
             game.step(&mut map, Command::default(), 1.0 / 120.0);
+            if game.training_assault() {
+                assert!(game.finished);
+                continue;
+            }
             assert_eq!(game.assault_status(&map).map(|state| state.half), Some(2));
             let second = game.fighters[0].walker.position;
             assert!(

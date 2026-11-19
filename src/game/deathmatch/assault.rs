@@ -27,12 +27,22 @@ pub(super) struct Round {
     pub limit: f32,
     pub first_attack: Option<Option<f32>>,
     pub completed_at: Option<f32>,
+    pub tutorial: Option<Briefing>,
     pub notice: Option<(usize, f32)>,
     forts: Vec<FortState>,
     triggers: Vec<TriggerStatus>,
     counts: Vec<usize>,
     dispatch_until: Vec<f32>,
     pending: Vec<(f32, usize, bool)>,
+}
+
+pub(super) struct Briefing {
+    pub allies: usize,
+    pub subtitle: Option<usize>,
+    pub ready: bool,
+    next_at: f32,
+    next: usize,
+    protected_fort: Option<usize>,
 }
 
 impl Round {
@@ -45,6 +55,14 @@ impl Round {
             limit: first_attack.flatten().unwrap_or(f32::from(map.seconds)),
             first_attack,
             completed_at: None,
+            tutorial: map.tutorial.as_ref().map(|data| Briefing {
+                allies: data.allies,
+                subtitle: None,
+                ready: false,
+                next_at: 3.0,
+                next: 0,
+                protected_fort: data.protected_fort,
+            }),
             notice: None,
             forts: map
                 .forts
@@ -82,8 +100,41 @@ impl Round {
         self.pending.push((time, event, attacker));
     }
 
+    pub fn briefing_step(
+        &mut self,
+        data: &crate::assault::Tutorial,
+        time: f32,
+        sounds: &mut SoundEvents,
+    ) -> bool {
+        let Some(state) = &mut self.tutorial else {
+            return false;
+        };
+        if state.ready || time < state.next_at {
+            return false;
+        }
+        if let Some(lesson) = data.lessons.get(state.next) {
+            sounds.push(lesson.audio.clone());
+            state.subtitle = Some(state.next);
+            state.next += 1;
+            state.next_at += lesson.audio.duration().floor() + 2.0;
+            return false;
+        }
+        state.ready = true;
+        state.subtitle = None;
+        true
+    }
+
+    fn protected(&self, tag: Option<usize>) -> bool {
+        self.tutorial
+            .as_ref()
+            .is_some_and(|state| !state.ready && tag.is_some() && tag == state.protected_fort)
+    }
+
     fn finish_fort(&mut self, map: &AssaultMap, index: usize, time: f32) {
         let fort = &map.forts[index];
+        if self.protected(fort.tag) {
+            return;
+        }
         let state = &mut self.forts[index];
         if state.complete {
             return;
@@ -280,7 +331,7 @@ impl Round {
                 .zip(&self.forts)
                 .enumerate()
                 .filter_map(|(index, (fort, state))| {
-                    if !attacker || fort.touch || state.complete {
+                    if !attacker || fort.touch || state.complete || self.protected(fort.tag) {
                         return None;
                     }
                     Some((fort.volume.trace(start, delta)?, Target::Fort(index)))
@@ -382,6 +433,9 @@ impl Round {
             }
             Target::Fort(index) => {
                 let fort = &data.forts[index];
+                if self.protected(fort.tag) {
+                    return;
+                }
                 let state = &mut self.forts[index];
                 if !attacker || state.complete || fort.touch {
                     return;

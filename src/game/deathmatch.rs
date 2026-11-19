@@ -841,6 +841,7 @@ pub struct AssaultStatus<'a> {
     pub total: usize,
     pub objective: Option<&'a str>,
     pub notice: Option<(&'a str, &'a str)>,
+    pub tutorial: bool,
 }
 
 impl Match {
@@ -894,19 +895,29 @@ impl Match {
 
     fn spawn_all(&mut self, map: &Map) {
         self.fighters.clear();
-        for id in 0..=self.rules.bots {
-            let spawn = if id == 0
-                && !self.rules.mode.team_based()
-                && usable_start(map, self.preferred_start).is_some()
-            {
-                self.preferred_start
-            } else {
-                self.choose_spawn(map, id, None)
-            };
-            let mut fighter = self.spawn_at(map, spawn);
-            fighter.team = self.team_for(id);
-            self.fighters.push(fighter);
+        let bots = if self.training_assault() {
+            0
+        } else {
+            self.rules.bots
+        };
+        for _ in 0..=bots {
+            self.add_fighter(map);
         }
+    }
+
+    fn add_fighter(&mut self, map: &Map) {
+        let id = self.fighters.len();
+        let spawn = if id == 0
+            && !self.rules.mode.team_based()
+            && usable_start(map, self.preferred_start).is_some()
+        {
+            self.preferred_start
+        } else {
+            self.choose_spawn(map, id, None)
+        };
+        let mut fighter = self.spawn_at(map, spawn);
+        fighter.team = self.team_for(id);
+        self.fighters.push(fighter);
     }
 
     fn spawn_at(&mut self, map: &Map, start: usize) -> Fighter {
@@ -1030,7 +1041,34 @@ impl Match {
             })
     }
     fn team_for(&self, fighter: usize) -> Option<usize> {
+        if let Some(training) = self
+            .assault
+            .as_ref()
+            .and_then(|round| round.tutorial.as_ref())
+        {
+            return Some(usize::from(fighter > training.allies));
+        }
         self.rules.mode.team_based().then_some(fighter % 2)
+    }
+
+    pub fn training_assault(&self) -> bool {
+        self.assault
+            .as_ref()
+            .is_some_and(|round| round.tutorial.is_some())
+    }
+
+    pub fn tutorial_subtitle<'a>(&self, map: &'a Map) -> Option<&'a str> {
+        let index = self.assault.as_ref()?.tutorial.as_ref()?.subtitle?;
+        Some(
+            map.assault
+                .as_ref()?
+                .tutorial
+                .as_ref()?
+                .lessons
+                .get(index)?
+                .subtitle
+                .as_str(),
+        )
     }
     pub fn team_scores(&self) -> Option<[i16; 2]> {
         self.rules
@@ -1204,6 +1242,7 @@ impl Match {
             total: data.forts.len(),
             objective,
             notice,
+            tutorial: round.tutorial.is_some(),
         })
     }
 
@@ -1578,6 +1617,14 @@ impl Match {
             return sounds;
         }
         self.time += dt;
+        if let Some(round) = &mut self.assault
+            && let Some(training) = map.assault.as_ref().and_then(|data| data.tutorial.as_ref())
+            && round.briefing_step(training, self.time, &mut sounds)
+        {
+            for _ in 0..training.bots {
+                self.add_fighter(map);
+            }
+        }
         for fighter in &mut self.fighters {
             fighter.capture_body();
         }
@@ -1927,7 +1974,23 @@ impl Match {
                 .or_else(|| (self.time >= round.limit).then_some(round.limit))
                 && self.time >= result_at
             {
-                if let Some(first) = round.first_attack {
+                if round.tutorial.is_some() {
+                    self.finished = true;
+                    if conquered.is_some() {
+                        self.objectives.scores[0] = 1;
+                        if let Some(audio) = map
+                            .assault
+                            .as_ref()
+                            .and_then(|data| data.tutorial.as_ref())
+                            .and_then(|training| training.completion.clone())
+                        {
+                            sounds.push(audio);
+                        }
+                    } else {
+                        self.objectives.scores[1] = 1;
+                        self.announce(map, 4, "MATCH LOST", &mut sounds);
+                    }
+                } else if let Some(first) = round.first_attack {
                     let winner = if conquered.is_some() {
                         Some(round.attack_team)
                     } else {
@@ -3789,6 +3852,10 @@ impl Match {
     }
 
     fn apply_hit_from(&mut self, map: &Map, hit: Hit, sounds: &mut SoundEvents, cannon: bool) {
+        if self.training_assault() && hit.victim == 0 && hit.damage != u16::MAX {
+            self.fighters[0].walker.add_velocity(hit.impulse);
+            return;
+        }
         if hit.owner.is_some_and(|owner| {
             owner != hit.victim && allied(self.fighters[owner].team, self.fighters[hit.victim].team)
         }) {
@@ -5034,6 +5101,8 @@ mod tests {
             turrets: Vec::new(),
             turret_smoke: None,
             effects: crate::assault::Effects::default(),
+            tutorial: None,
+            briefing: Vec::new(),
         });
         let mut game = Match::new(
             &map,
@@ -5206,6 +5275,108 @@ mod tests {
             assert!(if minigun { observed[1] } else { observed[0] });
             assert!(sound.len() > 0);
         }
+    }
+
+    #[test]
+    #[ignore = "requires the local reference-client map installation"]
+    fn assault_tutorial_plays_its_briefing_then_unlocks_the_exercise() {
+        use crate::assault::Target;
+        let path = std::path::Path::new("local/reference-client/Maps/AS-Tutorial.unr");
+        let bytes = std::fs::read(path).unwrap();
+        let package = Package::read(&bytes).unwrap();
+        let mut map = Map::load(&package, Some(path)).unwrap();
+        let data = map.assault.as_ref().unwrap();
+        let tutorial = data.tutorial.as_ref().expect("TrainingAS and TutVoiceAS");
+        assert_eq!(tutorial.lessons.len(), 12);
+        let completion = tutorial
+            .completion
+            .clone()
+            .expect("exercise completion voice");
+        let lessons: Vec<_> = tutorial
+            .lessons
+            .iter()
+            .map(|lesson| (lesson.subtitle.clone(), lesson.audio.clone()))
+            .collect();
+        let protected = data
+            .forts
+            .iter()
+            .position(|fort| fort.tag.is_some() && fort.tag == tutorial.protected_fort)
+            .unwrap();
+        let final_fort = data.forts.iter().position(|fort| fort.final_fort).unwrap();
+        let bots = tutorial.bots;
+        let allies = tutorial.allies;
+        let mut game = Match::new(
+            &map,
+            0,
+            Rules {
+                mode: Mode::Assault,
+                bots: 8,
+                ..Rules::default()
+            },
+        );
+        assert!(game.training_assault());
+        assert_eq!(game.fighters.len(), 1);
+        let dt = 1.0 / 120.0;
+        game.step(&mut map, Command::default(), dt);
+        assert!(game.tutorial_subtitle(&map).is_none());
+        let mut next = 3.0;
+        for (subtitle, voice) in lessons {
+            game.time = next;
+            let events = game.step(&mut map, Command::default(), dt);
+            assert!(!subtitle.is_empty());
+            assert_eq!(game.tutorial_subtitle(&map), Some(subtitle.as_str()));
+            assert!(
+                events
+                    .waves()
+                    .any(|wave| std::sync::Arc::ptr_eq(wave, &voice))
+            );
+            assert_eq!(game.fighters.len(), 1);
+            next += voice.duration().floor() + 2.0;
+        }
+        game.damage_objective(&map, 0, Target::Fort(protected), 1000, "shot");
+        assert!(game.assault.as_ref().unwrap().active(protected));
+        game.time = next;
+        game.step(&mut map, Command::default(), dt);
+        assert!(game.tutorial_subtitle(&map).is_none());
+        assert_eq!(game.fighters.len(), 1 + bots);
+        for id in 1..game.fighters.len() {
+            assert_eq!(game.fighters[id].team, Some(usize::from(id > allies)));
+        }
+        let mut sounds = SoundEvents::default();
+        let health = game.fighters[0].health;
+        game.apply_hit(
+            &map,
+            Hit {
+                victim: 0,
+                owner: None,
+                damage: 100,
+                impulse: Vec3::default(),
+                bypass_armor: false,
+            },
+            &mut sounds,
+        );
+        assert_eq!(game.fighters[0].health, health);
+        game.damage_objective(&map, 0, Target::Fort(protected), 1000, "shot");
+        assert!(!game.assault.as_ref().unwrap().active(protected));
+        game.damage_objective(&map, 0, Target::Fort(final_fort), 1000, "shot");
+        game.time += 2.0;
+        let events = game.step(&mut map, Command::default(), dt);
+        assert!(game.finished && game.winner() == Some(0));
+        assert!(
+            events
+                .waves()
+                .any(|wave| std::sync::Arc::ptr_eq(wave, &completion))
+        );
+        game.step(
+            &mut map,
+            Command {
+                restart: true,
+                ..Command::default()
+            },
+            dt,
+        );
+        assert_eq!(game.fighters.len(), 1);
+        assert!(!game.finished && game.tutorial_subtitle(&map).is_none());
     }
 
     #[test]

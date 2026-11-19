@@ -320,6 +320,10 @@ impl Wave {
         self.samples.len() / self.channels
     }
 
+    pub(crate) fn duration(&self) -> f32 {
+        self.frames() as f32 / self.rate as f32
+    }
+
     fn sample(&self, cursor: f64, frames: usize, looping: bool) -> [f32; 2] {
         let current = cursor as usize;
         let next = if current + 1 < frames {

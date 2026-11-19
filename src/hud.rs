@@ -57,13 +57,17 @@ impl Hud {
         if let Some(status) = game.assault_status(map) {
             let seconds = game.remaining();
             let role = if status.attacking { "Attack" } else { "Defend" };
+            let round = if status.tutorial {
+                "Training".to_owned()
+            } else {
+                format!("Round {}/2", status.half)
+            };
             self.centered(
                 frame,
                 (22.0 * scale) as i32,
                 scale,
                 &format!(
-                    "Round {}/2    {}/{} objectives    {:02}:{:02}",
-                    status.half,
+                    "{round}    {}/{} objectives    {:02}:{:02}",
                     status.completed,
                     status.total,
                     seconds / 60,
@@ -106,6 +110,9 @@ impl Hud {
                 &format!("Lives {lives}"),
                 white,
             );
+        }
+        if let Some(subtitle) = game.tutorial_subtitle(map) {
+            self.draw_tutorial_subtitle(frame, subtitle, scale);
         }
         if let Some([red, blue]) = game.flag_status() {
             self.centered(
@@ -270,7 +277,13 @@ impl Hud {
         let accent = [0.61, 0.84, 0.90];
         frame.shade([left, top, width, height], [0.045, 0.062, 0.078], 0.74);
         frame.solid([left, top, width, px(2.0).max(1)], [0.36, 0.58, 0.65]);
-        let title = if game.finished {
+        let title = if game.finished && game.training_assault() {
+            if game.winner() == Some(0) {
+                "Training complete".into()
+            } else {
+                "Training failed".into()
+            }
+        } else if game.finished {
             match game
                 .winner()
                 .map(|winner| (winner, game.fighters[winner].team))
@@ -281,6 +294,8 @@ impl Hud {
                 Some((winner, None)) => format!("{} wins", Match::label(winner)),
                 None => "Match drawn".to_owned(),
             }
+        } else if game.training_assault() {
+            "Assault training".into()
         } else {
             game.mode().label().to_owned()
         };
@@ -295,9 +310,13 @@ impl Hud {
         let (frag_limit, time_limit) = game.limits();
         let details = if let Some(status) = game.assault_status(map) {
             let seconds = game.remaining();
+            let round = if status.tutorial {
+                "Training".to_owned()
+            } else {
+                format!("Round {}/2", status.half)
+            };
             format!(
-                "Round {}/2    {}/{} objectives    {:02}:{:02}",
-                status.half,
+                "{round}    {}/{} objectives    {:02}:{:02}",
                 status.completed,
                 status.total,
                 seconds / 60,
@@ -544,6 +563,136 @@ impl Hud {
             text,
             color,
         );
+    }
+
+    fn draw_tutorial_subtitle(&self, frame: &mut Frame, text: &str, scale: f32) {
+        let width = (frame.width as f32 * 0.70).round() as i32;
+        let lines = self.wrap_lines(text, width - 30, scale);
+        if lines.is_empty() {
+            return;
+        }
+        let stride = (19.0 * scale).round() as i32;
+        let padding = (8.0 * scale).max(3.0) as i32;
+        let height = stride * lines.len() as i32 + 2 * padding;
+        let y = (frame.height as i32 * 3 / 4 - height).max(0);
+        frame.shade(
+            [(frame.width as i32 - width) / 2, y, width, height],
+            [0.04, 0.06, 0.09],
+            0.82,
+        );
+        for (index, line) in lines.iter().enumerate() {
+            self.centered(
+                frame,
+                y + padding + stride * index as i32,
+                scale,
+                line,
+                [0.96, 0.96, 0.92],
+            );
+        }
+    }
+
+    pub(crate) fn draw_assault_briefing(&self, frame: &mut Frame, map: &Map, index: usize) {
+        let Some(data) = &map.assault else {
+            return;
+        };
+        let Some(page) = data.briefing.get(index) else {
+            return;
+        };
+        frame.begin_ui(false);
+        let scale = (frame.height as f32 / 650.0).clamp(0.45, 1.7);
+        let px = |size: f32| (size * scale).round() as i32;
+        let width = px(670.0).min((frame.width as f32 * 0.88).round() as i32);
+        let image = page.image.as_ref().map(|texture| {
+            let (w, h) = texture.size();
+            let ratio = ((width - px(54.0)) as f32 / w).min(px(275.0) as f32 / h);
+            (
+                texture.image(0.0),
+                (w * ratio).round() as i32,
+                (h * ratio).round() as i32,
+            )
+        });
+        let lines = self.wrap_lines(&page.description, width - px(54.0), scale);
+        let image_height = image.map_or(0, |(_, _, height)| height + px(14.0));
+        let line_height = px(22.0);
+        let height = px(102.0) + image_height + lines.len() as i32 * line_height;
+        let left = (frame.width as i32 - width) / 2;
+        let top = ((frame.height as i32 - height) / 2).max(0);
+        frame.shade([left, top, width, height], [0.046, 0.070, 0.092], 0.94);
+        frame.solid([left, top, width, px(2.0).max(1)], [0.31, 0.55, 0.62]);
+        self.centered(
+            frame,
+            top + px(14.0),
+            scale * 1.2,
+            &map.title,
+            [0.92, 0.97, 1.0],
+        );
+        if let Some((image, w, h)) = image {
+            let (tw, th) = image.size();
+            frame.tile(
+                image,
+                [(frame.width as i32 - w) / 2, top + px(51.0), w, h],
+                [0.0, 0.0, tw, th],
+                [1.0; 3],
+            );
+        }
+        for (row, line) in lines.iter().enumerate() {
+            self.centered(
+                frame,
+                top + px(51.0) + image_height + row as i32 * line_height,
+                scale,
+                line,
+                [0.94, 0.95, 0.98],
+            );
+        }
+        let hint = if data.briefing.len() > 1 {
+            format!(
+                "{} / {}     Left / Right     F3 Close",
+                index + 1,
+                data.briefing.len()
+            )
+        } else {
+            "F3 Close".into()
+        };
+        self.centered(
+            frame,
+            top + height - px(29.0),
+            scale * 0.83,
+            &hint,
+            [0.65, 0.80, 0.89],
+        );
+    }
+
+    fn wrap_lines(&self, text: &str, width: i32, scale: f32) -> Vec<String> {
+        let Some(glyphs) = &self.glyphs else {
+            return Vec::new();
+        };
+        let steps = |word: &str| {
+            word.chars()
+                .map(|ch| glyphs.advance[glyph_index(ch)])
+                .sum::<i32>()
+        };
+        let limit = (width as f32 * 2.0 / scale) as i32;
+        let mut lines = Vec::new();
+        let mut line = String::new();
+        let mut advance = 0;
+        let space = steps(" ");
+        for word in text.split_whitespace() {
+            let word_width = steps(word);
+            if !line.is_empty() && advance + space + word_width > limit {
+                lines.push(std::mem::take(&mut line));
+                advance = 0;
+            }
+            if !line.is_empty() {
+                line.push(' ');
+                advance += space;
+            }
+            line.push_str(word);
+            advance += word_width;
+        }
+        if !line.is_empty() {
+            lines.push(line);
+        }
+        lines
     }
 
     pub(crate) fn text(

@@ -217,6 +217,7 @@ unsafe fn message_loop(
     let mut stats = FrameStats::new(started);
     let mut deathmatch = match_rules.map(|rules| deathmatch::Match::new(map, start, rules));
     let mut restart_match = false;
+    let mut briefing_page: Option<usize> = None;
     let mut match_clock = deathmatch::Timestep::default();
 
     unsafe {
@@ -256,9 +257,31 @@ unsafe fn message_loop(
                             let pressed = message.wParam as u16;
                             primary |= pressed == settings.bindings[6];
                             alternate |= pressed == settings.bindings[7];
+                            let pages = deathmatch
+                                .as_ref()
+                                .filter(|game| game.mode() == deathmatch::Mode::Assault)
+                                .and_then(|_| map.assault.as_ref())
+                                .map_or(0, |data| data.briefing.len());
                             match pressed {
+                                VK_F3 if pages > 0 => {
+                                    match_clock.clear();
+                                    briefing_page = if briefing_page.is_some() {
+                                        None
+                                    } else {
+                                        Some(0)
+                                    };
+                                }
+                                VK_LEFT | VK_RIGHT if pages > 0 && briefing_page.is_some() => {
+                                    let index = briefing_page.unwrap();
+                                    let step = if pressed == VK_LEFT { pages - 1 } else { 1 };
+                                    briefing_page = Some((index + step) % pages);
+                                }
+                                VK_ESCAPE | VK_RETURN if briefing_page.is_some() => {
+                                    briefing_page = None
+                                }
                                 VK_RETURN => restart_match = true,
                                 VK_ESCAPE if let Some(frontend) = frontend.as_deref_mut() => {
+                                    briefing_page = None;
                                     mouse.release();
                                     let action = run_frontend(
                                         window,
@@ -626,12 +649,17 @@ unsafe fn message_loop(
                         ],
                         ..deathmatch::Command::default()
                     };
+                    let controls = briefing_page.is_none();
                     let events = match_clock.advance(
                         game,
                         map,
-                        command,
-                        [shoot, secondary],
-                        jump_pressed,
+                        if controls {
+                            command
+                        } else {
+                            deathmatch::Command::default()
+                        },
+                        [controls && shoot, controls && secondary],
+                        controls && jump_pressed,
                         frame_dt * f64::from(settings.game_speed) / 100.0,
                     );
                     if let Some(audio) = &mut audio {
@@ -678,7 +706,7 @@ unsafe fn message_loop(
                     (frame.width, frame.height) = (size.0 as usize, size.1 as usize);
                     game.hud_scale = settings.hud_scale as f32 / 100.0;
                     game.show_decals = settings.show_decals;
-                    let scoreboard = active && key(VK_TAB);
+                    let scoreboard = active && briefing_page.is_none() && key(VK_TAB);
                     frame.draw_deathmatch(
                         map,
                         &view,
@@ -687,8 +715,13 @@ unsafe fn message_loop(
                         blend,
                         scoreboard,
                     );
-                    hud.draw_deathmatch(&mut frame, game, map, scoreboard, mouse.captured);
-                    if settings.show_fps && !scoreboard && !game.finished {
+                    if let Some(index) = briefing_page {
+                        hud.draw_assault_briefing(&mut frame, map, index);
+                    } else {
+                        hud.draw_deathmatch(&mut frame, game, map, scoreboard, mouse.captured);
+                    }
+                    if settings.show_fps && briefing_page.is_none() && !scoreboard && !game.finished
+                    {
                         let label = stats.label(window, size, presenter.software);
                         hud.centered(&mut frame, 8, 0.8, &label, [0.72, 0.95, 0.78]);
                     }
