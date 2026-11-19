@@ -4,6 +4,7 @@ mod ai;
 mod arsenal;
 mod assault;
 mod assault_effects;
+mod breakables;
 mod guidance;
 mod navigation;
 mod objectives;
@@ -785,8 +786,13 @@ impl shock::Targets for ShockTargets<'_> {
             }
             shock::Target::Objective(target) => {
                 let scale = self.game.shock_damage_scale(owner);
-                self.game
-                    .damage_objective(self.map, owner, target, damage.saturating_mul(scale));
+                self.game.damage_objective(
+                    self.map,
+                    owner,
+                    target,
+                    damage.saturating_mul(scale),
+                    "jolted",
+                );
             }
         }
         None
@@ -977,6 +983,17 @@ impl Match {
         self.assault
             .iter()
             .flat_map(move |round| round.environment.visuals(map, self.time))
+    }
+
+    pub(crate) fn assault_debris<'a>(
+        &'a self,
+        map: &'a Map,
+    ) -> impl Iterator<Item = (Vec3, Vec3, f32, &'a [crate::map::Face])> + 'a {
+        self.assault
+            .as_ref()
+            .zip(map.assault.as_ref())
+            .into_iter()
+            .flat_map(|(round, data)| round.debris.visuals(&data.effects))
     }
 
     pub(crate) fn turret_muzzles<'a>(
@@ -1890,7 +1907,7 @@ impl Match {
                         .quake_impulse(&data.effects, &self.fighters[0], self.time);
                 self.fighters[0].walker.add_velocity(impulse);
             }
-            let hazard_hits = round.environment.tick(
+            let (hazard_hits, wall_events) = round.environment.tick(
                 map,
                 &self.fighters,
                 self.time,
@@ -1898,7 +1915,16 @@ impl Match {
                 &mut self.ballistics,
                 &mut self.decals,
                 &mut sounds,
+                &mut round.debris,
             );
+            for event in wall_events {
+                round.emit(self.time, event, false);
+            }
+            if let Some(data) = &map.assault {
+                round
+                    .debris
+                    .tick(map, &data.effects, self.time, dt, &mut sounds);
+            }
             for hit in hazard_hits {
                 self.apply_hit(map, hit, &mut sounds);
             }
@@ -2272,7 +2298,7 @@ impl Match {
         {
             let offset = start + delta * at - camera.position;
             let damage = super::hammer_damage(alternate, offset.dot(offset).sqrt(), charge);
-            self.damage_objective(map, id, objective, damage * scale);
+            self.damage_objective(map, id, objective, damage * scale, "impact");
         } else if let Some((victim, at)) = pawn {
             let offset = start + delta * at - camera.position;
             let damage = super::hammer_damage(alternate, offset.dot(offset).sqrt(), charge);
@@ -2757,6 +2783,7 @@ impl Match {
                         damage,
                         self.time,
                         attacker,
+                        "shot",
                     );
                     at
                 } else if let Some((projectile, at)) = intercepted {
@@ -2963,6 +2990,7 @@ impl Match {
                         id,
                         last,
                         (PulseBeam::DAMAGE_PER_SECOND * contact) as u16 * boost,
+                        "jolted",
                     );
                 }
             }
@@ -2971,7 +2999,7 @@ impl Match {
 
     fn shock_blast(&mut self, map: &Map, owner: usize, blast: shock::Blast, hits: &mut Vec<Hit>) {
         let scale = self.shock_damage_scale(owner);
-        self.assault_blast(map, owner, &blast, scale);
+        self.assault_blast(map, owner, &blast, scale, "jolted");
         for (victim, fighter) in self
             .fighters
             .iter()
@@ -3185,7 +3213,14 @@ impl Match {
                 {
                     objective_impact = Some(bolt.position + (end - bolt.position) * at);
                     if payload.blast == 0.0 {
-                        round.damage(data, objective, payload.damage, self.time, attacker);
+                        round.damage(
+                            data,
+                            objective,
+                            payload.damage,
+                            self.time,
+                            attacker,
+                            art.damage_type.as_deref().unwrap_or(""),
+                        );
                         sounds.extend_at(
                             art.contact.iter().cloned(),
                             objective_impact.unwrap(),
@@ -3546,7 +3581,18 @@ impl Match {
             } else {
                 1
             };
-            self.assault_blast(map, owner, &blast, if warhead { damage_scale } else { 1 });
+            let damage_type = if payload.kind == ordnance::Kind::FlakShell {
+                "FlakDeath"
+            } else {
+                art.damage_type.as_deref().unwrap_or("")
+            };
+            self.assault_blast(
+                map,
+                owner,
+                &blast,
+                if warhead { damage_scale } else { 1 },
+                damage_type,
+            );
             for (victim, fighter) in self
                 .fighters
                 .iter()
@@ -3848,6 +3894,7 @@ impl Match {
         owner: usize,
         target: crate::assault::Target,
         damage: u16,
+        damage_type: &str,
     ) {
         if let Some((round, data)) = self.assault.as_mut().zip(map.assault.as_ref()) {
             round.damage(
@@ -3856,11 +3903,19 @@ impl Match {
                 damage,
                 self.time,
                 self.fighters[owner].team == Some(round.attack_team),
+                damage_type,
             );
         }
     }
 
-    fn assault_blast(&mut self, map: &Map, owner: usize, blast: &shock::Blast, scale: u16) {
+    fn assault_blast(
+        &mut self,
+        map: &Map,
+        owner: usize,
+        blast: &shock::Blast,
+        scale: u16,
+        damage_type: &str,
+    ) {
         let Some((round, data)) = self.assault.as_mut().zip(map.assault.as_ref()) else {
             return;
         };
@@ -3876,6 +3931,7 @@ impl Match {
                     damage.saturating_mul(scale),
                     self.time,
                     attacker,
+                    damage_type,
                 );
             }
         }
@@ -3889,6 +3945,7 @@ impl Match {
                     damage.saturating_mul(scale),
                     self.time,
                     attacker,
+                    damage_type,
                 );
             }
         }
@@ -3907,6 +3964,12 @@ impl Match {
             {
                 round.environment.arm(&data.effects, index, self.time);
             }
+        }
+        for event in round
+            .debris
+            .blast(map, &data.effects, blast, damage_type, scale, self.time)
+        {
+            round.emit(self.time, event, attacker);
         }
     }
 
@@ -5118,7 +5181,13 @@ mod tests {
                 ..Rules::default()
             },
         );
-        game.damage_objective(&map, 0, crate::assault::Target::Fort(compressor), 200);
+        game.damage_objective(
+            &map,
+            0,
+            crate::assault::Target::Fort(compressor),
+            200,
+            "shot",
+        );
         assert!(map.assault.as_ref().unwrap().relays.iter().any(|relay| {
             name(relay.tag) == "fluid1"
                 && matches!(

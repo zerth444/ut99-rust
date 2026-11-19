@@ -487,6 +487,15 @@ pub fn load(
     let mut waves = HashMap::new();
     if let Some(assault) = assault.as_deref_mut() {
         let effects = &mut assault.effects;
+        if !effects.walls.is_empty() {
+            breakable_art(
+                &mut assets,
+                &mut class_cache,
+                &mut textures,
+                &mut waves,
+                effects,
+            )?;
+        }
         if !effects.quakes.is_empty()
             && let Some(class) = find_export(&assets, "unrealshare", "Earthquake", "Class")
         {
@@ -1225,6 +1234,13 @@ fn projectile_art(
             match name {
                 name if name.eq_ignore_ascii_case("speed") => art.speed = value.f32().ok(),
                 "Damage" => art.damage = value.f32().ok(),
+                "MyDamageType" => {
+                    art.damage_type = value
+                        .index()
+                        .ok()
+                        .and_then(|index| package.name(index).ok())
+                        .map(str::to_owned)
+                }
                 "MomentumTransfer" => {
                     art.momentum = value.u32().ok().map(|value| value as i32 as f32)
                 }
@@ -1835,6 +1851,96 @@ fn read_turret(
         muzzle,
         audio,
     })
+}
+
+fn breakable_art(
+    assets: &mut Assets<'_>,
+    classes: &mut HashMap<Object, Appearance>,
+    textures: &mut HashMap<Object, Option<Arc<Texture>>>,
+    waves: &mut HashMap<Object, Option<Arc<Wave>>>,
+    effects: &mut crate::assault::Effects,
+) -> io::Result<()> {
+    for wall in &mut effects.walls {
+        let sound = assets.resolve(0, wall.sound_ref);
+        wall.sound = cached_wave(assets, waves, sound);
+    }
+    for (kind, name) in ["WallFragments", "WoodFragments", "GlassFragments"]
+        .into_iter()
+        .enumerate()
+    {
+        if !effects
+            .walls
+            .iter()
+            .any(|wall| wall.materials[kind].count > 0)
+        {
+            continue;
+        }
+        let Some(class) = find_export(assets, "unrealshare", name, "Class") else {
+            continue;
+        };
+        let defaults = appearance(assets, classes, Some(class));
+        let (package, export) = assets.object(class);
+        let mut properties = class_properties(package, export)?;
+        let mut refs = [0; 11];
+        let mut audio = [0; 2];
+        let mut count = refs.len();
+        while let Some(property) = properties.next_tag()? {
+            let mut value = property.value;
+            match property.name {
+                "Fragments" if property.array_index < refs.len() => {
+                    refs[property.array_index] = value.compact()?
+                }
+                "numFragmentTypes" => count = (value.u32()? as usize).min(refs.len()),
+                "ImpactSound" => audio[0] = value.compact()?,
+                "MiscSound" => audio[1] = value.compact()?,
+                _ => {}
+            }
+        }
+        let impacts = audio.map(|reference| {
+            let object = assets.resolve(class.package, reference);
+            cached_wave(assets, waves, object)
+        });
+        let meshes: Vec<_> = refs[..count]
+            .iter()
+            .filter_map(|&reference| {
+                let object = assets.resolve(class.package, reference)?;
+                let (package, export) = assets.object(object);
+                Some((object, Mesh::read(package, export).ok()?))
+            })
+            .collect();
+        for wall in &mut effects.walls {
+            let material = &mut wall.materials[kind];
+            if material.count == 0 {
+                continue;
+            }
+            material.impacts = impacts.clone();
+            material.collision = [
+                defaults.collision_radius.unwrap_or(0.0),
+                defaults.collision_height.unwrap_or(0.0),
+            ];
+            let visual = Appearance {
+                skin: assets.resolve(0, material.texture_ref).or(defaults.skin),
+                unlit: defaults.unlit || material.unlit,
+                ..defaults
+            };
+            for (object, mesh) in &meshes {
+                let Some(frame) = mesh.frame(0) else {
+                    continue;
+                };
+                let vertices = effect_vertices(mesh, frame, 1.0);
+                let mut faces = mesh_faces(assets, textures, *object, visual, mesh, &vertices);
+                if material.translucent {
+                    for face in &mut faces {
+                        face.flags |= 4;
+                    }
+                }
+                if !faces.is_empty() {
+                    material.shapes.push(faces);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn effect_vertices(mesh: &Mesh, frame: &[Vec3], scale: f32) -> Vec<Vec3> {

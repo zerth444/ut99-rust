@@ -112,6 +112,10 @@ impl View {
 
     fn scaled_model(&self, origin: Vec3, forward: Vec3, scale: Vec3) -> Self {
         let (right, up) = shock::axes(forward);
+        self.basis_model(origin, forward, right, up, scale)
+    }
+
+    fn basis_model(&self, origin: Vec3, forward: Vec3, right: Vec3, up: Vec3, scale: Vec3) -> Self {
         let local = |p: Vec3| Vec3(p.dot(forward), p.dot(right), p.dot(up));
         let product = crate::mover::product;
         Self {
@@ -480,6 +484,30 @@ impl Frame {
         }
         for visual in game.assault_effects(map) {
             self.draw_world_effect(&view, game.time, visual);
+        }
+        for (origin, angles, scale, faces) in game.assault_debris(map) {
+            if view.point(origin).2 + 24.0 * scale < NEAR {
+                continue;
+            }
+            let axis = |vector| crate::mover::rotate(vector, angles);
+            let model = view.basis_model(
+                origin,
+                axis(Vec3(1.0, 0.0, 0.0)),
+                axis(Vec3(0.0, 1.0, 0.0)),
+                axis(Vec3(0.0, 0.0, 1.0)),
+                Vec3(scale, scale, scale),
+            );
+            self.draw_lit_faces(
+                faces,
+                &model,
+                game.time,
+                false,
+                None,
+                None,
+                &map.scene_lights,
+                None,
+                None,
+            );
         }
         for (position, direction, faces) in game.turret_muzzles(map) {
             let model = view.in_model(position, direction, 1.0);

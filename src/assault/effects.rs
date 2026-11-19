@@ -18,6 +18,7 @@ pub(crate) struct Effects {
     pub charge_image: Option<Arc<Texture>>,
     pub charge_sound: Option<Arc<Wave>>,
     pub mortar_mark: Option<(Arc<Texture>, f32, f32)>,
+    pub walls: Vec<super::breakables::Breakable>,
 }
 
 pub(crate) struct Quake {
@@ -84,11 +85,15 @@ impl Effects {
                     | "TimedTrigger"
                     | "StochasticTrigger"
                     | "Earthquake"
+                    | "ExplodingWall"
             ) {
                 continue;
             }
             let mut values = package.properties(actor)?;
             match kind {
+                "ExplodingWall" => effects
+                    .walls
+                    .push(super::breakables::Breakable::read(package, actor)?),
                 "MortarSpawner" => {
                     let mut mortar = Mortar {
                         location: Vec3::default(),

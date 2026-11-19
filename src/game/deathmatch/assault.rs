@@ -22,6 +22,7 @@ struct TriggerStatus {
 pub(super) struct Round {
     pub defenses: super::turrets::Defenses,
     pub environment: super::assault_effects::Environment,
+    pub debris: super::breakables::Debris,
     pub attack_team: usize,
     pub limit: f32,
     pub first_attack: Option<Option<f32>>,
@@ -39,6 +40,7 @@ impl Round {
         Self {
             defenses: super::turrets::Defenses::new(map),
             environment: super::assault_effects::Environment::new(&map.effects, attack_team),
+            debris: super::breakables::Debris::new(&map.effects, attack_team),
             attack_team,
             limit: first_attack.flatten().unwrap_or(f32::from(map.seconds)),
             first_attack,
@@ -253,6 +255,9 @@ impl Round {
             }
             self.defenses.signal(data, event, due, sounds);
             self.environment.signal(&data.effects, event, due, attacker);
+            for follow in self.debris.signal(&data.effects, event, due) {
+                self.emit(due, follow, attacker);
+            }
         }
     }
 
@@ -317,10 +322,22 @@ impl Round {
                 }
                 Some((charge.volume.trace(start, delta)?, Target::Charge(index)))
             });
+        let walls = data
+            .effects
+            .walls
+            .iter()
+            .enumerate()
+            .filter_map(|(index, wall)| {
+                if !self.debris.targetable(&data.effects, index) {
+                    return None;
+                }
+                Some((wall.volume.trace(start, delta)?, Target::Wall(index)))
+            });
         forts
             .chain(triggers)
             .chain(turrets)
             .chain(charges)
+            .chain(walls)
             .min_by(|a, b| a.0.total_cmp(&b.0))
     }
 
@@ -331,11 +348,24 @@ impl Round {
         damage: u16,
         time: f32,
         attacker: bool,
+        damage_type: &str,
     ) {
         if damage == 0 {
             return;
         }
         match target {
+            Target::Wall(index) => {
+                if let Some(event) = self.debris.strike(
+                    &data.effects,
+                    index,
+                    damage_type,
+                    damage,
+                    time,
+                    Vec3::default(),
+                ) {
+                    self.emit(time, event, attacker);
+                }
+            }
             Target::Charge(index) => self.environment.arm(&data.effects, index, time),
             Target::Turret(index) => self.defenses.damage(index, damage, time),
             Target::Trigger(index) => {

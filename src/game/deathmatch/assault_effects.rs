@@ -233,9 +233,10 @@ impl Environment {
         ballistic: &mut ballistics::Effects,
         marks: &mut decals::Marks,
         sounds: &mut SoundEvents,
-    ) -> Vec<Hit> {
+        debris: &mut super::breakables::Debris,
+    ) -> (Vec<Hit>, Vec<usize>) {
         let Some(assault) = &map.assault else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let data = &assault.effects;
         let art = &map.ordnance[Kind::FlakShell as usize];
@@ -367,6 +368,7 @@ impl Environment {
             );
         }
         let mut hits = Vec::new();
+        let mut wall_events = Vec::new();
         for explosion in &blasts {
             let blast = Blast::radial(
                 explosion.center,
@@ -374,6 +376,12 @@ impl Environment {
                 explosion.damage,
                 explosion.momentum,
             );
+            let damage_type = if explosion.mortar {
+                "mortared"
+            } else {
+                "detonated"
+            };
+            wall_events.extend(debris.blast(map, data, &blast, damage_type, 1, time));
             for (victim, fighter) in fighters
                 .iter()
                 .enumerate()
@@ -402,7 +410,7 @@ impl Environment {
             }
         }
         self.explosions.extend(blasts);
-        hits
+        (hits, wall_events)
     }
 
     pub fn visuals<'a>(&'a self, map: &'a Map, time: f32) -> impl Iterator<Item = Visual<'a>> + 'a {
@@ -566,6 +574,11 @@ mod tests {
         }
         assert!(spent > 1, "expected the scheduled explosion chain to fire");
         assert!(shook, "expected the quake event to shake the camera");
+        assert!(
+            game.assault_debris(&map)
+                .any(|(_, _, _, faces)| faces.iter().any(|face| face.texture.is_some())),
+            "the Wallholio event should also release textured wall debris"
+        );
         assert!(
             game.assault_effects(&map)
                 .any(|visual| matches!(visual, Visual::Sprite(..)))

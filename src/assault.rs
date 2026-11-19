@@ -5,6 +5,7 @@ use crate::{
     package::{Export, Package},
 };
 
+mod breakables;
 mod effects;
 pub(crate) use effects::{Effects, Timer};
 
@@ -150,6 +151,7 @@ pub(crate) enum Target {
     Trigger(usize),
     Turret(usize),
     Charge(usize),
+    Wall(usize),
 }
 
 impl AssaultMap {

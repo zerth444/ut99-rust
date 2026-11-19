@@ -181,6 +181,7 @@ pub struct Art {
     pub lifetime: Option<f32>,
     pub speed: Option<f32>,
     pub damage: Option<f32>,
+    pub damage_type: Option<String>,
     pub momentum: Option<f32>,
     pub scale: Option<f32>,
     pub wavefront: Vec<Face>,
