@@ -46,6 +46,7 @@ pub struct Mover {
     fraction: f32,
     countdown: f32,
     opening: bool,
+    trigger_touching: bool,
     ready: bool,
     hull: Option<usize>,
     triggers: Vec<Trigger>,
@@ -252,6 +253,7 @@ impl Mover {
         self.fraction = 0.0;
         self.countdown = 0.0;
         self.opening = false;
+        self.trigger_touching = false;
         self.ready = true;
         self.signaled = None;
         self.control_sources = 0;
@@ -359,7 +361,7 @@ impl Mover {
                         .iter()
                         .any(|walker| walker.touches_box(min, max, 1.0))
             }
-            Activation::Trigger if !scripted => walkers
+            Activation::Trigger | Activation::Control | Activation::Toggle if !scripted => walkers
                 .iter()
                 .any(|walker| self.triggers.iter().any(|trigger| trigger.touches(walker))),
             _ => false,
@@ -371,6 +373,17 @@ impl Mover {
             }
             if self.fraction == 0.0 {
                 self.ready = true;
+            }
+        } else if !scripted && matches!(self.activation, Activation::Control | Activation::Toggle) {
+            let entered = requested && !self.trigger_touching;
+            self.trigger_touching = requested;
+            if matches!(self.activation, Activation::Control) {
+                self.opening = requested || (self.trigger_once && self.signaled.is_some());
+            } else if entered && (!self.trigger_once || self.signaled.is_none()) {
+                self.opening = !self.opening;
+            }
+            if entered && self.trigger_once {
+                self.signaled = Some(false);
             }
         } else if self.fraction == 0.0 {
             self.ready |= !requested;
@@ -402,13 +415,10 @@ impl Mover {
         };
         let offset = self.travel * fraction;
         #[cfg(windows)]
-        let rotation = if scripted {
-            self.scene_keys
-                .get(1)
-                .map_or(Vec3::default(), |(_, angle)| *angle * fraction)
-        } else {
-            Vec3::default()
-        };
+        let rotation = self
+            .scene_keys
+            .get(1)
+            .map_or(Vec3::default(), |(_, angle)| *angle * fraction);
         #[cfg(not(windows))]
         let rotation = Vec3::default();
         let delta = offset - self.offset;
@@ -700,6 +710,7 @@ impl Brush {
                 fraction: 0.0,
                 countdown: 0.0,
                 opening: false,
+                trigger_touching: false,
                 ready: true,
                 hull: None,
                 triggers,
@@ -789,6 +800,55 @@ fn inv(value: f32) -> f32 {
 mod tests {
     use super::*;
     use crate::map::Map;
+
+    #[test]
+    #[ignore = "requires local CTF map packages"]
+    fn niven_and_coret_doors_stay_open_until_their_trigger_is_clear() {
+        for name in ["CTF-Niven.unr", "CTF-Coret.unr"] {
+            let path = Path::new("local/reference-client/Maps").join(name);
+            let bytes = std::fs::read(path).unwrap();
+            let mut map = Map::load(&Package::read(&bytes).unwrap(), None).unwrap();
+            let mover = map
+                .movers
+                .iter_mut()
+                .find(|mover| {
+                    matches!(mover.activation, Activation::Control) && !mover.triggers.is_empty()
+                })
+                .expect("trigger-controlled door");
+            let mut walker = mover
+                .triggers
+                .iter()
+                .find_map(|trigger| {
+                    [
+                        Vec3(0.0, 0.0, 0.0),
+                        Vec3(0.8, 0.0, 0.0),
+                        Vec3(-0.8, 0.0, 0.0),
+                        Vec3(0.0, 0.8, 0.0),
+                        Vec3(0.0, -0.8, 0.0),
+                    ]
+                    .into_iter()
+                    .find_map(|offset| {
+                        let walker = Walker::spawn(
+                            &map.collision,
+                            trigger.position + offset * trigger.radius,
+                        );
+                        (trigger.touches(&walker)
+                            && !walker.touches_box(mover.min, mover.max, -0.5))
+                        .then_some(walker)
+                    })
+                })
+                .expect("clear position inside the door trigger");
+            let seconds = mover.time + mover.pause + 1.0;
+            for _ in 0..(seconds * 120.0).ceil() as usize {
+                mover.tick(&mut map.collision, &mut walker, 1.0 / 120.0);
+            }
+            assert!(mover.lift_at(LiftStop::Away), "{name}");
+            for _ in 0..((mover.time + 0.1) * 120.0).ceil() as usize {
+                mover.tick_many(&mut map.collision, &mut [], 1.0 / 120.0, None);
+            }
+            assert!(mover.lift_at(LiftStop::Home), "{name}");
+        }
+    }
 
     #[test]
     #[ignore = "requires the local GOTY Deck16 map"]

@@ -5,9 +5,10 @@ use crate::{
 };
 
 use super::distance_squared;
+use std::{cmp::Ordering, collections::BinaryHeap};
 
 const EDGE_LIMIT: f32 = 620.0;
-pub(super) const WAYPOINT_RADIUS: f32 = 34.0;
+pub(super) const WAYPOINT_RADIUS: f32 = 22.0;
 const JUMP_PROBE_SECONDS: f32 = 1.4;
 const LAND_RADIUS: f32 = 48.0;
 
@@ -22,9 +23,19 @@ pub(super) struct LiftRide {
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Step {
     Walk(Vec3),
+    Swim(Vec3),
     Teleport(Vec3),
     Lift(LiftRide),
     Jump(Jump),
+}
+
+impl Step {
+    pub(super) fn movement_goal(self) -> Option<Vec3> {
+        match self {
+            Self::Walk(point) | Self::Swim(point) => Some(point),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -53,9 +64,9 @@ pub(super) enum JumpControl {
 }
 
 impl Jump {
-    fn probe(world: &Collision, from: Vec3, to: Vec3) -> Option<Self> {
+    pub(super) fn probe(world: &Collision, from: Vec3, to: Vec3) -> Option<Self> {
         let offset = to - from;
-        if !(58.0..=330.0).contains(&offset.0.hypot(offset.1))
+        if !(44.0..=330.0).contains(&offset.0.hypot(offset.1))
             || !(-95.0..=64.0).contains(&offset.2)
         {
             return None;
@@ -193,6 +204,35 @@ struct Edge {
     step: Step,
 }
 
+#[derive(Clone, Copy)]
+struct RouteCandidate {
+    id: usize,
+    cost: f32,
+}
+
+impl PartialEq for RouteCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for RouteCandidate {}
+
+impl PartialOrd for RouteCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RouteCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .cost
+            .total_cmp(&self.cost)
+            .then_with(|| other.id.cmp(&self.id))
+    }
+}
+
 pub(super) struct Navigation {
     points: Vec<Vec3>,
     edges: Vec<Vec<Edge>>,
@@ -279,6 +319,35 @@ impl Navigation {
                 ));
             }
         }
+        if !map.navigation_points.is_empty() {
+            for link in &map.reach_links {
+                let (from, to) = (
+                    node_at(&mut points, link.from),
+                    node_at(&mut points, link.to),
+                );
+                if from == to {
+                    continue;
+                }
+                let step = if link.swim {
+                    Step::Swim(link.to)
+                } else if link.jump && !walk_link(&map.collision, link.from, link.to) {
+                    let Some(jump) = Jump::probe(&map.collision, link.from, link.to) else {
+                        continue;
+                    };
+                    Step::Jump(jump)
+                } else {
+                    Step::Walk(link.to)
+                };
+                transfers.push((
+                    from,
+                    Edge {
+                        to,
+                        cost: link.distance,
+                        step,
+                    },
+                ));
+            }
+        }
         let mut edges = vec![Vec::new(); points.len()];
         for (index, &from) in points.iter().enumerate() {
             for (next, &to) in points.iter().enumerate().skip(index + 1) {
@@ -287,7 +356,7 @@ impl Navigation {
                     continue;
                 }
                 if walk_link(&map.collision, from, to) {
-                    let cost = distance.sqrt();
+                    let cost = distance.sqrt() * 1.2;
                     edges[index].push(Edge {
                         to: next,
                         cost,
@@ -320,7 +389,7 @@ impl Navigation {
     }
 
     pub(super) fn next_step(&self, world: &Collision, from: Vec3, to: Vec3) -> Option<Step> {
-        self.next_step_avoiding(world, from, to, None)
+        self.next_step_avoiding(world, from, to, &[])
     }
 
     pub(super) fn next_step_avoiding(
@@ -328,15 +397,38 @@ impl Navigation {
         world: &Collision,
         from: Vec3,
         to: Vec3,
-        blocked: Option<Vec3>,
+        blocked: &[(Vec3, f32)],
     ) -> Option<Step> {
-        let allowed =
-            |point| blocked.is_none_or(|failed| distance_squared(point, failed) > 45.0_f32.powi(2));
+        let allowed = |point| {
+            blocked
+                .iter()
+                .all(|&(failed, _)| distance_squared(point, failed) > 40.0_f32.powi(2))
+        };
+        // A route between lift landings needs the platform even when the
+        // currently docked platform makes a straight approach look walkable.
+        let lift = self
+            .points
+            .iter()
+            .zip(&self.edges)
+            .filter(|&(&point, _)| distance_squared(from, point) < 48.0_f32.powi(2))
+            .flat_map(|(_, edges)| edges)
+            .find_map(|edge| match edge.step {
+                Step::Lift(ride)
+                    if distance_squared(to, ride.exit) < WAYPOINT_RADIUS.powi(2)
+                        && allowed(ride.exit) =>
+                {
+                    Some(edge.step)
+                }
+                _ => None,
+            });
+        if lift.is_some() {
+            return lift;
+        }
         if allowed(to) && walk_link(world, from, to) {
             return Some(Step::Walk(to));
         }
         let mut costs = vec![f32::INFINITY; self.points.len()];
-        let mut visited = vec![false; self.points.len()];
+        let mut queue = BinaryHeap::new();
         let mut first = vec![None; self.points.len()];
         for (id, &point) in self.points.iter().enumerate() {
             let distance = distance_squared(from, point);
@@ -350,18 +442,21 @@ impl Navigation {
                     first[id] = Some(Step::Walk(point));
                 }
                 costs[id] = distance.sqrt();
+                queue.push(RouteCandidate {
+                    id,
+                    cost: costs[id],
+                });
             }
         }
         let mut best = f32::INFINITY;
         let mut waypoint = None;
-        while let Some(id) = (0..costs.len())
-            .filter(|&id| !visited[id])
-            .min_by(|&a, &b| costs[a].total_cmp(&costs[b]))
-        {
-            if costs[id] >= best {
+        while let Some(RouteCandidate { id, cost }) = queue.pop() {
+            if cost >= best {
                 break;
             }
-            visited[id] = true;
+            if cost > costs[id] {
+                continue;
+            }
             let point = self.points[id];
             let closing = distance_squared(point, to);
             if closing <= EDGE_LIMIT.powi(2)
@@ -373,14 +468,17 @@ impl Navigation {
                 waypoint = first[id].or(Some(Step::Walk(to)));
             }
             for edge in &self.edges[id] {
-                if first[id].is_none() && matches!(edge.step, Step::Walk(point) if !allowed(point))
-                {
+                if !allowed(self.points[edge.to]) {
                     continue;
                 }
                 let length = costs[id] + edge.cost;
                 if length < costs[edge.to] {
                     costs[edge.to] = length;
                     first[edge.to] = first[id].or(Some(edge.step));
+                    queue.push(RouteCandidate {
+                        id: edge.to,
+                        cost: length,
+                    });
                 }
             }
         }
@@ -392,7 +490,7 @@ impl Navigation {
         world: &Collision,
         from: Vec3,
         objective: Option<Vec3>,
-        blocked: Option<Vec3>,
+        blocked: &[(Vec3, f32)],
     ) -> Option<Step> {
         self.points
             .iter()
@@ -401,7 +499,8 @@ impl Navigation {
                 let distance = distance_squared(from, point);
                 (65.0_f32.powi(2)..=300.0_f32.powi(2)).contains(&distance)
                     && blocked
-                        .is_none_or(|failed| distance_squared(point, failed) > 65.0_f32.powi(2))
+                        .iter()
+                        .all(|&(failed, _)| distance_squared(point, failed) > 48.0_f32.powi(2))
                     && walk_link(world, from, point)
             })
             .min_by(|&a, &b| {

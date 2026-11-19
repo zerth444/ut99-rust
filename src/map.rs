@@ -99,6 +99,7 @@ pub struct Map {
     pub(crate) ctf_training: Option<crate::game::deathmatch::ctf_training::Data>,
     pub(crate) ctf_icons: [Option<Arc<Texture>>; 3],
     pub navigation_points: Vec<Vec3>,
+    pub(crate) reach_links: Vec<ReachLink>,
     pub(crate) lift_exits: Vec<LiftExit>,
     pub collision: Collision,
     pub sky_origin: Option<Vec3>,
@@ -140,7 +141,7 @@ impl Map {
             .iter()
             .find(|item| package.object_name(item.class) == Some("Level"))
             .ok_or_else(|| invalid("Package has no Level export"))?;
-        let (model, actors) =
+        let (model, actors, reach_links) =
             level_data(package, level).map_err(|error| invalid(format!("Level: {error}")))?;
         let mut assault = crate::assault::AssaultMap::load(package, &actors)?;
         let city_intro = path.filter(|path| {
@@ -381,6 +382,7 @@ impl Map {
             ctf_training,
             ctf_icons,
             navigation_points,
+            reach_links,
             lift_exits,
             collision,
             sky_origin,
@@ -411,10 +413,18 @@ pub(crate) fn native_data<'a>(package: &Package<'a>, export: &Export) -> io::Res
     Ok(properties.reader)
 }
 
+pub(crate) struct ReachLink {
+    pub from: Vec3,
+    pub to: Vec3,
+    pub distance: f32,
+    pub jump: bool,
+    pub swim: bool,
+}
+
 fn level_data<'p, 'a>(
     package: &'p Package<'a>,
     export: &Export,
-) -> io::Result<(&'p Export, Vec<&'p Export>)> {
+) -> io::Result<(&'p Export, Vec<&'p Export>, Vec<ReachLink>)> {
     let mut reader = native_data(package, export)?;
     let count = reader.u32()? as usize;
     reader.u32()?;
@@ -447,7 +457,78 @@ fn level_data<'p, 'a>(
         .and_then(|index| package.exports.get(index))
         .filter(|item| package.object_name(item.class) == Some("Model"))
         .ok_or_else(|| invalid("Level does not reference a BSP Model"))?;
-    Ok((model, actors))
+    let reach_links = if reader.remaining.is_empty() {
+        Vec::new()
+    } else {
+        read_reach_links(package, &mut reader)?
+    };
+    Ok((model, actors, reach_links))
+}
+
+fn read_reach_links(package: &Package<'_>, reader: &mut Reader<'_>) -> io::Result<Vec<ReachLink>> {
+    const WALK: u32 = 1;
+    const SWIM: u32 = 4;
+    const JUMP: u32 = 8;
+    const DOOR: u32 = 16;
+    let mut links = Vec::new();
+    let mut locations = std::collections::HashMap::new();
+    let mut location = |reference: i32| -> io::Result<_> {
+        if let Some(&point) = locations.get(&reference) {
+            return Ok(point);
+        }
+        let Some(actor) = usize::try_from(reference)
+            .ok()
+            .and_then(|id| id.checked_sub(1))
+            .and_then(|id| package.exports.get(id))
+        else {
+            return Ok(None);
+        };
+        if package.object_name(actor.class) == Some("LiftCenter") {
+            // The lift controller provides the executable transfer between exits.
+            locations.insert(reference, None);
+            return Ok(None);
+        }
+        let mut properties = package.properties(actor)?;
+        let mut point = Vec3::default();
+        while let Some((name, mut value)) = properties.next()? {
+            if name == "Location" {
+                point = Vec3::read(&mut value)?;
+                break;
+            }
+        }
+        let point =
+            (point.0.is_finite() && point.1.is_finite() && point.2.is_finite()).then_some(point);
+        locations.insert(reference, point);
+        Ok(point)
+    };
+    for _ in 0..reader.count(19)? {
+        let distance = reader.u32()? as i32;
+        let from = reader.compact()?;
+        let to = reader.compact()?;
+        let radius = reader.u32()? as i32;
+        let height = reader.u32()? as i32;
+        let flags = reader.u32()?;
+        let pruned = reader.byte()?;
+        if distance <= 0
+            || pruned != 0
+            || flags == 0
+            || flags & !(WALK | SWIM | JUMP | DOOR) != 0
+            || (radius as f32) < crate::collision::PLAYER_RADIUS
+            || (height as f32) < crate::collision::PLAYER_HEIGHT
+        {
+            continue;
+        }
+        if let (Some(from), Some(to)) = (location(from)?, location(to)?) {
+            links.push(ReachLink {
+                from,
+                to,
+                distance: distance as f32,
+                jump: flags & JUMP != 0,
+                swim: flags & SWIM != 0,
+            });
+        }
+    }
+    Ok(links)
 }
 
 fn skip_string(reader: &mut Reader<'_>) -> io::Result<()> {

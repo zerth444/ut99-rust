@@ -577,12 +577,14 @@ struct Bot {
     last_seen: Option<(Vec3, f32)>,
     lift: Option<ActiveLift>,
     plan_origin: Option<Vec3>,
-    blocked_waypoint: Option<(Vec3, f32)>,
+    blocked_waypoints: Vec<(Vec3, f32)>,
+    last_waypoint: Option<Vec3>,
     navigation_objective: Option<Vec3>,
     retreat: Option<Retreat>,
     retreat_retry_at: f32,
     jump: JumpProgress,
     jump_until: Option<f32>,
+    route_jump_again_at: f32,
     evasion: Option<Evasion>,
     evade_again_at: f32,
 }
@@ -590,6 +592,17 @@ struct Bot {
 struct Evasion {
     direction: Vec3,
     until: f32,
+}
+
+impl Bot {
+    fn avoid_waypoint(&mut self, point: Vec3, until: f32) {
+        self.blocked_waypoints
+            .retain(|&(failed, _)| distance_squared(point, failed) >= WAYPOINT_RADIUS.powi(2));
+        if self.blocked_waypoints.len() == 5 {
+            self.blocked_waypoints.remove(0);
+        }
+        self.blocked_waypoints.push((point, until));
+    }
 }
 
 struct Retreat {
@@ -4633,6 +4646,7 @@ impl Match {
         let objective = assault
             .map(|(fort, _)| fort.destination)
             .or_else(|| self.objectives.destination(&self.fighters, id));
+        let carrying_flag = self.objectives.carries_flag(id);
         if let Some((fort, true)) = assault
             && !fort.touch
         {
@@ -4771,18 +4785,21 @@ impl Match {
                 .map(|(ray, _)| ray)
         });
         let fighter = &mut self.fighters[id];
-        if let Some(command) = try_retreat(
-            &self.navigation,
-            map,
-            fighter,
-            &skill,
-            target.is_some(),
-            self.time,
-            dt,
-        ) {
+        if !carrying_flag
+            && let Some(command) = try_retreat(
+                &self.navigation,
+                map,
+                fighter,
+                &skill,
+                target.is_some(),
+                self.time,
+                dt,
+            )
+        {
             return command;
         }
         let bot = &mut fighter.bot;
+        let mut fire_while_carrying = None;
         if let Some((other, target_position, delta, distance, velocity)) = target {
             let reacquired = bot.target == Some(other)
                 && bot
@@ -4790,7 +4807,9 @@ impl Match {
                     .is_some_and(|since| self.time - since > 0.12);
             bot.hidden_since = None;
             bot.last_seen = Some((target_position, self.time));
-            bot.plan_origin = None;
+            if !carrying_flag {
+                bot.plan_origin = None;
+            }
             if bot.target != Some(other) || reacquired {
                 bot.target = Some(other);
                 bot.react_at = self.time + skill.reaction + (id % 3) as f32 * 0.07;
@@ -4934,7 +4953,7 @@ impl Match {
             bot.combat_move =
                 bot.combat_move + (desired - bot.combat_move) * (1.0 - (-5.0 * dt).exp());
             let movement = safe_combat_move(map, &fighter.walker, bot.combat_move);
-            return Command {
+            let combat = Command {
                 movement: movement_input(movement, fighter.yaw + yaw),
                 look: [yaw, tilt],
                 primary: hold_trigger && !alt,
@@ -4943,8 +4962,13 @@ impl Match {
                 preferred: (weapon != fighter.weapon).then_some(weapon),
                 ..Command::default()
             };
+            if !carrying_flag {
+                return combat;
+            }
+            fire_while_carrying = Some(combat);
         }
-        if let Some((point, seen)) = bot.last_seen
+        if !carrying_flag
+            && let Some((point, seen)) = bot.last_seen
             && tracked_alive
             && self.time - seen < 0.28
         {
@@ -4959,7 +4983,7 @@ impl Match {
                 ..Command::default()
             };
         }
-        if bot.target.take().is_some() {
+        if fire_while_carrying.is_none() && bot.target.take().is_some() {
             bot.goal = None;
             bot.rethink_at = self.time;
             bot.hidden_since = None;
@@ -4967,83 +4991,112 @@ impl Match {
         bot.combat_move = Vec3::default();
         let position = fighter.walker.position;
         let check_progress = self.time >= bot.rethink_at;
-        let arrived = matches!(bot.goal, Some(Step::Walk(point)) if near_waypoint(point, position));
+        let movement_goal = bot.goal.and_then(Step::movement_goal);
+        let arrived = match bot.goal {
+            Some(Step::Walk(point)) => near_waypoint(point, position),
+            Some(Step::Swim(point)) => distance_squared(point, position) < WAYPOINT_RADIUS.powi(2),
+            _ => false,
+        };
         let stalled = check_progress
             && !arrived
             && bot.plan_origin.is_some_and(|origin| {
-                matches!(bot.goal, Some(Step::Walk(_)))
-                    && distance_squared(origin, position) < 24.0_f32.powi(2)
+                movement_goal.is_some() && distance_squared(origin, position) < 24.0_f32.powi(2)
             });
-        if stalled && let Some(Step::Walk(point)) = bot.goal {
-            bot.blocked_waypoint = Some((point, self.time + 3.5));
-        }
         let objective_changed = match (bot.navigation_objective, objective) {
             (Some(previous), Some(next)) => distance_squared(previous, next) > 125.0_f32.powi(2),
             (None, None) => false,
             _ => true,
         };
+        if objective_changed {
+            bot.last_waypoint = None;
+        }
+        if stalled && let Some(point) = movement_goal {
+            if fighter.walker.grounded
+                && self.time >= bot.route_jump_again_at
+                && let Some(jump) = navigation::Jump::probe(&map.collision, position, point)
+            {
+                bot.goal = Some(Step::Jump(jump));
+                bot.route_jump_again_at = self.time + 4.0;
+                return follow_transfer(map, fighter, self.time, dt).unwrap_or_default();
+            }
+            bot.avoid_waypoint(point, self.time + 6.0);
+        }
+        if arrived
+            && let Some(point) = movement_goal
+            && bot
+                .last_waypoint
+                .is_none_or(|last| distance_squared(last, point) > 32.0_f32.powi(2))
+        {
+            if let Some(last) = bot.last_waypoint.replace(point) {
+                bot.avoid_waypoint(last, self.time + 2.5);
+            }
+        }
         if arrived || stalled || objective_changed || (check_progress && bot.goal.is_none()) {
             bot.plan_origin = Some(position);
             bot.navigation_objective = objective;
-            let blocked = bot
-                .blocked_waypoint
-                .filter(|&(_, until)| self.time < until)
-                .map(|(point, _)| point);
-            let mut supplies: Vec<_> = map
-                .props
-                .iter()
-                .filter(|prop| {
-                    prop.visible
-                        && distance_squared(prop.position, position) > 42.0_f32.powi(2)
-                        && match prop.item {
-                            Some(Item::Health(_, max)) => fighter.health < max.min(80),
-                            Some(Item::Armor(kind)) => {
-                                fighter.armor[kind as usize] < kind.pickup_charge(&fighter.armor)
-                            }
-                            Some(Item::Power(power, charge)) => {
-                                fighter.power.wants(power, charge, self.time)
-                            }
-                            Some(Item::Gun(weapon)) => !fighter.inventory.owns(weapon),
-                            Some(Item::Ammo(weapon, _)) => {
-                                fighter.inventory.owns(weapon)
-                                    && fighter.inventory.ammo(weapon)
-                                        < super::max_ammo(&map.arsenal, weapon) / 3
-                            }
-                            _ => false,
-                        }
-                })
-                .map(|prop| prop.position)
-                .collect();
-            supplies.sort_by(|a, b| {
-                distance_squared(*a, position).total_cmp(&distance_squared(*b, position))
-            });
-            let chase = bot
-                .last_seen
-                .filter(|&(point, time)| {
-                    self.time - time < 3.0 && distance_squared(point, position) > 90.0_f32.powi(2)
-                })
-                .map(|(point, _)| point);
-            let supply = supplies
-                .into_iter()
-                .take(if stalled { 0 } else { 2 })
-                .find_map(|point| self.navigation.next_step(&map.collision, position, point));
-            let pursue = (!stalled)
-                .then_some(chase)
-                .flatten()
-                .and_then(|point| self.navigation.next_step(&map.collision, position, point));
-            let stocked = fighter
-                .inventory
-                .preferred_with_favorite(560.0, favorite)
-                .switch_priority()
-                > Weapon::Enforcer.switch_priority();
+            bot.blocked_waypoints
+                .retain(|&(_, until)| self.time < until);
+            let blocked = &bot.blocked_waypoints;
             let objective_step = objective.and_then(|point| {
                 self.navigation
                     .next_step_avoiding(&map.collision, position, point, blocked)
             });
-            bot.goal = objective_step.or(if stocked {
-                pursue.or(supply)
-            } else {
-                supply.or(pursue)
+            bot.goal = objective_step.or_else(|| {
+                if stalled {
+                    return None;
+                }
+                let mut supplies: Vec<_> = map
+                    .props
+                    .iter()
+                    .filter(|prop| {
+                        prop.visible
+                            && distance_squared(prop.position, position) > 42.0_f32.powi(2)
+                            && match prop.item {
+                                Some(Item::Health(_, max)) => fighter.health < max.min(80),
+                                Some(Item::Armor(kind)) => {
+                                    fighter.armor[kind as usize]
+                                        < kind.pickup_charge(&fighter.armor)
+                                }
+                                Some(Item::Power(power, charge)) => {
+                                    fighter.power.wants(power, charge, self.time)
+                                }
+                                Some(Item::Gun(weapon)) => !fighter.inventory.owns(weapon),
+                                Some(Item::Ammo(weapon, _)) => {
+                                    fighter.inventory.owns(weapon)
+                                        && fighter.inventory.ammo(weapon)
+                                            < super::max_ammo(&map.arsenal, weapon) / 3
+                                }
+                                _ => false,
+                            }
+                    })
+                    .map(|prop| prop.position)
+                    .collect();
+                supplies.sort_by(|a, b| {
+                    distance_squared(*a, position).total_cmp(&distance_squared(*b, position))
+                });
+                let chase = bot
+                    .last_seen
+                    .filter(|&(point, time)| {
+                        self.time - time < 3.0
+                            && distance_squared(point, position) > 90.0_f32.powi(2)
+                    })
+                    .map(|(point, _)| point);
+                let supply = supplies
+                    .into_iter()
+                    .take(2)
+                    .find_map(|point| self.navigation.next_step(&map.collision, position, point));
+                let pursue = chase
+                    .and_then(|point| self.navigation.next_step(&map.collision, position, point));
+                let stocked = fighter
+                    .inventory
+                    .preferred_with_favorite(560.0, favorite)
+                    .switch_priority()
+                    > Weapon::Enforcer.switch_priority();
+                if stocked {
+                    pursue.or(supply)
+                } else {
+                    supply.or(pursue)
+                }
             });
             if bot.goal.is_none() && (objective.is_some() || stalled) {
                 bot.goal = self
@@ -5072,9 +5125,36 @@ impl Match {
             return command;
         }
         if let Some(Step::Walk(goal)) = fighter.bot.goal {
+            let route = steer(fighter, goal, dt);
+            if let Some(mut fire) = fire_while_carrying {
+                let [forward, strafe] = route.movement;
+                let (sin, cos) = (fighter.yaw + route.look[0]).sin_cos();
+                let direction = Vec3(
+                    cos * forward - sin * strafe,
+                    sin * forward + cos * strafe,
+                    0.0,
+                );
+                fire.movement = movement_input(direction, fighter.yaw + fire.look[0]);
+                return fire;
+            }
+            return route;
+        }
+        if let Some(Step::Swim(goal)) = fighter.bot.goal {
+            if map.collision.regions.at(position).water {
+                let (yaw, pitch) = aim_error(goal - position, fighter.yaw, fighter.pitch);
+                let turn = 4.6 * dt;
+                return Command {
+                    look: [yaw.clamp(-turn, turn), pitch.clamp(-turn, turn)],
+                    movement: [0.8, 0.0],
+                    ..Command::default()
+                };
+            }
             return steer(fighter, goal, dt);
         }
         if self.rules.mode.team_based() {
+            if let Some(fire) = fire_while_carrying {
+                return fire;
+            }
             let limit = 1.8 * dt;
             let turn = objective.map_or(0.0, |point| {
                 aim_error(point - position, fighter.yaw, fighter.pitch)
@@ -5259,7 +5339,7 @@ fn try_retreat(
 fn follow_transfer(map: &Map, fighter: &mut Fighter, time: f32, dt: f32) -> Option<Command> {
     if fighter.bot.lift.is_none() {
         match fighter.bot.goal? {
-            Step::Walk(_) => return None,
+            Step::Walk(_) | Step::Swim(_) => return None,
             Step::Jump(maneuver) => {
                 if fighter.bot.jump_until.is_none() {
                     fighter.bot.jump_until = Some(time + 2.8);
@@ -5281,6 +5361,9 @@ fn follow_transfer(map: &Map, fighter: &mut Fighter, time: f32, dt: f32) -> Opti
                     false
                 };
                 fighter.bot.jump_until = None;
+                if !landed {
+                    fighter.bot.avoid_waypoint(maneuver.end, time + 6.0);
+                }
                 fighter.bot.goal = None;
                 fighter.bot.rethink_at = time + if landed { 0.0 } else { 0.4 };
                 return Some(Command::default());
@@ -9435,6 +9518,73 @@ mod tests {
                 && angle_delta(yaw_after, yaw_before).abs() < 0.001
         );
         assert!(bot.bot.goal.is_none());
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY data"]
+    fn audit_objective_bots() {
+        for (name, mode) in [
+            ("CTF-Face.unr", Mode::CaptureTheFlag),
+            ("CTF-Niven.unr", Mode::CaptureTheFlag),
+            ("CTF-Coret.unr", Mode::CaptureTheFlag),
+            ("AS-Frigate.unr", Mode::Assault),
+            ("AS-Overlord.unr", Mode::Assault),
+            ("AS-Guardia.unr", Mode::Assault),
+            ("DOM-Sesmar.unr", Mode::Domination),
+        ] {
+            let path = std::path::Path::new("local/reference-client/Maps").join(name);
+            let bytes = std::fs::read(&path).unwrap();
+            let mut map = Map::load(&Package::read(&bytes).unwrap(), Some(&path)).unwrap();
+            assert!(
+                !map.reach_links.is_empty(),
+                "{name} has no authored bot routes"
+            );
+            let mut game = Match::new(
+                &map,
+                0,
+                Rules {
+                    mode,
+                    bots: 5,
+                    frag_limit: 3,
+                    seconds: 120,
+                    ..Rules::default()
+                },
+            );
+            game.fighters[0].protected_until = f32::INFINITY;
+            let mut carried = 0;
+            let mut status = None;
+            let mut by_half = [0; 2];
+            for _ in 0..(120 * 220) {
+                game.step(&mut map, Command::default(), 1.0 / 120.0);
+                let current = game.flag_icon_states();
+                if current != status && current.is_some_and(|states| states.contains(&1)) {
+                    carried += 1;
+                }
+                status = current;
+                if let Some(round) = &game.assault {
+                    by_half[round.attack_team] = by_half[round.attack_team].max(round.completed());
+                }
+                if game.finished {
+                    break;
+                }
+            }
+            let deaths: u32 = game
+                .fighters
+                .iter()
+                .map(|fighter| u32::from(fighter.deaths))
+                .sum();
+            println!(
+                "{name}: finished={} time={:.1} scores={:?} carries={carried} forts={by_half:?} deaths={deaths}",
+                game.finished,
+                game.time,
+                game.team_scores()
+            );
+            match name {
+                "CTF-Coret.unr" => assert!(carried > 0, "bots must reach the enemy flag"),
+                "AS-Frigate.unr" => assert!(by_half.into_iter().any(|completed| completed >= 2)),
+                _ => {}
+            }
+        }
     }
 
     #[test]

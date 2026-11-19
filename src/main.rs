@@ -193,6 +193,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
         if command == "map-info" {
+            println!("{} usable authored navigation links", map.reach_links.len());
             if let Some(data) = &map.assault {
                 println!(
                     "{} Assault objectives, {} triggers, {} relays, {} seconds",
