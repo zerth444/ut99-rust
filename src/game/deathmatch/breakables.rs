@@ -167,10 +167,11 @@ impl Debris {
         data: &Effects,
         index: usize,
         time: f32,
+        position: Vec3,
         momentum: Vec3,
         size: f32,
     ) {
-        self.break_wall(data, index, time, momentum, Some(size));
+        self.break_wall(data, index, time, momentum, Some((position, size)));
     }
 
     fn break_wall(
@@ -179,7 +180,7 @@ impl Debris {
         index: usize,
         time: f32,
         momentum: Vec3,
-        decoration_size: Option<f32>,
+        decoration: Option<(Vec3, f32)>,
     ) -> Option<usize> {
         let state = &mut self.walls[index];
         if state.broken {
@@ -188,7 +189,7 @@ impl Debris {
         state.broken = true;
         let wall = &data.walls[index];
         self.sounds.push(index);
-        let location = wall.volume.position;
+        let location = decoration.map_or(wall.volume.position, |(position, _)| position);
         for (kind, material) in wall.materials.iter().enumerate() {
             if material.shapes.is_empty() || material.scale == 0.0 {
                 continue;
@@ -203,7 +204,7 @@ impl Debris {
                         random.2 * momentum.2,
                     ) * ((1.0 + roll(&mut self.rng)) * 0.0001)
                 } else {
-                    let extra = if decoration_size.is_some() {
+                    let extra = if decoration.is_some() {
                         momentum.dot(momentum).sqrt() / 80.0
                     } else {
                         wall.force
@@ -233,7 +234,7 @@ impl Debris {
                     wall: index,
                     material: kind,
                     model,
-                    scale: decoration_size.map_or(material.scale, |size| {
+                    scale: decoration.map_or(material.scale, |(_, size)| {
                         size * (0.5 + 0.7 * roll(&mut self.rng))
                     }),
                     position,

@@ -657,22 +657,23 @@ pub fn load(
         let faces = mesh_faces(&mut assets, &mut textures, object, visual, mesh, &vertices);
         if !faces.is_empty() {
             if dm_training && map.object_name(actor.class) == Some("Barrel") {
-                let mut health = 0;
-                if let Some(class) = class {
-                    let (package, export) = assets.object(class);
-                    let mut defaults = class_properties(package, export)?;
-                    while let Some((name, mut value)) = defaults.next()? {
-                        if name == "Health" {
-                            health = value.u32()? as i32;
+                let (mut health, mut pushable, mut fixed) = (0, false, false);
+                let mut read_rules = |mut properties: Properties<'_, '_>| -> io::Result<()> {
+                    while let Some(mut property) = properties.next_tag()? {
+                        match property.name {
+                            "Health" => health = property.value.u32()? as i32,
+                            "bPushable" => pushable = property.boolean.unwrap_or(false),
+                            "bStatic" => fixed = property.boolean.unwrap_or(false),
+                            _ => {}
                         }
                     }
+                    Ok(())
+                };
+                if let Some(class) = class {
+                    let (package, export) = assets.object(class);
+                    read_rules(class_properties(package, export)?)?;
                 }
-                let mut placement_health = map.properties(actor)?;
-                while let Some((name, mut value)) = placement_health.next()? {
-                    if name == "Health" {
-                        health = value.u32()? as i32;
-                    }
-                }
+                read_rules(map.properties(actor)?)?;
                 training_barrels.push(crate::game::deathmatch::dm_training::Barrel {
                     prop: props.len(),
                     volume: crate::assault::Volume {
@@ -681,6 +682,8 @@ pub fn load(
                         height: visual.collision_height.unwrap_or(30.0),
                     },
                     health,
+                    pushable,
+                    fixed,
                 });
             }
             let mut properties = map.properties(actor)?;
@@ -1876,6 +1879,17 @@ fn deathmatch_training(
     let mesh = Mesh::read(package, export).ok()?;
     let nali_idle = effect_motion(assets, textures, object, visual, &mesh, &["Breath"]);
     let nali_death = effect_motion(assets, textures, object, visual, &mesh, &["Dead"]);
+    let (package, export) = assets.object(nali);
+    let mut properties = class_properties(package, export).ok()?;
+    let mut death_sound = 0;
+    while let Some((name, mut value)) = properties.next().ok()? {
+        if name == "Die" {
+            death_sound = value.compact().ok()?;
+            break;
+        }
+    }
+    let nali_death_sound = assets.resolve(nali.package, death_sound);
+    let nali_death_sound = cached_wave(assets, waves, nali_death_sound);
     let mut debris = crate::assault::Effects {
         walls: barrels
             .iter()
@@ -1889,6 +1903,14 @@ fn deathmatch_training(
         waves,
         find_export(assets, "botpack", "RespawnSound2", "Sound"),
     );
+    let push_sounds = ["ObjectPush", "Endpush"].map(|name| {
+        cached_wave(
+            assets,
+            waves,
+            find_export(assets, "unrealshare", name, "Sound"),
+        )
+    });
+    let gibs = training_nali_gibs(assets, classes, textures, waves, nali, visual.scale);
     Some(Data {
         lessons,
         barrels,
@@ -1898,6 +1920,113 @@ fn deathmatch_training(
         nali_height: visual.collision_height.unwrap_or(43.0),
         debris,
         reveal_sound,
+        push_sounds,
+        nali_death_sound,
+        gibs,
+    })
+}
+
+fn training_nali_gibs(
+    assets: &mut Assets<'_>,
+    classes: &mut HashMap<Object, Appearance>,
+    textures: &mut HashMap<Object, Option<Arc<Texture>>>,
+    waves: &mut HashMap<Object, Option<Arc<Wave>>>,
+    nali: Object,
+    scale: f32,
+) -> Option<crate::game::deathmatch::dm_training::gibs::Art> {
+    use crate::game::deathmatch::dm_training::gibs::{Art, Part};
+    let (package, export) = assets.object(nali);
+    let mut defaults = class_properties(package, export).ok()?;
+    let (mut health, mut mass) = (100.0, 100.0);
+    while let Some((name, mut value)) = defaults.next().ok()? {
+        match name {
+            "Health" => health = value.u32().ok()? as i32 as f32,
+            "Mass" => mass = value.f32().ok()?,
+            _ => {}
+        }
+    }
+    let carcass = find_export(assets, "unrealshare", "NaliCarcass", "Class")?;
+    let (package, export) = assets.object(carcass);
+    let mut props = class_properties(package, export).ok()?;
+    let (mut refs, mut heights) = ([0; 8], [0.0; 8]);
+    let mut trails = [false; 8];
+    while let Some(property) = props.next_tag().ok()? {
+        let mut value = property.value;
+        let index = property.array_index;
+        if index < refs.len() {
+            if property.name.eq_ignore_ascii_case("bodyparts") {
+                refs[index] = value.compact().ok()?;
+            } else if property.name.eq_ignore_ascii_case("zoffset") {
+                heights[index] = value.f32().ok()?;
+            } else if property.name.eq_ignore_ascii_case("trails") {
+                trails[index] = value.f32().ok()? > 0.0;
+            }
+        }
+    }
+    let chunk = find_export(assets, "unrealshare", "CreatureChunks", "Class")?;
+    let chunk_visual = appearance(assets, classes, Some(chunk));
+    let master = find_export(assets, "unrealshare", "NaliMasterChunk", "Class");
+    let master = appearance(assets, classes, master);
+    let mut parts = Vec::new();
+    for (index, (reference, height)) in refs.into_iter().zip(heights).enumerate() {
+        let object = if index == 0 {
+            master
+                .mesh
+                .or_else(|| assets.resolve(carcass.package, reference))
+        } else {
+            assets.resolve(carcass.package, reference)
+        };
+        let Some(object) = object else { break };
+        let (package, export) = assets.object(object);
+        let mesh = Mesh::read(package, export).ok()?;
+        let vertices = effect_vertices(&mesh, mesh.frame(0)?, scale);
+        let faces = mesh_faces(assets, textures, object, chunk_visual, &mesh, &vertices);
+        parts.push(Part {
+            faces,
+            height,
+            trail: index != 0 && trails[index],
+        });
+    }
+    if parts.len() < 2 {
+        return None;
+    }
+    let mut effect = |name, clip| -> Option<Motion> {
+        let class = find_export(assets, "unrealshare", name, "Class")?;
+        let visual = appearance(assets, classes, Some(class));
+        let object = visual.mesh?;
+        let (package, export) = assets.object(object);
+        let mesh = Mesh::read(package, export).ok()?;
+        Some(effect_motion(
+            assets,
+            textures,
+            object,
+            visual,
+            &mesh,
+            &[clip],
+        ))
+    };
+    let mut spurt = effect("BloodSpurt", "GravSpray2").unwrap_or_default();
+    spurt.rate *= 0.9;
+    let trail = effect("BloodTrail", "Trail").unwrap_or_default();
+    let impacts = ["gibP1", "gibP3", "gibP4", "gibP5", "gibP6"].map(|name| {
+        cached_wave(
+            assets,
+            waves,
+            find_export(assets, "unrealshare", name, "Sound"),
+        )
+    });
+    Some(Art {
+        parts,
+        spurt,
+        trail,
+        impacts,
+        health,
+        mass,
+        collision: [
+            chunk_visual.collision_radius.unwrap_or(0.0),
+            chunk_visual.collision_height.unwrap_or(0.0),
+        ],
+        lifetime: chunk_visual.lifetime.filter(|time| *time > 0.0),
     })
 }
 

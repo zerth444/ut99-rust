@@ -459,8 +459,12 @@ impl Frame {
         );
         self.layer(Layer::World);
         let view = self.camera_view(camera);
-        for barrel in game.training_barrels(map) {
-            self.draw_faces_in_view(&barrel.faces, &view, game.time, false, None, None);
+        for (barrel, offset) in game.training_barrels(map) {
+            let model = View {
+                eye: view.eye - offset,
+                ..view
+            };
+            self.draw_faces_in_view(&barrel.faces, &model, game.time, false, None, None);
         }
         if let Some((position, pose)) = game.training_nali(map) {
             let model = view.in_model(position, Vec3(1.0, 0.0, 0.0), 1.0);
@@ -509,7 +513,9 @@ impl Frame {
         for visual in game.assault_effects(map) {
             self.draw_world_effect(&view, game.time, visual);
         }
-        for (origin, angles, scale, faces) in game.assault_debris(map) {
+        for (origin, angles, scale, faces) in
+            game.assault_debris(map).chain(game.training_gibs(map))
+        {
             if view.point(origin).2 + 24.0 * scale < NEAR {
                 continue;
             }
@@ -532,6 +538,10 @@ impl Frame {
                 None,
                 None,
             );
+        }
+        for (origin, direction, pose) in game.training_spurts(map) {
+            let model = view.in_model(origin, direction, 1.0);
+            self.draw_faces_in_view(pose.current, &model, game.time, false, Some(pose), None);
         }
         for (position, direction, faces) in game.turret_muzzles(map) {
             let model = view.in_model(position, direction, 1.0);

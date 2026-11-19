@@ -1153,7 +1153,7 @@ impl Match {
     pub(crate) fn training_barrels<'a>(
         &'a self,
         map: &'a Map,
-    ) -> impl Iterator<Item = &'a crate::props::Prop> + 'a {
+    ) -> impl Iterator<Item = (&'a crate::props::Prop, Vec3)> + 'a {
         self.dm_training
             .as_ref()
             .filter(|session| session.barrels_revealed)
@@ -1163,13 +1163,21 @@ impl Match {
                 data.barrels
                     .iter()
                     .zip(&session.barrels)
-                    .filter(|(_, health)| **health >= 0)
-                    .map(|(barrel, _)| &map.props[barrel.prop])
+                    .filter(|(_, state)| state.health >= 0)
+                    .map(|(barrel, state)| {
+                        (
+                            &map.props[barrel.prop],
+                            state.volume.position - barrel.volume.position,
+                        )
+                    })
             })
     }
 
     pub(crate) fn training_nali<'a>(&self, map: &'a Map) -> Option<(Vec3, Pose<'a>)> {
         let session = self.dm_training.as_ref()?;
+        if session.gibs.is_some() {
+            return None;
+        }
         let position = session.nali?;
         let data = map.dm_training.as_ref()?;
         let pose = if let Some(fell) = session.nali_died {
@@ -1179,6 +1187,33 @@ impl Match {
             data.nali_idle.sample(self.time % data.nali_idle.duration())
         }?;
         Some((position, pose))
+    }
+
+    pub(crate) fn training_gibs<'a>(
+        &'a self,
+        map: &'a Map,
+    ) -> impl Iterator<Item = (Vec3, Vec3, f32, &'a [crate::map::Face])> + 'a {
+        self.dm_training
+            .as_ref()
+            .and_then(|session| session.gibs.as_ref())
+            .zip(map.dm_training.as_ref().and_then(|data| data.gibs.as_ref()))
+            .into_iter()
+            .flat_map(|(gibs, art)| {
+                gibs.models(art)
+                    .map(|(position, rotation, faces)| (position, rotation, 1.0, faces))
+            })
+    }
+
+    pub(crate) fn training_spurts<'a>(
+        &'a self,
+        map: &'a Map,
+    ) -> impl Iterator<Item = (Vec3, Vec3, Pose<'a>)> + 'a {
+        self.dm_training
+            .as_ref()
+            .and_then(|session| session.gibs.as_ref())
+            .zip(map.dm_training.as_ref().and_then(|data| data.gibs.as_ref()))
+            .into_iter()
+            .flat_map(move |(gibs, art)| gibs.spurts(art, self.time))
     }
 
     pub fn tutorial_subtitle<'a>(&self, map: &'a Map) -> Option<&'a str> {
@@ -2072,6 +2107,9 @@ impl Match {
                 }
                 _ => {}
             }
+        }
+        if let Some(training) = &mut self.dm_training {
+            training.move_barrels(map, &mut self.fighters, self.time, dt, &mut sounds);
         }
         self.separate_fighters(map);
         self.collect(map, &mut sounds);
@@ -3545,6 +3583,7 @@ impl Match {
                         self.time,
                         unit(bolt.velocity)
                             * art.momentum.unwrap_or(f32::from(payload.damage) * 3.4),
+                        art.damage_type.as_deref().unwrap_or(""),
                     );
                     sounds.extend_at(
                         art.contact.iter().cloned(),
@@ -4268,7 +4307,7 @@ impl Match {
             {
                 let momentum =
                     self.fighters[owner].camera(map).look_direction() * (f32::from(damage) * 3.4);
-                training.damage(data, index, damage, self.time, momentum);
+                training.damage(data, index, damage, self.time, momentum, damage_type);
             }
             return;
         }
@@ -4304,7 +4343,7 @@ impl Match {
                 })
                 .collect();
             for (index, damage, impulse) in impacts {
-                training.damage(data, index, damage, self.time, impulse);
+                training.damage(data, index, damage, self.time, impulse, damage_type);
             }
         }
         let Some((round, data)) = self.assault.as_mut().zip(map.assault.as_ref()) else {
@@ -5753,6 +5792,16 @@ mod tests {
                 .any(|face| face.texture.is_some())
         );
         assert!(!data.nali_death.frames.is_empty());
+        let gib_art = data.gibs.as_ref().expect("stock NaliCarcass body parts");
+        let gib_count = gib_art.parts.len();
+        assert!(gib_count >= 5);
+        assert!(
+            gib_art
+                .parts
+                .iter()
+                .all(|part| part.faces.iter().any(|face| face.texture.is_some()))
+        );
+        assert!(!gib_art.spurt.frames.is_empty());
         let audio: Vec<_> = data
             .lessons
             .iter()
@@ -5823,6 +5872,25 @@ mod tests {
             );
             assert!(!game.dm_tutorial_subtitle(&map).unwrap().is_empty());
             assert_eq!(game.fighters.len(), 1);
+            if index == 20 {
+                assert_eq!(game.training_gibs(&map).count(), gib_count);
+                assert!(game.training_nali(&map).is_none());
+                assert!(game.training_spurts(&map).next().is_some());
+                let effect_vertices = |game: &Match| {
+                    use crate::render::{Frame, commands::Layer};
+                    let mut frame = Frame::hardware(&map);
+                    let view = game.render_view(&map, 1.0, 0.0);
+                    frame.draw_deathmatch(&map, &view, game, 90.0, 1.0, false);
+                    frame.commands.as_ref().unwrap().passes[Layer::Effects as usize]
+                        .batches()
+                        .map(|(_, vertices)| vertices.len())
+                        .sum::<usize>()
+                };
+                let with_gibs = effect_vertices(&game);
+                let gibs = game.dm_training.as_mut().unwrap().gibs.take();
+                assert!(with_gibs > effect_vertices(&game));
+                game.dm_training.as_mut().unwrap().gibs = gibs;
+            }
             if index == 13 {
                 for _ in 0..200 {
                     game.step(&mut map, Command::default(), dt);
@@ -5880,6 +5948,95 @@ mod tests {
         assert_eq!(settings.deathmatch_progress, 0);
         assert_eq!(settings.ladder_progress(mode), 1);
         assert!(frontend.load_ladder(mode, 1).unwrap().dm_training.is_none());
+    }
+
+    #[test]
+    #[ignore = "requires the local reference-client map installation"]
+    fn training_barrel_moves_on_bump_and_shot_then_breaks_at_its_current_position() {
+        let path = std::path::Path::new("local/reference-client/Maps/DM-Tutorial.unr");
+        let bytes = std::fs::read(path).unwrap();
+        let mut map = Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap();
+        map.collision = crate::collision::Collision::test_world();
+        map.collision
+            .add_box(Vec3(-400.0, -400.0, -80.0), Vec3(400.0, 400.0, 0.0));
+        let data = map.dm_training.as_ref().unwrap();
+        let index = data
+            .barrels
+            .iter()
+            .position(|barrel| barrel.pushable && !barrel.fixed && barrel.health > 0)
+            .expect("stock pushable barrel with health");
+        let push = data.push_sounds[0].clone().unwrap();
+        let height = data.barrels[index].volume.height;
+        let radius = data.barrels[index].volume.radius;
+        let mut game = Match::new(&map, 0, Rules::default());
+        let session = game.dm_training.as_mut().unwrap();
+        session.barrels_revealed = true;
+        let original = Vec3(0.0, 0.0, height + 0.2);
+        session.barrels[index].volume.position = original;
+        let player = &mut game.fighters[0];
+        player.walker = Walker::spawn(
+            &map.collision,
+            Vec3(-radius - PLAYER_RADIUS - 5.0, 0.0, PLAYER_HEIGHT + 0.2),
+        );
+        player.yaw = 0.0;
+        let mut pushed = false;
+        for _ in 0..35 {
+            let events = game.step(
+                &mut map,
+                Command {
+                    movement: [1.0, 0.0],
+                    ..Command::default()
+                },
+                1.0 / 120.0,
+            );
+            pushed |= events
+                .waves()
+                .any(|wave| std::sync::Arc::ptr_eq(wave, &push));
+        }
+        let moved = game.dm_training.as_ref().unwrap().barrels[index]
+            .volume
+            .position;
+        assert!(moved.0 > 5.0 && pushed, "{moved:?}, push sound {pushed}");
+
+        game.fighters[0].walker.position = Vec3(-250.0, -150.0, PLAYER_HEIGHT + 0.2);
+        let session = game.dm_training.as_mut().unwrap();
+        session.damage(
+            map.dm_training.as_ref().unwrap(),
+            index + 1,
+            1,
+            game.time,
+            Vec3(0.0, 5000.0, 0.0),
+            "shot",
+        );
+        game.step(&mut map, Command::default(), 1.0 / 120.0);
+        let position = game.dm_training.as_ref().unwrap().barrels[index]
+            .volume
+            .position;
+        assert!(position.1 > moved.1);
+        assert!(
+            game.objective_target(
+                &map,
+                0,
+                position - Vec3(80.0, 0.0, 0.0),
+                Vec3(160.0, 0.0, 0.0)
+            )
+            .is_some_and(|(_, target)| target == crate::assault::Target::Training(index + 1))
+        );
+        game.damage_objective(
+            &map,
+            0,
+            crate::assault::Target::Training(index + 1),
+            1000,
+            "shot",
+        );
+        assert_eq!(game.training_barrels(&map).count(), 2);
+        let chunks = game.assault_debris(&map).collect::<Vec<_>>();
+        assert_eq!(chunks.len(), 12);
+        assert!(
+            chunks
+                .iter()
+                .all(|(orig, _, _, _)| distance_squared(*orig, position) < 0.01)
+        );
     }
 
     #[cfg(windows)]
