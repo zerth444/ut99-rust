@@ -579,6 +579,7 @@ struct Bot {
     plan_origin: Option<Vec3>,
     blocked_waypoints: Vec<(Vec3, f32)>,
     last_waypoint: Option<Vec3>,
+    wall_detour: Vec<Vec3>,
     navigation_objective: Option<Vec3>,
     retreat: Option<Retreat>,
     retreat_retry_at: f32,
@@ -598,7 +599,7 @@ impl Bot {
     fn avoid_waypoint(&mut self, point: Vec3, until: f32) {
         self.blocked_waypoints
             .retain(|&(failed, _)| distance_squared(point, failed) >= WAYPOINT_RADIUS.powi(2));
-        if self.blocked_waypoints.len() == 5 {
+        if self.blocked_waypoints.len() == 12 {
             self.blocked_waypoints.remove(0);
         }
         self.blocked_waypoints.push((point, until));
@@ -2207,6 +2208,7 @@ impl Match {
                 fighter.airborne_since = None;
                 fighter.power.boosted_airborne = false;
                 fighter.bot.goal = None;
+                fighter.bot.wall_detour.clear();
                 fighter.bot.lift = None;
                 fighter.bot.jump_until = None;
                 fighter.bot.rethink_at = self.time;
@@ -4644,7 +4646,13 @@ impl Match {
                     .map(|index| (&data.forts[index], fighter.team == Some(round.attack_team)))
             });
         let objective = assault
-            .map(|(fort, _)| fort.destination)
+            .map(|(fort, attacking)| {
+                if attacking && fort.touch {
+                    fort.volume.position
+                } else {
+                    fort.destination
+                }
+            })
             .or_else(|| self.objectives.destination(&self.fighters, id));
         let carrying_flag = self.objectives.carries_flag(id);
         if let Some((fort, true)) = assault
@@ -5000,7 +5008,10 @@ impl Match {
         let stalled = check_progress
             && !arrived
             && bot.plan_origin.is_some_and(|origin| {
-                movement_goal.is_some() && distance_squared(origin, position) < 24.0_f32.powi(2)
+                movement_goal.is_some_and(|goal| {
+                    distance_squared(origin, goal).sqrt() - distance_squared(position, goal).sqrt()
+                        < 18.0
+                })
             });
         let objective_changed = match (bot.navigation_objective, objective) {
             (Some(previous), Some(next)) => distance_squared(previous, next) > 125.0_f32.powi(2),
@@ -5009,8 +5020,18 @@ impl Match {
         };
         if objective_changed {
             bot.last_waypoint = None;
+            bot.wall_detour.clear();
         }
         if stalled && let Some(point) = movement_goal {
+            if fighter.walker.grounded
+                && let Some(mut route) =
+                    navigation::walk_around_wall(&map.collision, position, point)
+            {
+                route.reverse();
+                bot.wall_detour = route;
+                bot.rethink_at = self.time + 3.0;
+                return follow_transfer(map, fighter, self.time, dt).unwrap_or_default();
+            }
             if fighter.walker.grounded
                 && self.time >= bot.route_jump_again_at
                 && let Some(jump) = navigation::Jump::probe(&map.collision, position, point)
@@ -5019,7 +5040,7 @@ impl Match {
                 bot.route_jump_again_at = self.time + 4.0;
                 return follow_transfer(map, fighter, self.time, dt).unwrap_or_default();
             }
-            bot.avoid_waypoint(point, self.time + 6.0);
+            bot.avoid_waypoint(point, self.time + 18.0);
         }
         if arrived
             && let Some(point) = movement_goal
@@ -5037,10 +5058,27 @@ impl Match {
             bot.blocked_waypoints
                 .retain(|&(_, until)| self.time < until);
             let blocked = &bot.blocked_waypoints;
-            let objective_step = objective.and_then(|point| {
-                self.navigation
-                    .next_step_avoiding(&map.collision, position, point, blocked)
-            });
+            let objective_step = objective
+                .and_then(|point| {
+                    self.navigation
+                        .next_step_avoiding(&map.collision, position, point, blocked)
+                })
+                .or_else(|| {
+                    assault.and_then(|(fort, attacking)| {
+                        (attacking
+                            && fort.touch
+                            && distance_squared(fort.destination, fort.volume.position) > 1.0)
+                            .then(|| {
+                                self.navigation.next_step_avoiding(
+                                    &map.collision,
+                                    position,
+                                    fort.destination,
+                                    blocked,
+                                )
+                            })
+                            .flatten()
+                    })
+                });
             bot.goal = objective_step.or_else(|| {
                 if stalled {
                     return None;
@@ -5337,6 +5375,27 @@ fn try_retreat(
 }
 
 fn follow_transfer(map: &Map, fighter: &mut Fighter, time: f32, dt: f32) -> Option<Command> {
+    if let Some(&point) = fighter.bot.wall_detour.last() {
+        if time < fighter.bot.rethink_at {
+            let next = if near_waypoint(point, fighter.walker.position) {
+                fighter.bot.wall_detour.pop();
+                fighter.bot.rethink_at = time + 3.0;
+                fighter.bot.wall_detour.last().copied()
+            } else {
+                Some(point)
+            };
+            if let Some(next) = next {
+                return Some(steer(fighter, next, dt));
+            }
+        } else {
+            fighter
+                .bot
+                .avoid_waypoint(fighter.bot.wall_detour[0], time + 18.0);
+            fighter.bot.wall_detour.clear();
+        }
+        fighter.bot.goal = None;
+        fighter.bot.rethink_at = time;
+    }
     if fighter.bot.lift.is_none() {
         match fighter.bot.goal? {
             Step::Walk(_) | Step::Swim(_) => return None,
@@ -5362,7 +5421,7 @@ fn follow_transfer(map: &Map, fighter: &mut Fighter, time: f32, dt: f32) -> Opti
                 };
                 fighter.bot.jump_until = None;
                 if !landed {
-                    fighter.bot.avoid_waypoint(maneuver.end, time + 6.0);
+                    fighter.bot.avoid_waypoint(maneuver.end, time + 18.0);
                 }
                 fighter.bot.goal = None;
                 fighter.bot.rethink_at = time + if landed { 0.0 } else { 0.4 };
@@ -9554,7 +9613,8 @@ mod tests {
             let mut carried = 0;
             let mut status = None;
             let mut by_half = [0; 2];
-            for _ in 0..(120 * 220) {
+            let seconds = if mode == Mode::Assault { 240 } else { 220 };
+            for _ in 0..(120 * seconds) {
                 game.step(&mut map, Command::default(), 1.0 / 120.0);
                 let current = game.flag_icon_states();
                 if current != status && current.is_some_and(|states| states.contains(&1)) {
@@ -9580,8 +9640,16 @@ mod tests {
                 game.team_scores()
             );
             match name {
-                "CTF-Coret.unr" => assert!(carried > 0, "bots must reach the enemy flag"),
-                "AS-Frigate.unr" => assert!(by_half.into_iter().any(|completed| completed >= 2)),
+                "CTF-Coret.unr" => assert!(
+                    carried > 0
+                        && game.finished
+                        && game
+                            .team_scores()
+                            .unwrap()
+                            .into_iter()
+                            .any(|score| score > 0)
+                ),
+                "AS-Frigate.unr" => assert_eq!((game.finished, by_half), (true, [3, 3])),
                 _ => {}
             }
         }

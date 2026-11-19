@@ -550,3 +550,100 @@ pub(super) fn walk_link(world: &Collision, from: Vec3, to: Vec3) -> bool {
                 .is_some()
     })
 }
+
+pub(super) fn walk_around_wall(world: &Collision, from: Vec3, to: Vec3) -> Option<Vec<Vec3>> {
+    use crate::collision::{PLAYER_HEIGHT, PLAYER_RADIUS};
+    const SIDE: usize = 29;
+    const SPACING: f32 = 24.0;
+    let delta = to - from;
+    let horizontal = Vec3(delta.0, delta.1, 0.0);
+    if delta.2.abs() > world.profile.step_height + 16.0
+        || !(30.0_f32.powi(2)..=320.0_f32.powi(2)).contains(&horizontal.dot(horizontal))
+    {
+        return None;
+    }
+    let (hit, normal, _) =
+        world.projectile_contact(from, horizontal, PLAYER_RADIUS, PLAYER_HEIGHT)?;
+    if normal.2.abs() >= 0.25 || distance_squared(from, hit) > 70.0_f32.powi(2) {
+        return None;
+    }
+    let clear = |a: Vec3, b: Vec3| {
+        let delta = b - a;
+        world
+            .projectile_surface(a, Vec3(delta.0, delta.1, 0.0), PLAYER_RADIUS, PLAYER_HEIGHT)
+            .is_none()
+            && walk_link(world, a, b)
+    };
+    let point = |id: usize| {
+        let middle = (SIDE / 2) as f32;
+        from + Vec3(
+            (id % SIDE) as f32 - middle,
+            (id / SIDE) as f32 - middle,
+            0.0,
+        ) * SPACING
+    };
+    let start = (SIDE * SIDE) / 2;
+    let mut costs = [f32::INFINITY; SIDE * SIDE];
+    let mut parents = [None; SIDE * SIDE];
+    let mut queue = BinaryHeap::new();
+    costs[start] = 0.0;
+    queue.push(RouteCandidate {
+        id: start,
+        cost: distance_squared(from, to).sqrt(),
+    });
+    while let Some(RouteCandidate { id, cost }) = queue.pop() {
+        let here = point(id);
+        let remaining = distance_squared(here, to).sqrt();
+        if cost > costs[id] + remaining {
+            continue;
+        }
+        if id != start && remaining <= 112.0 && clear(here, to) {
+            let mut path = vec![to, here];
+            let mut parent = parents[id];
+            while let Some(index) = parent.filter(|&index| index != start) {
+                path.push(point(index));
+                parent = parents[index];
+            }
+            let mut route = Vec::new();
+            let mut origin = from;
+            while let Some(next) = path.pop() {
+                if path.last().is_some_and(|&after| clear(origin, after)) {
+                    continue;
+                }
+                route.push(next);
+                origin = next;
+            }
+            return Some(route);
+        }
+        let (x, y) = (id % SIDE, id / SIDE);
+        for (dx, dy) in [
+            (-1, -1),
+            (-1, 0),
+            (-1, 1),
+            (0, -1),
+            (0, 1),
+            (1, -1),
+            (1, 0),
+            (1, 1),
+        ] {
+            let (Some(x), Some(y)) = (x.checked_add_signed(dx), y.checked_add_signed(dy)) else {
+                continue;
+            };
+            if x >= SIDE || y >= SIDE {
+                continue;
+            }
+            let next = y * SIDE + x;
+            let there = point(next);
+            let distance = costs[id] + distance_squared(here, there).sqrt();
+            if distance < costs[next] && world.player_fits(there) && clear(here, there) {
+                costs[next] = distance;
+                parents[next] = Some(id);
+                queue.push(RouteCandidate {
+                    id: next,
+                    cost: distance + distance_squared(there, to).sqrt(),
+                });
+            }
+        }
+    }
+    None
+}
