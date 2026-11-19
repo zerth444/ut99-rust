@@ -220,6 +220,7 @@ unsafe fn message_loop(
     let mut match_clock = deathmatch::Timestep::default();
     let mut advance_ladder = false;
     let mut ladder_error = false;
+    let mut training_bindings = None;
 
     unsafe {
         loop {
@@ -311,6 +312,7 @@ unsafe fn message_loop(
                                         return Ok(());
                                     }
                                     if action == Action::LeaveMatch {
+                                        training_bindings = None;
                                         ladder_stage = None;
                                         advance_ladder = false;
                                         ladder_error = false;
@@ -621,6 +623,7 @@ unsafe fn message_loop(
                         ));
                         ladder_stage = Some((mode, next));
                         ladder_error = false;
+                        training_bindings = None;
                         frame = Frame::hardware(map);
                         if let Some(audio) = &mut audio {
                             audio.keep_bio_charges(|_| false);
@@ -669,6 +672,10 @@ unsafe fn message_loop(
                 let jump_pressed = std::mem::take(&mut jump);
                 let dodge_key = dodge.take();
                 if active {
+                    if game.training_deathmatch() && training_bindings != Some(settings.bindings) {
+                        game.set_training_keys(crate::frontend::training_keys(settings));
+                        training_bindings = Some(settings.bindings);
+                    }
                     let (dx, dy) = if mouse.captured {
                         mouse.motion(raw)
                     } else {

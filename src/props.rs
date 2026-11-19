@@ -416,6 +416,7 @@ pub struct Scene {
     pub zones: Vec<crate::movement::Zone>,
     pub powerups: crate::game::PowerupArt,
     pub liquid_audio: Vec<[Option<Arc<Wave>>; 2]>,
+    pub dm_training: Option<crate::game::deathmatch::dm_training::Data>,
 }
 
 pub fn load(
@@ -433,6 +434,9 @@ pub fn load(
         && path
             .file_stem()
             .is_some_and(|stem| stem.eq_ignore_ascii_case("AS-Tutorial"));
+    let dm_training = path
+        .file_stem()
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("DM-Tutorial"));
     let mut packages: Vec<_> = [
         ("../System", "u"),
         ("../Textures", "utx"),
@@ -465,6 +469,7 @@ pub fn load(
                 | "soldierskins"
                 | "ladrstatic"
         ) && !(training && name == "tutvoiceas")
+            && !(dm_training && name == "tutvoicedm")
             && !map.imports.iter().any(|import| {
                 import.outer == 0 && map.names[import.name].eq_ignore_ascii_case(&name)
             })
@@ -592,6 +597,7 @@ pub fn load(
         }
     }
     let mut props = Vec::new();
+    let mut training_barrels = Vec::new();
     for &actor in actors {
         let item = map.object_name(actor.class).and_then(Item::from_class);
         let class = assets.resolve(0, actor.class);
@@ -650,6 +656,33 @@ pub fn load(
             .sqrt();
         let faces = mesh_faces(&mut assets, &mut textures, object, visual, mesh, &vertices);
         if !faces.is_empty() {
+            if dm_training && map.object_name(actor.class) == Some("Barrel") {
+                let mut health = 0;
+                if let Some(class) = class {
+                    let (package, export) = assets.object(class);
+                    let mut defaults = class_properties(package, export)?;
+                    while let Some((name, mut value)) = defaults.next()? {
+                        if name == "Health" {
+                            health = value.u32()? as i32;
+                        }
+                    }
+                }
+                let mut placement_health = map.properties(actor)?;
+                while let Some((name, mut value)) = placement_health.next()? {
+                    if name == "Health" {
+                        health = value.u32()? as i32;
+                    }
+                }
+                training_barrels.push(crate::game::deathmatch::dm_training::Barrel {
+                    prop: props.len(),
+                    volume: crate::assault::Volume {
+                        position: placement.location,
+                        radius: visual.collision_radius.unwrap_or(30.0),
+                        height: visual.collision_height.unwrap_or(30.0),
+                    },
+                    health,
+                });
+            }
             let mut properties = map.properties(actor)?;
             let mut tag = None;
             while let Some((name, mut value)) = properties.next()? {
@@ -1135,6 +1168,23 @@ pub fn load(
             find_export(&assets, "announcer", name, "Sound"),
         )
     });
+    let dm_training = dm_training
+        .then(|| {
+            deathmatch_training(
+                &mut assets,
+                &mut class_cache,
+                &mut textures,
+                &mut waves,
+                folder,
+                training_barrels,
+            )
+        })
+        .flatten();
+    if let Some(training) = &dm_training {
+        for barrel in &training.barrels {
+            props[barrel.prop].visible = false;
+        }
+    }
     Ok(Scene {
         props,
         arsenal,
@@ -1150,6 +1200,7 @@ pub fn load(
         zones,
         powerups,
         liquid_audio,
+        dm_training,
     })
 }
 
@@ -1743,6 +1794,111 @@ fn assault_briefing(
                 .then_some(crate::assault::ObjectivePage { description, image })
         })
         .collect())
+}
+
+fn deathmatch_training(
+    assets: &mut Assets<'_>,
+    classes: &mut HashMap<Object, Appearance>,
+    textures: &mut HashMap<Object, Option<Arc<Texture>>>,
+    waves: &mut HashMap<Object, Option<Arc<Wave>>>,
+    folder: &Path,
+    barrels: Vec<crate::game::deathmatch::dm_training::Barrel>,
+) -> Option<crate::game::deathmatch::dm_training::Data> {
+    use crate::game::deathmatch::dm_training::{Data, Lesson};
+    if barrels.is_empty() {
+        return None;
+    }
+    let class = find_export(assets, "botpack", "TrainingDM", "Class")?;
+    let (package, export) = assets.object(class);
+    let mut props = class_properties(package, export).ok()?;
+    let mut voices: [String; 24] = Default::default();
+    let mut texts: [String; 24] = Default::default();
+    let mut parts: HashMap<String, String> = HashMap::new();
+    while let Some(prop) = props.next_tag().ok()? {
+        let mut value = prop.value;
+        match prop.name {
+            "DM" if prop.array_index < voices.len() => {
+                voices[prop.array_index] = value.string(package.version).ok()?;
+            }
+            "TutMessage" if prop.array_index < texts.len() => {
+                texts[prop.array_index] = value.string(package.version).ok()?;
+            }
+            name if name.starts_with("TutMessage") && name.ends_with("Parts") => {
+                parts.insert(
+                    format!("{}[{}]", name.to_ascii_lowercase(), prop.array_index),
+                    value.string(package.version).ok()?,
+                );
+            }
+            _ => {}
+        }
+    }
+    parts.extend(localized_section(folder, "Botpack.int", "TrainingDM"));
+    for (index, text) in texts.iter_mut().enumerate() {
+        if let Some(localized) = parts.get(&format!("tutmessage[{index}]")) {
+            *text = localized.clone();
+        }
+    }
+    for (index, keys) in [
+        (4, &[0, 1, 2, 3][..]),
+        (6, &[4][..]),
+        (14, &[5][..]),
+        (15, &[6][..]),
+    ] {
+        let segments = (0..=keys.len())
+            .map(|part| parts.get(&format!("tutmessage{index}parts[{part}]")))
+            .collect::<Option<Vec<_>>>();
+        if let Some(segments) = segments {
+            let mut text = segments[0].clone();
+            for (&key, part) in keys.iter().zip(segments.into_iter().skip(1)) {
+                let join = if part.starts_with(',') { "" } else { " " };
+                text.push_str(&format!(" [{{{key}}}]{join}{part}"));
+            }
+            texts[index] = text;
+        }
+    }
+    let lessons = voices
+        .into_iter()
+        .zip(texts)
+        .map(|(voice, text)| {
+            let (package, _) = voice.split_once('.')?;
+            let name = voice.rsplit('.').next()?;
+            let sound = find_export(assets, &package.to_ascii_lowercase(), name, "Sound");
+            Some(Lesson {
+                text,
+                audio: cached_wave(assets, waves, sound)?,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let nali = find_export(assets, "unrealshare", "Nali", "Class")?;
+    let visual = appearance(assets, classes, Some(nali));
+    let object = visual.mesh?;
+    let (package, export) = assets.object(object);
+    let mesh = Mesh::read(package, export).ok()?;
+    let nali_idle = effect_motion(assets, textures, object, visual, &mesh, &["Breath"]);
+    let nali_death = effect_motion(assets, textures, object, visual, &mesh, &["Dead"]);
+    let mut debris = crate::assault::Effects {
+        walls: barrels
+            .iter()
+            .map(|barrel| crate::assault::Breakable::wooden_barrel(barrel.volume))
+            .collect(),
+        ..Default::default()
+    };
+    breakable_art(assets, classes, textures, waves, &mut debris).ok()?;
+    let reveal_sound = cached_wave(
+        assets,
+        waves,
+        find_export(assets, "botpack", "RespawnSound2", "Sound"),
+    );
+    Some(Data {
+        lessons,
+        barrels,
+        nali_idle,
+        nali_death,
+        nali_radius: visual.collision_radius.unwrap_or(18.0),
+        nali_height: visual.collision_height.unwrap_or(43.0),
+        debris,
+        reveal_sound,
+    })
 }
 
 fn assault_tutorial(

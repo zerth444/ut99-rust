@@ -459,6 +459,23 @@ impl Frame {
         );
         self.layer(Layer::World);
         let view = self.camera_view(camera);
+        for barrel in game.training_barrels(map) {
+            self.draw_faces_in_view(&barrel.faces, &view, game.time, false, None, None);
+        }
+        if let Some((position, pose)) = game.training_nali(map) {
+            let model = view.in_model(position, Vec3(1.0, 0.0, 0.0), 1.0);
+            self.draw_lit_faces(
+                pose.current,
+                &model,
+                game.time,
+                false,
+                Some(pose),
+                None,
+                &map.scene_lights,
+                None,
+                None,
+            );
+        }
         for (origin, direction, base, pose, rise) in game.turret_models(map) {
             self.draw_turret(map, &view, game.time, origin, direction, base, pose, rise);
         }
@@ -669,7 +686,7 @@ impl Frame {
         }
         self.zoom = 1.0;
         self.roll = 0.0;
-        if player.health > 0 && !game.finished && end_camera.is_none() {
+        if player.health > 0 && player.has_weapon() && !game.finished && end_camera.is_none() {
             if !player.zoomed()
                 && !piloting
                 && let Some(weapon) = map.arsenal.get(&player.weapon)

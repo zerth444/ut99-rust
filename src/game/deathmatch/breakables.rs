@@ -17,6 +17,7 @@ struct Fragment {
     wall: usize,
     material: usize,
     model: usize,
+    scale: f32,
     position: Vec3,
     velocity: Vec3,
     rotation: Vec3,
@@ -105,6 +106,7 @@ impl Debris {
                     index,
                     time,
                     rotate(Vec3(1.0, 0.0, 0.0), wall.rotation),
+                    None,
                 )
             })
             .collect()
@@ -127,7 +129,7 @@ impl Debris {
         if wall.health > 0 {
             return None;
         }
-        self.break_wall(data, index, time, momentum)
+        self.break_wall(data, index, time, momentum, None)
     }
 
     pub fn blast(
@@ -160,12 +162,24 @@ impl Debris {
             .collect()
     }
 
+    pub fn break_decoration(
+        &mut self,
+        data: &Effects,
+        index: usize,
+        time: f32,
+        momentum: Vec3,
+        size: f32,
+    ) {
+        self.break_wall(data, index, time, momentum, Some(size));
+    }
+
     fn break_wall(
         &mut self,
         data: &Effects,
         index: usize,
         time: f32,
         momentum: Vec3,
+        decoration_size: Option<f32>,
     ) -> Option<usize> {
         let state = &mut self.walls[index];
         if state.broken {
@@ -189,7 +203,12 @@ impl Debris {
                         random.2 * momentum.2,
                     ) * ((1.0 + roll(&mut self.rng)) * 0.0001)
                 } else {
-                    direction(&mut self.rng) * (wall.force + roll(&mut self.rng) * 150.0 + 100.0)
+                    let extra = if decoration_size.is_some() {
+                        momentum.dot(momentum).sqrt() / 80.0
+                    } else {
+                        wall.force
+                    };
+                    direction(&mut self.rng) * (extra + roll(&mut self.rng) * 150.0 + 100.0)
                         + Vec3(0.0, 0.0, if kind == 1 { wall.force * 0.5 } else { 0.0 })
                 };
                 let model = ((roll(&mut self.rng) * material.shapes.len() as f32) as usize)
@@ -214,6 +233,9 @@ impl Debris {
                     wall: index,
                     material: kind,
                     model,
+                    scale: decoration_size.map_or(material.scale, |size| {
+                        size * (0.5 + 0.7 * roll(&mut self.rng))
+                    }),
                     position,
                     velocity,
                     rotation: Vec3::default(),
@@ -331,7 +353,7 @@ impl Debris {
             (
                 fragment.position,
                 fragment.rotation,
-                material.scale,
+                fragment.scale,
                 material.shapes[fragment.model].as_slice(),
             )
         })
@@ -365,6 +387,7 @@ mod tests {
             wall: 0,
             material: 0,
             model: 0,
+            scale: 1.0,
             position: Vec3(100.0, 0.0, 0.0),
             velocity: Vec3::default(),
             rotation: Vec3::default(),

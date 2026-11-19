@@ -51,6 +51,28 @@ impl FragmentMaterial {
 }
 
 impl Breakable {
+    pub(crate) fn wooden_barrel(volume: Volume) -> Self {
+        Self {
+            volume,
+            rotation: Vec3::default(),
+            tag: None,
+            event: None,
+            health: 0,
+            damage_types: Default::default(),
+            trigger_only: false,
+            projectile_target: true,
+            force: 0.0,
+            spread: 0.0,
+            materials: [
+                FragmentMaterial::new(0),
+                FragmentMaterial::new(12),
+                FragmentMaterial::new(0),
+            ],
+            sound_ref: 0,
+            sound: None,
+        }
+    }
+
     pub fn read(package: &Package<'_>, actor: &Export) -> io::Result<Self> {
         let mut data = Self {
             volume: Volume {

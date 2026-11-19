@@ -226,12 +226,16 @@ impl Mover {
     }
 
     pub(crate) fn signal(&mut self, tag: usize, attacker: bool) {
-        if self.tag != Some(tag)
-            || !matches!(
-                self.activation,
-                Activation::Trigger | Activation::Control | Activation::Toggle
-            )
-            || (self.trigger_once && self.signaled.is_some())
+        if self.tag == Some(tag) {
+            self.trigger(attacker);
+        }
+    }
+
+    pub(crate) fn trigger(&mut self, attacker: bool) {
+        if !matches!(
+            self.activation,
+            Activation::Trigger | Activation::Control | Activation::Toggle
+        ) || (self.trigger_once && self.signaled.is_some())
         {
             return;
         }

@@ -416,6 +416,7 @@ impl Round {
             return;
         }
         match target {
+            Target::Training(_) => {}
             Target::Wall(index) => {
                 if let Some(event) = self.debris.strike(
                     &data.effects,

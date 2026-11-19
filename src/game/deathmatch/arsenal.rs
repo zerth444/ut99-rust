@@ -5,17 +5,32 @@ use std::collections::HashMap;
 pub(super) struct Inventory {
     owned: [bool; Weapon::ALL.len()],
     ammo: [u16; Weapon::ALL.len()],
+    training_capacity: [bool; Weapon::ALL.len()],
 }
 
 impl Inventory {
-    pub fn new(map: &Map) -> Self {
-        let mut inventory = Self {
+    pub fn empty() -> Self {
+        Self {
             owned: [false; Weapon::ALL.len()],
             ammo: [0; Weapon::ALL.len()],
-        };
+            training_capacity: [false; Weapon::ALL.len()],
+        }
+    }
+
+    pub fn new(map: &Map) -> Self {
+        let mut inventory = Self::empty();
         inventory.pickup(&map.arsenal, Weapon::Hammer);
         inventory.pickup(&map.arsenal, Weapon::Enforcer);
         inventory
+    }
+
+    pub fn grant_training_weapon(&mut self, weapon: Weapon) {
+        self.owned[weapon as usize] = true;
+        if weapon != Weapon::Hammer {
+            let pool = weapon.ammo_pool();
+            self.training_capacity[pool] = true;
+            self.ammo[pool] = 199;
+        }
     }
 
     pub fn owns(&self, weapon: Weapon) -> bool {
@@ -36,13 +51,22 @@ impl Inventory {
         weapon: Weapon,
         quantity: u16,
     ) -> bool {
+        let cap = self.capacity(art, weapon);
         let ammo = &mut self.ammo[weapon.ammo_pool()];
-        let next = ammo.saturating_add(quantity).min(max_ammo(art, weapon));
+        let next = ammo.saturating_add(quantity).min(cap);
         if next <= *ammo {
             return false;
         }
         *ammo = next;
         true
+    }
+
+    pub fn capacity(&self, art: &HashMap<Weapon, WeaponAssets>, weapon: Weapon) -> u16 {
+        if self.training_capacity[weapon.ammo_pool()] {
+            199
+        } else {
+            max_ammo(art, weapon)
+        }
     }
 
     pub fn pickup(&mut self, art: &HashMap<Weapon, WeaponAssets>, weapon: Weapon) -> bool {

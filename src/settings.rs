@@ -40,6 +40,7 @@ pub struct Settings {
     pub match_minutes: u32,
     pub assault_progress: usize,
     pub deathmatch_progress: usize,
+    pub deathmatch_training_complete: bool,
     pub assault_team: usize,
     pub gui_skin: usize,
     pub field_of_view: u32,
@@ -70,6 +71,7 @@ impl Default for Settings {
             match_minutes: 5,
             assault_progress: 0,
             deathmatch_progress: 0,
+            deathmatch_training_complete: false,
             assault_team: 0,
             gui_skin: 0,
             field_of_view: 90,
@@ -87,21 +89,24 @@ impl Settings {
     pub fn ladder_progress(&self, mode: Mode) -> usize {
         match mode {
             Mode::Assault => self.assault_progress,
-            Mode::Deathmatch => self.deathmatch_progress,
+            Mode::Deathmatch => {
+                self.deathmatch_progress
+                    + usize::from(self.deathmatch_training_complete || self.deathmatch_progress > 0)
+            }
             _ => 0,
         }
     }
 
     pub fn record_ladder_win(&mut self, mode: Mode, stage: usize) -> bool {
-        let progress = match mode {
-            Mode::Assault => &mut self.assault_progress,
-            Mode::Deathmatch => &mut self.deathmatch_progress,
-            _ => return false,
-        };
-        if stage != *progress {
+        if stage != self.ladder_progress(mode) {
             return false;
         }
-        *progress += 1;
+        match mode {
+            Mode::Assault => self.assault_progress += 1,
+            Mode::Deathmatch if stage == 0 => self.deathmatch_training_complete = true,
+            Mode::Deathmatch => self.deathmatch_progress += 1,
+            _ => return false,
+        }
         true
     }
 
@@ -137,6 +142,9 @@ impl Settings {
                 "match_minutes" => settings.match_minutes = value.min(60),
                 "assault_progress" => settings.assault_progress = value.min(32) as usize,
                 "deathmatch_progress" => settings.deathmatch_progress = value.min(32) as usize,
+                "deathmatch_training_complete" => {
+                    settings.deathmatch_training_complete = value != 0
+                }
                 "assault_team" => settings.assault_team = value.min(31) as usize,
                 "gui_skin" => settings.gui_skin = (value as usize).min(GUI_SKINS.len() - 1),
                 "fov" => settings.field_of_view = value.clamp(75, 120),
@@ -202,13 +210,14 @@ impl Settings {
         use std::fmt::Write;
         let _ = writeln!(
             text,
-            "bot_count={}\nfrag_limit={}\nmatch_minutes={}\nassault_progress={}\nassault_team={}\ndeathmatch_progress={}",
+            "bot_count={}\nfrag_limit={}\nmatch_minutes={}\nassault_progress={}\nassault_team={}\ndeathmatch_progress={}\ndeathmatch_training_complete={}",
             self.bot_count,
             self.frag_limit,
             self.match_minutes,
             self.assault_progress,
             self.assault_team,
-            self.deathmatch_progress
+            self.deathmatch_progress,
+            u8::from(self.deathmatch_training_complete)
         );
         for (index, key) in self.bindings.iter().enumerate() {
             let _ = writeln!(text, "bind{index}={key}");
@@ -233,6 +242,16 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_deathmatch_progress_keeps_the_same_ranked_checkpoint() {
+        let mut settings = Settings::parse("deathmatch_progress=4");
+        assert_eq!(settings.ladder_progress(Mode::Deathmatch), 5);
+        assert!(!settings.record_ladder_win(Mode::Deathmatch, 0));
+        assert!(settings.record_ladder_win(Mode::Deathmatch, 5));
+        assert_eq!(settings.deathmatch_progress, 5);
+        assert_eq!(settings.ladder_progress(Mode::Deathmatch), 6);
+    }
 
     #[test]
     fn config_bounds_invalid_values_and_keeps_escape_available() {

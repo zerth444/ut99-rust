@@ -44,6 +44,12 @@ impl Hud {
         frame.begin_ui(false);
         if scoreboard || game.finished {
             self.draw_match_board(frame, game, map, result_help);
+            if game.finished
+                && let Some(subtitle) = game.dm_tutorial_subtitle(map)
+            {
+                let scale = (game.hud_scale * frame.width as f32 / 1280.0).clamp(0.55, 1.6);
+                self.draw_tutorial_subtitle(frame, &subtitle, scale);
+            }
             return;
         }
         let has_art = map.hud.ready();
@@ -112,7 +118,9 @@ impl Hud {
                 white,
             );
         }
-        if let Some(subtitle) = game.tutorial_subtitle(map) {
+        if let Some(subtitle) = game.dm_tutorial_subtitle(map) {
+            self.draw_tutorial_subtitle(frame, &subtitle, scale);
+        } else if let Some(subtitle) = game.tutorial_subtitle(map) {
             self.draw_tutorial_subtitle(frame, subtitle, scale);
         }
         if let Some([red, blue]) = game.flag_status() {
@@ -278,7 +286,7 @@ impl Hud {
         let accent = [0.61, 0.84, 0.90];
         frame.shade([left, top, width, height], [0.045, 0.062, 0.078], 0.74);
         frame.solid([left, top, width, px(2.0).max(1)], [0.36, 0.58, 0.65]);
-        let title = if game.finished && game.training_assault() {
+        let title = if game.finished && (game.training_assault() || game.training_deathmatch()) {
             if game.winner() == Some(0) {
                 "Training complete".into()
             } else {
@@ -296,6 +304,8 @@ impl Hud {
             }
         } else if game.training_assault() {
             "Assault training".into()
+        } else if game.training_deathmatch() {
+            "Deathmatch training".into()
         } else {
             game.mode().label().to_owned()
         };

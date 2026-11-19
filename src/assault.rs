@@ -7,6 +7,7 @@ use crate::{
 
 mod breakables;
 mod effects;
+pub(crate) use breakables::Breakable;
 pub(crate) use effects::{Effects, Timer};
 
 pub(crate) struct AssaultMap {
@@ -85,7 +86,7 @@ pub(crate) struct CannonProjectile {
     pub impact_audio: Option<Arc<crate::sound::Wave>>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct Volume {
     pub position: Vec3,
     pub radius: f32,
@@ -183,6 +184,7 @@ pub(crate) enum RelayAction {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Target {
+    Training(usize),
     Fort(usize),
     Trigger(usize),
     Turret(usize),

@@ -217,15 +217,7 @@ pub(super) fn load(system: &Path, maps: &[String], mode: Mode) -> io::Result<Cam
         .zip(configs)
         .take(count)
         .enumerate()
-        .filter(|(index, (map, _))| {
-            // DM-Tutorial uses TrainingDM, which is separate from ranked matches.
-            let unported_training = mode == Mode::Deathmatch
-                && Path::new(map)
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .is_some_and(|stem| stem.eq_ignore_ascii_case("Tutorial"));
-            !demo_only[*index] && !unported_training
-        })
+        .filter(|(index, _)| !demo_only[*index])
         .map(|(index, (map, class))| {
             if map.is_empty() {
                 return Err(invalid("Missing tournament map"));
@@ -301,7 +293,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let campaign = load(&root.join("System"), &maps, Mode::Deathmatch).unwrap();
-        for stage in &campaign.stages {
+        assert_eq!(campaign.stages[0].map, "DM-Tutorial");
+        assert!(campaign.stages[0].installed.is_some());
+        for stage in &campaign.stages[1..] {
             assert!(stage.bots > 0, "{}", stage.map);
             assert!(stage.frag_limit > 0 || stage.seconds > 0, "{}", stage.map);
             assert!(stage.installed.is_some(), "{}", stage.map);
@@ -319,6 +313,7 @@ mod tests {
             campaign
                 .stages
                 .iter()
+                .skip(1)
                 .map(|stage| (stage.map.as_str(), stage.bots, stage.frag_limit))
                 .collect::<Vec<_>>(),
             [
@@ -337,7 +332,7 @@ mod tests {
                 ("DM-Peak", 4, 30)
             ],
         );
-        assert_eq!(campaign.stages[0].names[0], "Blake");
+        assert_eq!(campaign.stages[1].names[0], "Blake");
         assert!(
             campaign
                 .stages

@@ -176,6 +176,7 @@ impl Frontend {
                     .assault
                     .as_ref()
                     .is_none_or(|data| data.tutorial.is_none()))
+            || (mode == Mode::Deathmatch && stage == 0 && map.dm_training.is_none())
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1725,6 +1726,10 @@ fn key_name(key: u16) -> String {
     }
 }
 
+pub(crate) fn training_keys(settings: &Settings) -> [String; 7] {
+    [0, 1, 2, 3, 4, 6, 7].map(|index| key_name(settings.bindings[index]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1828,8 +1833,11 @@ mod tests {
         };
         let mut menu = Menu::default();
         menu.ladder_names = vec![("AS-Tutorial".into(), true), ("AS-Frigate".into(), true)];
-        menu.deathmatch_ladder_names =
-            vec![("DM-Oblivion".into(), true), ("DM-Stalwart".into(), true)];
+        menu.deathmatch_ladder_names = vec![
+            ("DM-Tutorial".into(), true),
+            ("DM-Oblivion".into(), true),
+            ("DM-Stalwart".into(), true),
+        ];
         menu.activate(1, &settings);
         assert!(menu.key(VK_RETURN, &mut settings) == Action::StartLadder(Mode::Assault, 1));
         menu.key(VK_TAB, &mut settings);
