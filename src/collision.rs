@@ -434,6 +434,11 @@ impl Walker {
         self.velocity
     }
 
+    pub(crate) fn set_teleport_velocity(&mut self, velocity: Vec3) {
+        self.velocity = velocity;
+        self.grounded &= velocity.2 <= 0.0;
+    }
+
     pub fn eye(&self, profile: Profile, right: Vec3) -> Vec3 {
         let speed = horizontal_length(self.velocity);
         let stride = if self.grounded && speed >= 10.0 {

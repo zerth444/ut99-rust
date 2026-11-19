@@ -104,18 +104,30 @@ pub mod player {
 
     impl Music {
         pub fn open(track: &Track) -> Option<Self> {
-            let library_path = track.directory.join("libopenmpt.dll").canonicalize().ok()?;
-            let name: Vec<_> = library_path.as_os_str().encode_wide().chain([0]).collect();
-            let handle = unsafe {
-                LoadLibraryExW(
-                    name.as_ptr(),
-                    null_mut(),
-                    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
-                )
-            };
-            if handle.is_null() {
-                return None;
-            }
+            let exe = std::env::current_exe().ok();
+            Self::open_for_client(track, exe.as_deref())
+        }
+
+        pub(super) fn open_for_client(
+            track: &Track,
+            exe: Option<&std::path::Path>,
+        ) -> Option<Self> {
+            let beside_client = exe.map(|path| path.with_file_name("libopenmpt.dll"));
+            let handle = beside_client
+                .into_iter()
+                .chain([track.directory.join("libopenmpt.dll")])
+                .find_map(|path| {
+                    let path = path.canonicalize().ok()?;
+                    let name: Vec<_> = path.as_os_str().encode_wide().chain([0]).collect();
+                    let handle = unsafe {
+                        LoadLibraryExW(
+                            name.as_ptr(),
+                            null_mut(),
+                            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+                        )
+                    };
+                    (!handle.is_null()).then_some(handle)
+                })?;
             let library = Library(handle);
             // The signatures are from libopenmpt's public C ABI. The module is
             // destroyed before the DLL is released.
@@ -201,5 +213,21 @@ mod tests {
                 .any(|frame| frame[0] != frame[1] && frame[0].abs() > 25);
         }
         assert!(audible);
+    }
+
+    #[test]
+    #[ignore = "requires the local reference soundtrack and client DLL"]
+    fn facing_worlds_decodes_music_with_the_clients_library() {
+        let path = Path::new("local/reference-client/Maps/CTF-Face.unr");
+        let bytes = fs::read(path).unwrap();
+        let map = Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap();
+        let track = map.music.as_ref().unwrap();
+        assert_eq!(track.name, "Foregone");
+        let client = Path::new("local/goty/UT99 Port.exe");
+        let mut music =
+            player::Music::open_for_client(track, Some(client)).expect("decoder beside the client");
+        let mut samples = [0; 8192];
+        assert_eq!(music.render(44_100, &mut samples), samples.len());
+        assert!(samples.iter().any(|sample| *sample != 0));
     }
 }

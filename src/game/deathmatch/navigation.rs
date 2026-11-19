@@ -320,7 +320,19 @@ impl Navigation {
     }
 
     pub(super) fn next_step(&self, world: &Collision, from: Vec3, to: Vec3) -> Option<Step> {
-        if walk_link(world, from, to) {
+        self.next_step_avoiding(world, from, to, None)
+    }
+
+    pub(super) fn next_step_avoiding(
+        &self,
+        world: &Collision,
+        from: Vec3,
+        to: Vec3,
+        blocked: Option<Vec3>,
+    ) -> Option<Step> {
+        let allowed =
+            |point| blocked.is_none_or(|failed| distance_squared(point, failed) > 45.0_f32.powi(2));
+        if allowed(to) && walk_link(world, from, to) {
             return Some(Step::Walk(to));
         }
         let mut costs = vec![f32::INFINITY; self.points.len()];
@@ -329,12 +341,15 @@ impl Navigation {
         for (id, &point) in self.points.iter().enumerate() {
             let distance = distance_squared(from, point);
             if distance <= EDGE_LIMIT.powi(2) && walk_link(world, from, point) {
-                costs[id] = distance.sqrt();
                 if (from.2 - point.2).abs() > 48.0
                     || (from.0 - point.0).hypot(from.1 - point.1) >= WAYPOINT_RADIUS
                 {
+                    if !allowed(point) {
+                        continue;
+                    }
                     first[id] = Some(Step::Walk(point));
                 }
+                costs[id] = distance.sqrt();
             }
         }
         let mut best = f32::INFINITY;
@@ -351,12 +366,17 @@ impl Navigation {
             let closing = distance_squared(point, to);
             if closing <= EDGE_LIMIT.powi(2)
                 && costs[id] + closing.sqrt() < best
+                && (first[id].is_some() || allowed(to))
                 && walk_link(world, point, to)
             {
                 best = costs[id] + closing.sqrt();
                 waypoint = first[id].or(Some(Step::Walk(to)));
             }
             for edge in &self.edges[id] {
+                if first[id].is_none() && matches!(edge.step, Step::Walk(point) if !allowed(point))
+                {
+                    continue;
+                }
                 let length = costs[id] + edge.cost;
                 if length < costs[edge.to] {
                     costs[edge.to] = length;
@@ -365,6 +385,34 @@ impl Navigation {
             }
         }
         waypoint
+    }
+
+    pub(super) fn recovery(
+        &self,
+        world: &Collision,
+        from: Vec3,
+        objective: Option<Vec3>,
+        blocked: Option<Vec3>,
+    ) -> Option<Step> {
+        self.points
+            .iter()
+            .copied()
+            .filter(|&point| {
+                let distance = distance_squared(from, point);
+                (65.0_f32.powi(2)..=300.0_f32.powi(2)).contains(&distance)
+                    && blocked
+                        .is_none_or(|failed| distance_squared(point, failed) > 65.0_f32.powi(2))
+                    && walk_link(world, from, point)
+            })
+            .min_by(|&a, &b| {
+                let score = |point| {
+                    objective.map_or(distance_squared(from, point), |goal| {
+                        distance_squared(goal, point)
+                    })
+                };
+                score(a).total_cmp(&score(b))
+            })
+            .map(Step::Walk)
     }
 }
 

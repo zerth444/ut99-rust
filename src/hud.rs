@@ -44,11 +44,8 @@ impl Hud {
         frame.begin_ui(false);
         let scale = (game.hud_scale * frame.width as f32 / 1280.0).clamp(0.55, 1.6);
         if scoreboard || game.finished {
-            if let Some(scores) = game
-                .team_scores()
-                .filter(|_| game.flag_icon_states().is_some())
-            {
-                self.draw_ctf_board(frame, game, scores, result_help);
+            if let Some(scores) = game.team_scores() {
+                self.draw_team_board(frame, game, map, scores, result_help);
             } else {
                 self.draw_match_board(frame, game, map, result_help);
             }
@@ -507,7 +504,14 @@ impl Hud {
         }
     }
 
-    fn draw_ctf_board(&self, frame: &mut Frame, game: &Match, scores: [i16; 2], result_help: &str) {
+    fn draw_team_board(
+        &self,
+        frame: &mut Frame,
+        game: &Match,
+        map: &Map,
+        scores: [i16; 2],
+        result_help: &str,
+    ) {
         let standings = game.standings();
         let teams = [0, 1].map(|team| {
             standings
@@ -525,10 +529,29 @@ impl Hud {
         let x = (frame.width as i32 - px(680.0)) / 2;
         let y = (frame.height as i32 - px(height)) / 2;
         let light = [0.95, 0.96, 0.98];
+        let text = |frame: &mut Frame, x, y, size, label: &str, color| {
+            if let Some(font) = &map.score_font {
+                font.draw_glyphs(frame, x as f32, y as f32, size, label, Some(color));
+            } else {
+                self.text(frame, x, y, size, label, color);
+            }
+        };
+        let centered = |frame: &mut Frame, y, size, label: &str| {
+            if let Some(font) = &map.score_font {
+                let left = (frame.width as f32 - font.width(label, size)) * 0.5;
+                font.draw_glyphs(frame, left, y as f32, size, label, Some(light));
+            } else {
+                self.centered(frame, y, size, label, light);
+            }
+        };
         let title = if game.finished {
             match game.winner().and_then(|winner| game.fighters[winner].team) {
                 Some(0) if game.training_ctf() => "Training complete".to_owned(),
                 Some(1) if game.training_ctf() => "Training failed".to_owned(),
+                Some(_) if game.training_assault() && game.player_won_assault() => {
+                    "Training complete".to_owned()
+                }
+                Some(_) if game.training_assault() => "Training failed".to_owned(),
                 Some(team) => format!("{} wins", game.team_label(team)),
                 None => "Match drawn".to_owned(),
             }
@@ -537,19 +560,20 @@ impl Hud {
         } else {
             game.mode().label().to_owned()
         };
-        self.centered(frame, y, 1.2 * scale, &title, light);
+        centered(frame, y, 1.2 * scale, &title);
         let elapsed = if game.limits().1 > 0 && !game.finished {
             u32::from(game.remaining())
         } else {
             game.time as u32
         };
-        self.centered(
-            frame,
-            y + px(25.0),
-            0.85 * scale,
-            &format!("{:02}:{:02}", elapsed / 60, elapsed % 60),
-            light,
-        );
+        let mut details = format!("{:02}:{:02}", elapsed / 60, elapsed % 60);
+        if let Some(status) = game.assault_status(map) {
+            details.push_str(&format!(
+                "    {}/{} objectives",
+                status.completed, status.total
+            ));
+        }
+        centered(frame, y + px(25.0), 0.85 * scale, &details);
         for (team, players) in teams.into_iter().enumerate() {
             let tint = [[1.0, 0.48, 0.47], [0.52, 0.73, 1.0]][team];
             let left = x + px(team as f32 * 346.0);
@@ -560,7 +584,7 @@ impl Hud {
                 0.76,
             );
             frame.solid([left, top, px(334.0), px(2.0).max(1)], tint);
-            self.text(
+            text(
                 frame,
                 left + px(16.0),
                 top + px(8.0),
@@ -568,7 +592,7 @@ impl Hud {
                 game.team_label(team),
                 tint,
             );
-            self.text(
+            text(
                 frame,
                 left + px(286.0),
                 top + px(8.0),
@@ -577,7 +601,7 @@ impl Hud {
                 tint,
             );
             for (column, heading) in [(22.0, "Player"), (224.0, "Score"), (280.0, "Deaths")] {
-                self.text(
+                text(
                     frame,
                     left + px(column),
                     top + px(33.0),
@@ -598,30 +622,24 @@ impl Hud {
                         [1.0, 0.86, 0.32],
                     );
                 }
-                for (column, text) in [
+                for (column, label) in [
                     (22.0, game.fighter_label(id)),
                     (224.0, fighter.score.to_string()),
                     (280.0, fighter.deaths.to_string()),
                 ] {
-                    self.text(
+                    text(
                         frame,
                         left + px(column),
                         y + px(4.0),
                         0.87 * scale,
-                        &text,
+                        &label,
                         light,
                     );
                 }
             }
         }
         if game.finished {
-            self.centered(
-                frame,
-                y + px(height + 11.0),
-                0.8 * scale,
-                result_help,
-                light,
-            );
+            centered(frame, y + px(height + 11.0), 0.8 * scale, result_help);
         }
     }
 

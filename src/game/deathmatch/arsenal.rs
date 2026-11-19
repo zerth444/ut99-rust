@@ -247,8 +247,8 @@ pub(super) fn shot(weapon: Weapon, alt: bool) -> Shot {
         (Weapon::Hammer, false) => trace(44, 0.58, 0, 96.0),
         (Weapon::Hammer, true) => trace(28, 0.34, 0, 78.0),
         (Weapon::Enforcer, _) => bullet(),
-        (Weapon::Bio, false) => missile(20, 0.36, 1, Gel, 150.0, 0.72, 0),
-        (Weapon::Bio, true) => missile(75, 0.88, 1, Glob, 75.0, 0.8, 0),
+        (Weapon::Bio, false) => missile(20, 0.36, 1, Gel, 150.0, 1.0, 0),
+        (Weapon::Bio, true) => missile(75, 0.88, 1, Glob, 75.0, 1.0, 0),
         (Weapon::Shock, _) => Shot {
             damage: 40,
             interval: super::super::shock::fallback_cooldown(alt),
@@ -275,7 +275,7 @@ pub(super) fn shot(weapon: Weapon, alt: bool) -> Shot {
             missile(damage as u16, 0.92, 1, FlakShell, radius, 1.0, 0)
         }
         (Weapon::Rocket, false) => missile(75, 0.92, 1, Rocket, 220.0, 0.0, 0),
-        (Weapon::Rocket, true) => missile(80, 0.98, 1, Grenade, 200.0, 0.87, 2),
+        (Weapon::Rocket, true) => missile(80, 0.98, 1, Grenade, 200.0, 1.0, 2),
         (Weapon::Sniper, false) => bullet(),
         (Weapon::Sniper, true) => Shot {
             damage: 0,

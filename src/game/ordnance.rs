@@ -92,6 +92,16 @@ impl Kind {
             })
     }
 
+    pub(super) fn launch_velocity(self, art: &Art, direction: Vec3, variation: f32) -> Vec3 {
+        let (extra_speed, lift) = match self {
+            Self::Grenade => (variation * 100.0, 210.0),
+            Self::FlakShell => (0.0, 200.0),
+            kind if kind.bio() => (0.0, 120.0),
+            _ => (0.0, 0.0),
+        };
+        direction * (self.launch_speed(art, variation) + extra_speed) + Vec3(0.0, 0.0, lift)
+    }
+
     pub(crate) fn bio(self) -> bool {
         matches!(self, Self::Gel | Self::Glob | Self::Splash)
     }
@@ -862,25 +872,11 @@ impl Shots {
             self.guided_roll = 0.0;
         }
         let offset = kind.launch_offset(camera, side, variation);
-        let speed = kind.launch_speed(art, variation);
-        let lift = match kind {
-            Kind::Grenade => 210.0,
-            Kind::FlakShell => 200.0,
-            Kind::Gel | Kind::Glob | Kind::Splash => 120.0,
-            _ => 0.0,
-        };
         let mut shot = Projectile {
             kind,
             direction,
             position: camera.position + offset,
-            velocity: direction
-                * (speed
-                    + if kind == Kind::Grenade {
-                        variation * 100.0
-                    } else {
-                        0.0
-                    })
-                + Vec3(0.0, 0.0, lift),
+            velocity: kind.launch_velocity(art, direction, variation),
             born: time,
             expires: time
                 + match kind {

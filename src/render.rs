@@ -252,6 +252,48 @@ impl Frame {
 
     pub fn draw(&mut self, map: &Map, camera: &Camera, time: f32) {
         self.draw_scene(map, camera, time, true);
+        let view = self.camera_view(camera);
+        self.draw_flags(
+            map,
+            &view,
+            time,
+            std::array::from_fn(|team| Some((map.flag_bases[team]?, map.flag_yaws[team], true))),
+        );
+    }
+
+    fn draw_flags(
+        &mut self,
+        map: &Map,
+        view: &View,
+        time: f32,
+        flags: [Option<(Vec3, f32, bool)>; 2],
+    ) {
+        self.layer(Layer::World);
+        for (team, flag) in flags.into_iter().enumerate() {
+            let Some((position, yaw, home)) = flag else {
+                continue;
+            };
+            let motion = if home {
+                &map.objective_art.base[team]
+            } else {
+                &map.objective_art.flag[team]
+            };
+            let Some(pose) = motion.sample_loop(time) else {
+                continue;
+            };
+            let model = view.in_model(position, Vec3(yaw.cos(), yaw.sin(), 0.0), 1.0);
+            self.draw_lit_faces(
+                pose.current,
+                &model,
+                time,
+                false,
+                Some(pose),
+                None,
+                &map.scene_lights,
+                None,
+                None,
+            );
+        }
     }
 
     fn draw_scene(&mut self, map: &Map, camera: &Camera, time: f32, static_turrets: bool) {
@@ -335,6 +377,21 @@ impl Frame {
             }
         }
         self.layer(Layer::Effects);
+        for (position, yaw) in crate::teleport::visuals(&map.teleporters) {
+            let model = view.in_model(position, Vec3(yaw.cos(), yaw.sin(), 0.0), 1.0);
+            for motion in &map.objective_art.portal {
+                if let Some(pose) = motion.sample_loop(time) {
+                    self.draw_faces_in_view(
+                        pose.current,
+                        &model,
+                        time,
+                        false,
+                        Some(pose),
+                        Some(1.0),
+                    );
+                }
+            }
+        }
         #[cfg(windows)]
         for (position, image, scale, glow) in
             map.smoke.sprites(time, &map.movers, &map.ballistics.smoke)
@@ -459,6 +516,7 @@ impl Frame {
         );
         self.layer(Layer::World);
         let view = self.camera_view(camera);
+        self.draw_flags(map, &view, game.time, game.flag_models(map, body_blend));
         for (position, direction, pose) in game.translocator_modules(map) {
             let model = view.in_model(position, direction, 1.0);
             self.draw_lit_faces(
@@ -573,7 +631,7 @@ impl Frame {
         for &effect in &game.hammer_effects {
             self.effect(camera, effect);
         }
-        for beam in game.pulse_beams(map) {
+        for beam in game.pulse_beams(map, (!piloting && !dead).then_some(camera)) {
             self.draw_pulse_beam(map, &view, &beam, game.time);
         }
         if game.show_decals {
@@ -694,6 +752,15 @@ impl Frame {
         {
             self.layer(Layer::Hud);
             for (position, marker, team) in game.objective_markers(map) {
+                if matches!(marker, Marker::Flag)
+                    && map
+                        .objective_art
+                        .base
+                        .iter()
+                        .all(|motion| !motion.frames.is_empty())
+                {
+                    continue;
+                }
                 self.match_marker(map, &view, position + Vec3(0.0, 0.0, 34.0), team, marker);
             }
             for fighter in &game.fighters[1..] {

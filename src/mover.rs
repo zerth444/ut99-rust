@@ -182,6 +182,7 @@ impl Mover {
                     brushes
                         .iter()
                         .flat_map(|brush| brush.polys.iter().map(|(material, _)| *material)),
+                    true,
                 )
             })
             .unwrap_or_default();

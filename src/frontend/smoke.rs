@@ -113,7 +113,12 @@ impl Smoke {
                 pending.push((emitter, if hidden { 0 } else { texture }));
             }
         }
-        let textures = load_materials(package, path, pending.iter().map(|(_, texture)| *texture));
+        let textures = load_materials(
+            package,
+            path,
+            pending.iter().map(|(_, texture)| *texture),
+            false,
+        );
         Ok(Self {
             emitters: pending
                 .into_iter()

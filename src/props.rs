@@ -420,6 +420,15 @@ pub struct Scene {
     pub dm_training: Option<crate::game::deathmatch::dm_training::Data>,
     pub ctf_training: Option<crate::game::deathmatch::ctf_training::Data>,
     pub ctf_icons: [Option<Arc<Texture>>; 3],
+    pub objectives: ObjectiveArt,
+    pub missing_mesh_materials: std::collections::BTreeMap<String, usize>,
+}
+
+#[derive(Default)]
+pub struct ObjectiveArt {
+    pub portal: [Motion; 2],
+    pub base: [Motion; 2],
+    pub flag: [Motion; 2],
 }
 
 pub fn load(
@@ -605,7 +614,57 @@ pub fn load(
     }
     let mut props = Vec::new();
     let mut training_barrels = Vec::new();
+    let mut missing_mesh_materials = std::collections::BTreeMap::new();
+    let has_flags = actors
+        .iter()
+        .any(|actor| map.object_name(actor.class) == Some("FlagBase"));
+    let has_visible_portals = actors
+        .iter()
+        .any(|actor| map.object_name(actor.class) == Some("VisibleTeleporter"));
+    let mut objectives = ObjectiveArt::default();
+    if has_flags {
+        objectives.base = [0, 1].map(|team| {
+            objective_motion(
+                &mut assets,
+                &mut class_cache,
+                &mut textures,
+                "FlagBase",
+                "newflag",
+                Some(team),
+            )
+        });
+        objectives.flag = [0, 1].map(|team| {
+            objective_motion(
+                &mut assets,
+                &mut class_cache,
+                &mut textures,
+                "CTFFlag",
+                "pflag",
+                Some(team),
+            )
+        });
+    }
+    if has_visible_portals {
+        objectives.portal = ["VisibleTeleporter", "UTTeleEffect"].map(|class| {
+            let mut motion = objective_motion(
+                &mut assets,
+                &mut class_cache,
+                &mut textures,
+                class,
+                "Teleport",
+                None,
+            );
+            motion.rate *= 2.0;
+            motion
+        });
+    }
     for &actor in actors {
+        if matches!(
+            map.object_name(actor.class),
+            Some("FlagBase" | "VisibleTeleporter")
+        ) {
+            continue;
+        }
         let item = map.object_name(actor.class).and_then(Item::from_class);
         let class = assets.resolve(0, actor.class);
         let defaults = appearance(&mut assets, &mut class_cache, class);
@@ -663,6 +722,15 @@ pub fn load(
             .sqrt();
         let faces = mesh_faces(&mut assets, &mut textures, object, visual, mesh, &vertices);
         if !faces.is_empty() {
+            let missing = faces.iter().filter(|face| face.texture.is_none()).count();
+            if missing > 0 {
+                let class = map.object_name(actor.class).unwrap_or("Actor");
+                let (package, export) = assets.object(object);
+                let mesh = package.name(export.name)?;
+                *missing_mesh_materials
+                    .entry(format!("{class}/{mesh}"))
+                    .or_default() += missing;
+            }
             if dm_training && map.object_name(actor.class) == Some("Barrel") {
                 let (mut health, mut pushable, mut fixed) = (0, false, false);
                 let mut mass = 100.0_f32;
@@ -1260,6 +1328,8 @@ pub fn load(
         dm_training,
         ctf_training,
         ctf_icons,
+        objectives,
+        missing_mesh_materials,
     })
 }
 
@@ -1619,6 +1689,30 @@ fn read_translocator(
         teleport: sound("Resp2A"),
         offset: weapon.fire_offset.unwrap_or_default(),
     })
+}
+
+fn objective_motion(
+    assets: &mut Assets<'_>,
+    classes: &mut HashMap<Object, Appearance>,
+    textures: &mut HashMap<Object, Option<Arc<Texture>>>,
+    class: &str,
+    animation: &str,
+    team: Option<usize>,
+) -> Motion {
+    let class = find_export(assets, "botpack", class, "Class");
+    let mut visual = appearance(assets, classes, class);
+    let Some(object) = visual.mesh else {
+        return Motion::default();
+    };
+    if let Some(team) = team {
+        let skin = find_export(assets, "botpack", ["JpflagR", "JpflagB"][team], "Texture");
+        visual.skin = skin;
+    }
+    let (package, export) = assets.object(object);
+    let Ok(mesh) = Mesh::read(package, export) else {
+        return Motion::default();
+    };
+    effect_motion(assets, textures, object, visual, &mesh, &[animation])
 }
 
 fn effect_motion(

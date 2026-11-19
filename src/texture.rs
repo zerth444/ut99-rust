@@ -19,8 +19,10 @@ pub struct TextureImage {
 
 impl Texture {
     pub(crate) fn read(package: &Package<'_>, export: &Export) -> io::Result<Self> {
-        if package.object_name(export.class) == Some("FireTexture") {
-            return Self::read_fire(package, export);
+        match package.object_name(export.class) {
+            Some("FireTexture") => return Self::read_fire(package, export),
+            Some("WaveTexture") => return Self::read_wave(package, export),
+            _ => {}
         }
         let mut frames = Vec::new();
         let mut frame = export;
@@ -542,6 +544,7 @@ pub fn load_materials(
     map: &Package<'_>,
     path: &Path,
     references: impl Iterator<Item = i32>,
+    default_surface: bool,
 ) -> HashMap<i32, Arc<Texture>> {
     let search_paths = path.parent().into_iter().flat_map(|folder| {
         [
@@ -578,9 +581,8 @@ pub fn load_materials(
 
     let read = |package: &Package<'_>, item: &Export| {
         let result = match package.object_name(item.class) {
-            Some("Texture" | "FireTexture") => Texture::read(package, item),
+            Some("Texture" | "FireTexture" | "WaveTexture") => Texture::read(package, item),
             Some("WetTexture") => Texture::read_wet(package, item, &files),
-            Some("WaveTexture") => Texture::read_wave(package, item),
             Some("IceTexture") => Texture::read_source_surface(package, item, &files, true),
             Some("ScriptedTexture") => Texture::read_source_surface(package, item, &files, false),
             _ => return None,
@@ -596,6 +598,11 @@ pub fn load_materials(
                     .entry(reference)
                     .or_insert_with(|| read(map, export));
             }
+        } else if reference == 0 && default_surface {
+            imports
+                .entry("engine".into())
+                .or_default()
+                .insert(0, vec!["defaulttexture".into()]);
         } else if let Some((package, path)) = import_path(map, reference) {
             imports.entry(package).or_default().insert(reference, path);
         }

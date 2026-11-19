@@ -84,9 +84,15 @@ pub struct Map {
     #[cfg(windows)]
     pub(crate) smoke: crate::frontend::smoke::Smoke,
     pub faces: Vec<Face>,
+    pub(crate) missing_bsp_materials: MissingMaterials,
+    pub(crate) missing_mesh_materials: MissingMaterials,
     pub starts: Vec<Start>,
     pub(crate) start_teams: Vec<Option<usize>>,
     pub(crate) flag_bases: [Option<Vec3>; 2],
+    pub(crate) flag_yaws: [f32; 2],
+    pub(crate) objective_art: crate::props::ObjectiveArt,
+    #[cfg(windows)]
+    pub(crate) score_font: Option<crate::frontend::font::MenuFont>,
     pub(crate) control_points: Vec<Vec3>,
     pub(crate) assault: Option<crate::assault::AssaultMap>,
     pub(crate) dm_training: Option<crate::game::deathmatch::dm_training::Data>,
@@ -141,7 +147,7 @@ impl Map {
             path.file_stem()
                 .is_some_and(|stem| stem.eq_ignore_ascii_case("CityIntro"))
         });
-        let (mut faces, mut collision, sky_origin, zone_actors) =
+        let (mut faces, mut collision, sky_origin, zone_actors, missing_bsp_materials) =
             read_bsp(package, model, &actors, path, city_intro.is_some())
                 .map_err(|error| invalid(format!("Model: {error}")))?;
         if faces.is_empty() {
@@ -175,6 +181,8 @@ impl Map {
             dm_training,
             ctf_training,
             ctf_icons,
+            objectives: objective_art,
+            missing_mesh_materials,
         } = path
             .map(|path| {
                 crate::props::load(
@@ -208,6 +216,7 @@ impl Map {
         let mut starts = Vec::new();
         let mut start_teams = Vec::new();
         let mut flag_bases = [None; 2];
+        let mut flag_yaws = [0.0; 2];
         let mut control_points = Vec::new();
         let mut navigation_points = Vec::new();
         let mut lift_exits = Vec::new();
@@ -217,9 +226,11 @@ impl Map {
                 let mut properties = package.properties(actor)?;
                 let mut position = Vec3::default();
                 let mut team = 0;
+                let mut yaw = 0.0;
                 while let Some((name, mut value)) = properties.next()? {
                     match name {
                         "Location" => position = Vec3::read(&mut value)?,
+                        "Rotation" => yaw = crate::mover::read_rotation(&mut value)?.1,
                         "Team" | "TeamNumber" if class == Some("FlagBase") => {
                             team = usize::from(value.byte()?)
                         }
@@ -230,6 +241,7 @@ impl Map {
                     control_points.push(position);
                 } else if let Some(base) = flag_bases.get_mut(team) {
                     *base = Some(position);
+                    flag_yaws[team] = yaw;
                 }
                 navigation_points.push(position);
             }
@@ -357,6 +369,12 @@ impl Map {
             starts,
             start_teams,
             flag_bases,
+            missing_bsp_materials,
+            missing_mesh_materials,
+            flag_yaws,
+            objective_art,
+            #[cfg(windows)]
+            score_font: path.and_then(crate::frontend::font::MenuFont::load_scoreboard),
             control_points,
             assault,
             dm_training,
@@ -570,13 +588,21 @@ pub(crate) fn brush_polys<'a>(
         .transpose()
 }
 
+type MissingMaterials = std::collections::BTreeMap<String, usize>;
+
 fn read_bsp(
     package: &Package<'_>,
     export: &Export,
     actors: &[&Export],
     path: Option<&Path>,
     use_zone_ambient: bool,
-) -> io::Result<(Vec<Face>, Collision, Option<Vec3>, Vec<i32>)> {
+) -> io::Result<(
+    Vec<Face>,
+    Collision,
+    Option<Vec3>,
+    Vec<i32>,
+    MissingMaterials,
+)> {
     let Model {
         vectors,
         points,
@@ -672,10 +698,12 @@ fn read_bsp(
                 package,
                 path,
                 surfaces.iter().map(|surface| surface.material),
+                true,
             )
         })
         .unwrap_or_default();
     let mut faces = Vec::new();
+    let mut missing = MissingMaterials::new();
     let mut lightmaps = std::collections::HashMap::new();
     for node in nodes {
         if node.vertices < 3 {
@@ -713,6 +741,18 @@ fn read_bsp(
                 .copied()
                 .unwrap_or_default()
         };
+        if path.is_some() && !textures.contains_key(&surface.material) {
+            let material = crate::texture::import_path(package, surface.material)
+                .map(|(root, objects)| {
+                    format!(
+                        "{root}.{}",
+                        objects.into_iter().rev().collect::<Vec<_>>().join(".")
+                    )
+                })
+                .or_else(|| package.object_name(surface.material).map(str::to_owned))
+                .unwrap_or_else(|| "<default>".into());
+            *missing.entry(material).or_default() += 1;
+        }
         let mut face = Face {
             mesh_triangle: None,
             flags: surface.flags,
@@ -764,7 +804,7 @@ fn read_bsp(
         }
         faces.push(face);
     }
-    Ok((faces, collision, sky_origin, zones))
+    Ok((faces, collision, sky_origin, zones, missing))
 }
 
 fn read_vectors(reader: &mut Reader<'_>) -> io::Result<Vec<Vec3>> {

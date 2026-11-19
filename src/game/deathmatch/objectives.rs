@@ -287,7 +287,12 @@ impl Objectives {
             return Some(match flags[1 - team].state {
                 FlagState::Home => flags[1 - team].base,
                 FlagState::Dropped(point, _) => point,
-                FlagState::Held(owner) => fighters[owner].walker.position,
+                FlagState::Held(owner) => {
+                    let carrier = fighters[owner].walker.position;
+                    let route = flags[team].base - carrier;
+                    let distance = route.0.hypot(route.1);
+                    carrier + route * (180.0 / distance.max(180.0))
+                }
             });
         }
         self.zones
@@ -317,6 +322,26 @@ impl Objectives {
             FlagState::Held(_) => 1,
             FlagState::Dropped(..) => 2,
         }))
+    }
+
+    pub(super) fn flag_models(
+        &self,
+        fighters: &[Fighter],
+        map: &Map,
+        blend: f32,
+    ) -> [Option<(Vec3, f32, bool)>; 2] {
+        std::array::from_fn(|team| {
+            let flag = &self.flags.as_ref()?[team];
+            Some(match flag.state {
+                FlagState::Home => (flag.base, map.flag_yaws[team], true),
+                FlagState::Dropped(point, _) => (point, map.flag_yaws[team], false),
+                FlagState::Held(0) => return None,
+                FlagState::Held(id) => {
+                    let (point, yaw) = fighters[id].body_transform(blend);
+                    (point, yaw, false)
+                }
+            })
+        })
     }
 
     pub(super) fn markers<'a>(

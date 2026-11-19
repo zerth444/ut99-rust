@@ -1,4 +1,4 @@
-mod font;
+pub(crate) mod font;
 mod intro;
 mod ladder;
 pub(crate) mod smoke;
@@ -2144,7 +2144,11 @@ mod tests {
 
         let reference = Path::new("local/reference-client/Maps");
         let catalog = match_catalog(&reference.join("DM-Deck16][.unr"), [reference]);
-        for (mode, minimum) in [(Mode::CaptureTheFlag, 20), (Mode::Domination, 11)] {
+        for (mode, minimum) in [
+            (Mode::CaptureTheFlag, 20),
+            (Mode::Domination, 11),
+            (Mode::Assault, 8),
+        ] {
             let paths = catalog.iter().filter(|path| {
                 path.file_name().is_some_and(|name| {
                     name.to_string_lossy()
@@ -2165,10 +2169,13 @@ mod tests {
                     path.display()
                 );
                 assert!(
-                    map.faces.iter().any(|face| face.texture.is_some()),
-                    "{} has no textured faces",
-                    path.display()
+                    map.missing_bsp_materials.is_empty() && map.missing_mesh_materials.is_empty(),
+                    "{} has unresolved materials: {:?} {:?}",
+                    path.display(),
+                    map.missing_bsp_materials,
+                    map.missing_mesh_materials
                 );
+                assert!(map.music.is_some(), "{} has no soundtrack", path.display());
                 assert!(
                     map.hud.ready() && !map.arsenal.is_empty(),
                     "{} lacks HUD or weapons",
@@ -2179,15 +2186,15 @@ mod tests {
                     0,
                     Rules {
                         mode,
-                        bots: 1,
+                        bots: 3,
                         ..Rules::default()
                     },
                 );
-                for _ in 0..60 {
+                for _ in 0..240 {
                     game.step(&mut map, Command::default(), 1.0 / 120.0);
                 }
                 assert!(
-                    !game.finished && game.fighters.iter().all(|fighter| fighter.health > 0),
+                    !game.finished && game.fighters[0].health > 0,
                     "{} failed to start",
                     path.display()
                 );
@@ -2314,7 +2321,10 @@ mod tests {
             }
         }
         assert!(intro.time > 45.0);
-        assert!(saw_smoke && saw_moving_flare);
+        assert!(
+            saw_smoke && saw_moving_flare,
+            "smoke: {saw_smoke}, moving flare: {saw_moving_flare}"
+        );
         assert!(saw_light_fade);
         assert!(moved && heard > 0);
         assert!(intro.map.props.iter().any(|prop| {

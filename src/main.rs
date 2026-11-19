@@ -182,7 +182,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     if command != "inspect" {
-        let mut map = Map::load(&package, (command != "map-info").then_some(path))?;
+        let mut map = Map::load(&package, Some(path))?;
         if let Some(rules) = rules
             && !map.supports_mode(rules.mode)
         {
@@ -206,6 +206,46 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "{} flag bases, {} control points",
                 map.flag_bases.iter().flatten().count(),
                 map.control_points.len()
+            );
+            println!(
+                "{} teleporter links, {} visible portal actors",
+                crate::teleport::link_count(&map.teleporters),
+                crate::teleport::visuals(&map.teleporters).count()
+            );
+            println!(
+                "{} untextured BSP faces, {} untextured mesh faces",
+                map.faces
+                    .iter()
+                    .filter(|face| face.texture.is_none())
+                    .count(),
+                map.props
+                    .iter()
+                    .flat_map(|prop| &prop.faces)
+                    .filter(|face| face.texture.is_none())
+                    .count()
+            );
+            let mut gravity = map
+                .collision
+                .regions
+                .zones
+                .iter()
+                .map(|zone| zone.gravity.2)
+                .chain([map.collision.regions.level.gravity.2])
+                .collect::<Vec<_>>();
+            gravity.sort_by(f32::total_cmp);
+            gravity.dedup();
+            println!("Zone gravity Z {gravity:?}");
+            for (name, faces) in &map.missing_bsp_materials {
+                println!("Unresolved material {name} ({faces} faces)");
+            }
+            for (name, faces) in &map.missing_mesh_materials {
+                println!("Unresolved mesh material {name} ({faces} faces)");
+            }
+            println!(
+                "Music {}",
+                map.music
+                    .as_ref()
+                    .map_or("(none)", |track| track.name.as_str())
             );
         }
         println!(

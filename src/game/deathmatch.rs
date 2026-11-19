@@ -577,6 +577,8 @@ struct Bot {
     last_seen: Option<(Vec3, f32)>,
     lift: Option<ActiveLift>,
     plan_origin: Option<Vec3>,
+    blocked_waypoint: Option<(Vec3, f32)>,
+    navigation_objective: Option<Vec3>,
     retreat: Option<Retreat>,
     retreat_retry_at: f32,
     jump: JumpProgress,
@@ -1337,6 +1339,10 @@ impl Match {
         self.objectives.flag_icon_states()
     }
 
+    pub(crate) fn flag_models(&self, map: &Map, blend: f32) -> [Option<(Vec3, f32, bool)>; 2] {
+        self.objectives.flag_models(&self.fighters, map, blend)
+    }
+
     pub fn fighter_carries_flag(&self, id: usize) -> bool {
         self.objectives.carries_flag(id)
     }
@@ -1740,7 +1746,11 @@ impl Match {
             .filter(|_| !self.finished)
     }
 
-    pub(crate) fn pulse_beams<'a>(&'a self, map: &'a Map) -> impl Iterator<Item = PulseBeam> + 'a {
+    pub(crate) fn pulse_beams<'a>(
+        &'a self,
+        map: &'a Map,
+        rendered_player: Option<&'a Camera>,
+    ) -> impl Iterator<Item = PulseBeam> + 'a {
         self.fighters
             .iter()
             .enumerate()
@@ -1760,6 +1770,19 @@ impl Match {
                     beam.end = beam.start + delta * fraction;
                     beam.hit_player = true;
                     beam.wall = None;
+                }
+                if id == 0
+                    && !beam.blocked
+                    && let Some(camera) = rendered_player
+                {
+                    let muzzle = PulseBeam::muzzle(camera);
+                    if map
+                        .collision
+                        .ray(camera.position, muzzle - camera.position)
+                        .is_none()
+                    {
+                        beam.start = muzzle;
+                    }
                 }
                 Some(beam)
             })
@@ -2161,13 +2184,12 @@ impl Match {
                 };
                 sounds.extend_at(sound.iter().cloned(), fighter.walker.position, 500.0, 0.7);
             }
-            if let Some((position, yaw)) = crate::teleport::touched(
+            if let Some(arrival) = crate::teleport::touched(
                 &map.teleporters,
                 fighter.walker.position,
                 &mut fighter.portal,
-            ) {
-                fighter.walker = Walker::spawn(&map.collision, position);
-                fighter.yaw = yaw.unwrap_or(fighter.yaw);
+            ) && arrival.apply(&map.collision, &mut fighter.walker, &mut fighter.yaw)
+            {
                 fighter.capture_body();
                 fighter.airborne_since = None;
                 fighter.power.boosted_airborne = false;
@@ -3131,6 +3153,8 @@ impl Match {
                     let aim_direction = unit(direction + aim.right() * (spread * 0.09));
                     let variation = if kind == super::ordnance::Kind::Pulse {
                         fighter.fired_count.saturating_sub(1) as f32 * 1.8
+                    } else if kind == ordnance::Kind::Grenade {
+                        (jitter() + 1.0) * 0.5
                     } else {
                         0.0
                     };
@@ -3141,7 +3165,6 @@ impl Match {
                                 (aim_direction, variation, 0.0)
                             });
                     let art = &map.ordnance[kind as usize];
-                    let speed = kind.launch_speed(art, variation);
                     let base_scale = art.scale.unwrap_or(2.0).max(0.01);
                     let draw_scale = if grow {
                         1.0 + 0.8 * f32::from(units).min(4.1)
@@ -3163,16 +3186,7 @@ impl Match {
                     self.bolts.push(Bolt {
                         owner: id,
                         position,
-                        velocity: aim_direction * speed
-                            + Vec3(
-                                0.0,
-                                0.0,
-                                if kind == ordnance::Kind::FlakShell {
-                                    200.0
-                                } else {
-                                    gravity * 115.0
-                                },
-                            ),
+                        velocity: kind.launch_velocity(art, aim_direction, variation),
                         born: self.time,
                         expires: self.time
                             + if guided {
@@ -4836,7 +4850,10 @@ impl Match {
                     let lead = ai::intercept(delta, velocity, speed);
                     let travel = lead.dot(lead).sqrt() / speed;
                     let fall = -map.collision.regions.at(eye.position).gravity.2;
-                    let lift = gravity * (0.5 * fall * travel * travel - 115.0 * travel);
+                    let launch_lift = kind
+                        .launch_velocity(&map.ordnance[kind as usize], Vec3::default(), 0.5)
+                        .2;
+                    let lift = 0.5 * gravity * fall * travel * travel - launch_lift * travel;
                     let aim = delta + (lead - delta) * skill.lead + Vec3(0.0, 0.0, lift);
                     clear = range > blast * 1.08;
                     if map.collision.ray(eye.position, aim).is_none() {
@@ -4957,8 +4974,21 @@ impl Match {
                 matches!(bot.goal, Some(Step::Walk(_)))
                     && distance_squared(origin, position) < 24.0_f32.powi(2)
             });
-        if arrived || stalled || (check_progress && bot.goal.is_none()) {
+        if stalled && let Some(Step::Walk(point)) = bot.goal {
+            bot.blocked_waypoint = Some((point, self.time + 3.5));
+        }
+        let objective_changed = match (bot.navigation_objective, objective) {
+            (Some(previous), Some(next)) => distance_squared(previous, next) > 125.0_f32.powi(2),
+            (None, None) => false,
+            _ => true,
+        };
+        if arrived || stalled || objective_changed || (check_progress && bot.goal.is_none()) {
             bot.plan_origin = Some(position);
+            bot.navigation_objective = objective;
+            let blocked = bot
+                .blocked_waypoint
+                .filter(|&(_, until)| self.time < until)
+                .map(|(point, _)| point);
             let mut supplies: Vec<_> = map
                 .props
                 .iter()
@@ -5006,15 +5036,20 @@ impl Match {
                 .preferred_with_favorite(560.0, favorite)
                 .switch_priority()
                 > Weapon::Enforcer.switch_priority();
-            let objective_step = (!stalled)
-                .then_some(objective)
-                .flatten()
-                .and_then(|point| self.navigation.next_step(&map.collision, position, point));
+            let objective_step = objective.and_then(|point| {
+                self.navigation
+                    .next_step_avoiding(&map.collision, position, point, blocked)
+            });
             bot.goal = objective_step.or(if stocked {
                 pursue.or(supply)
             } else {
                 supply.or(pursue)
             });
+            if bot.goal.is_none() && (objective.is_some() || stalled) {
+                bot.goal = self
+                    .navigation
+                    .recovery(&map.collision, position, objective, blocked);
+            }
             if bot.goal.is_none() {
                 bot.goal = (0..12).find_map(|offset| {
                     let yaw = fighter.yaw
@@ -5038,6 +5073,18 @@ impl Match {
         }
         if let Some(Step::Walk(goal)) = fighter.bot.goal {
             return steer(fighter, goal, dt);
+        }
+        if self.rules.mode.team_based() {
+            let limit = 1.8 * dt;
+            let turn = objective.map_or(0.0, |point| {
+                aim_error(point - position, fighter.yaw, fighter.pitch)
+                    .0
+                    .clamp(-limit, limit)
+            });
+            return Command {
+                look: [turn, -fighter.pitch * (dt * 4.0).min(1.0)],
+                ..Command::default()
+            };
         }
         Command {
             look: [(1.8 * dt).min(1.5), -fighter.pitch * (dt * 4.0).min(1.0)],
@@ -7628,7 +7675,7 @@ mod tests {
         game.fire(&map, 0, held, &mut hits, &mut sounds);
         let art = &map.arsenal[&Weapon::Pulse];
         let fighter = &game.fighters[0];
-        let beam = game.pulse_beams(&map).next().unwrap();
+        let beam = game.pulse_beams(&map, None).next().unwrap();
         let expected = PulseBeam::trace(&map, &fighter.camera(&map), game.time);
         assert!(distance_squared(beam.start, expected.start) < 0.001);
         assert!(distance_squared(beam.end, expected.end) < 0.001);
@@ -7648,7 +7695,7 @@ mod tests {
         assert_eq!(game.fighters[0].ammo(), Some(before - 1));
         game.fire(&map, 0, Command::default(), &mut hits, &mut sounds);
         assert!(game.weapon_loop(&map).is_none());
-        assert!(game.pulse_beams(&map).next().is_none());
+        assert!(game.pulse_beams(&map, None).next().is_none());
         assert!(std::ptr::eq(
             game.fighters[0].weapon_pose(art, game.time).current,
             art.attack_end.frames[0].as_slice()
@@ -9388,6 +9435,53 @@ mod tests {
                 && angle_delta(yaw_after, yaw_before).abs() < 0.001
         );
         assert!(bot.bot.goal.is_none());
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY data"]
+    fn objective_bots_escape_failed_waypoints_on_face_and_frigate() {
+        for (name, mode) in [
+            ("CTF-Face.unr", Mode::CaptureTheFlag),
+            ("AS-Frigate.unr", Mode::Assault),
+        ] {
+            let path = std::path::Path::new("local/reference-client/Maps").join(name);
+            let bytes = std::fs::read(&path).unwrap();
+            let mut map = Map::load(&Package::read(&bytes).unwrap(), Some(&path)).unwrap();
+            let mut game = Match::new(
+                &map,
+                0,
+                Rules {
+                    mode,
+                    bots: 3,
+                    ..Rules::default()
+                },
+            );
+            game.fighters[0].protected_until = f32::INFINITY;
+            let origins: Vec<_> = game
+                .fighters
+                .iter()
+                .map(|fighter| fighter.walker.position)
+                .collect();
+            let mut traveled = vec![0.0f32; origins.len()];
+            for _ in 0..720 {
+                game.step(&mut map, Command::default(), 1.0 / 120.0);
+                for (id, fighter) in game.fighters.iter().enumerate().skip(1) {
+                    if fighter.deaths == 0 {
+                        traveled[id] = traveled[id]
+                            .max(distance_squared(origins[id], fighter.walker.position).sqrt());
+                    }
+                }
+            }
+            assert!(
+                traveled
+                    .iter()
+                    .skip(1)
+                    .filter(|&&distance| distance > 120.0)
+                    .count()
+                    >= 2,
+                "{name}: {traveled:?}"
+            );
+        }
     }
 
     #[test]

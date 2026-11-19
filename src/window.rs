@@ -925,15 +925,12 @@ unsafe fn message_loop(
                     );
                     boot_jump = movement_audio.jump && !key(walk) && game.used_boot_jump();
                     movement_audio.jump |= dodged;
-                    if let Some((position, yaw)) = crate::teleport::touched(
+                    if let Some(arrival) = crate::teleport::touched(
                         &map.teleporters,
                         walker.position,
                         &mut occupied_portal,
                     ) {
-                        walker = Walker::spawn(&map.collision, position);
-                        if let Some(yaw) = yaw {
-                            camera.yaw = yaw;
-                        }
+                        arrival.apply(&map.collision, &mut walker, &mut camera.yaw);
                     }
                     if walker.position.2 < kill_z {
                         game.health = 0;

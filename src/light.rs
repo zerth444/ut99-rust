@@ -140,7 +140,7 @@ pub fn read_coronas(package: &Package<'_>, path: &Path) -> io::Result<Vec<Corona
         }
     }
     let textures =
-        crate::texture::load_materials(package, path, pending.iter().map(|entry| entry.3));
+        crate::texture::load_materials(package, path, pending.iter().map(|entry| entry.3), false);
     Ok(pending
         .into_iter()
         .filter_map(|(position, scale, color, skin, tag, attach_tag)| {

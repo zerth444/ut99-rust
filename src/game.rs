@@ -398,7 +398,7 @@ impl Motion {
         })
     }
 
-    fn sample_loop(&self, elapsed: f32) -> Option<Pose<'_>> {
+    pub(crate) fn sample_loop(&self, elapsed: f32) -> Option<Pose<'_>> {
         let duration = self.duration();
         if duration <= 0.0 {
             return None;
@@ -588,14 +588,19 @@ impl PulseBeam {
     const DAMAGE_PER_SECOND: f32 = 72.0;
     const RANGE: f32 = 810.0;
 
-    fn trace(map: &Map, camera: &Camera, started: f32) -> Self {
+    fn muzzle(camera: &Camera) -> Vec3 {
         let direction = camera.look_direction();
         let right = camera.right();
-        let up = direction.cross(right);
-        let offset = direction * 17.5 + right * 14.0 - up * 10.0;
-        let start = camera.position + offset;
-        let blocked = map.collision.ray(camera.position, offset).is_some();
-        let delta = direction * Self::RANGE;
+        camera.position + direction * 17.5 + right * 14.0 - direction.cross(right) * 10.0
+    }
+
+    fn trace(map: &Map, camera: &Camera, started: f32) -> Self {
+        let start = Self::muzzle(camera);
+        let blocked = map
+            .collision
+            .ray(camera.position, start - camera.position)
+            .is_some();
+        let delta = camera.look_direction() * Self::RANGE;
         let wall = (!blocked)
             .then(|| map.collision.ray_surface(start, delta))
             .flatten();

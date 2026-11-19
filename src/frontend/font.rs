@@ -18,6 +18,14 @@ struct Page {
 }
 
 impl MenuFont {
+    pub fn load_scoreboard(path: &Path) -> Option<Self> {
+        let root = path.parent()?.parent()?;
+        let relative = Path::new("Textures/LadderFonts.utx");
+        let bytes = fs::read(root.join(relative))
+            .or_else(|_| fs::read(root.join("../reference-client").join(relative)))
+            .ok()?;
+        Self::load(&Package::read(&bytes).ok()?, "UTLadder16").ok()
+    }
     pub fn load_sizes(path: &Path) -> [Option<Self>; FONT_SIZES.len()] {
         let Ok(bytes) = fs::read(path) else {
             return Default::default();
@@ -54,28 +62,59 @@ impl MenuFont {
         Ok(Self { pages })
     }
 
-    pub fn draw(&self, frame: &mut Frame, mut x: f32, y: f32, scale: f32, label: &str) {
-        for ch in label.bytes() {
-            let mut index = usize::from(ch);
+    fn glyphs<'a>(&'a self, label: &'a str) -> impl Iterator<Item = (&'a Texture, [u32; 4])> + 'a {
+        label.chars().filter_map(|ch| {
+            let ch = if ch as u32 <= 255 {
+                ch as u32
+            } else {
+                u32::from(b'?')
+            };
+            let mut index = ch as usize;
             for page in &self.pages {
-                if let Some(&[u, v, w, h]) = page.glyphs.get(index) {
-                    if w != 0 && h != 0 {
-                        frame.ink(
-                            page.texture.image(0.0),
-                            [
-                                x.round() as i32,
-                                y.round() as i32,
-                                (x + w as f32 * scale).round() as i32 - x.round() as i32,
-                                (y + h as f32 * scale).round() as i32 - y.round() as i32,
-                            ],
-                            [u as f32, v as f32, w as f32, h as f32],
-                        );
-                    }
-                    x += (w.max(3) as f32 + 1.0) * scale;
-                    break;
+                if let Some(&rect) = page.glyphs.get(index) {
+                    return Some((&page.texture, rect));
                 }
                 index -= page.glyphs.len();
             }
+            None
+        })
+    }
+
+    pub fn width(&self, label: &str, scale: f32) -> f32 {
+        self.glyphs(label)
+            .map(|(_, [_, _, w, _])| (w.max(3) as f32 + 1.0) * scale)
+            .sum()
+    }
+
+    pub fn draw(&self, frame: &mut Frame, x: f32, y: f32, scale: f32, label: &str) {
+        self.draw_glyphs(frame, x, y, scale, label, None);
+    }
+
+    pub fn draw_glyphs(
+        &self,
+        frame: &mut Frame,
+        mut x: f32,
+        y: f32,
+        scale: f32,
+        label: &str,
+        tint: Option<[f32; 3]>,
+    ) {
+        for (texture, [u, v, w, h]) in self.glyphs(label) {
+            if w != 0 && h != 0 {
+                let rect = [
+                    x.round() as i32,
+                    y.round() as i32,
+                    (x + w as f32 * scale).round() as i32 - x.round() as i32,
+                    (y + h as f32 * scale).round() as i32 - y.round() as i32,
+                ];
+                let source = [u as f32, v as f32, w as f32, h as f32];
+                if let Some(tint) = tint {
+                    frame.translucent_tile(texture.image(0.0), rect, source, tint);
+                } else {
+                    frame.ink(texture.image(0.0), rect, source);
+                }
+            }
+            x += (w.max(3) as f32 + 1.0) * scale;
         }
     }
 }
