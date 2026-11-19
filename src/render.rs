@@ -259,6 +259,36 @@ impl Frame {
             time,
             std::array::from_fn(|team| Some((map.flag_bases[team]?, map.flag_yaws[team], true))),
         );
+        self.draw_control_points(map, &view, time, std::iter::empty());
+    }
+
+    fn draw_control_points(
+        &mut self,
+        map: &Map,
+        view: &View,
+        time: f32,
+        owners: impl Iterator<Item = Option<usize>>,
+    ) {
+        for (point, owner) in map
+            .control_points
+            .iter()
+            .zip(owners.chain(std::iter::repeat(None)))
+        {
+            if point.visible {
+                let model = view.in_model(point.position, Vec3(1.0, 0.0, 0.0), 1.0);
+                self.draw_lit_faces(
+                    &map.objective_art.control[owner.unwrap_or(2)],
+                    &model,
+                    time,
+                    false,
+                    None,
+                    None,
+                    &map.scene_lights,
+                    None,
+                    None,
+                );
+            }
+        }
     }
 
     fn draw_flags(
@@ -517,6 +547,7 @@ impl Frame {
         self.layer(Layer::World);
         let view = self.camera_view(camera);
         self.draw_flags(map, &view, game.time, game.flag_models(map, body_blend));
+        self.draw_control_points(map, &view, game.time, game.control_owners());
         for (position, direction, pose) in game.translocator_modules(map) {
             let model = view.in_model(position, direction, 1.0);
             self.draw_lit_faces(
@@ -758,6 +789,11 @@ impl Frame {
                         .base
                         .iter()
                         .all(|motion| !motion.frames.is_empty())
+                {
+                    continue;
+                }
+                if matches!(marker, Marker::ControlPoint)
+                    && !map.objective_art.control[team.unwrap_or(2)].is_empty()
                 {
                     continue;
                 }

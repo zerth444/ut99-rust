@@ -399,6 +399,17 @@ impl Navigation {
         to: Vec3,
         blocked: &[(Vec3, f32)],
     ) -> Option<Step> {
+        self.route_avoiding(world, from, to, blocked)
+            .map(|(step, _)| step)
+    }
+
+    pub(super) fn route_avoiding(
+        &self,
+        world: &Collision,
+        from: Vec3,
+        to: Vec3,
+        blocked: &[(Vec3, f32)],
+    ) -> Option<(Step, f32)> {
         let allowed = |point| {
             blocked
                 .iter()
@@ -422,26 +433,33 @@ impl Navigation {
                 _ => None,
             });
         if lift.is_some() {
-            return lift;
+            return lift.map(|step| (step, distance_squared(from, to).sqrt()));
         }
-        if allowed(to) && walk_link(world, from, to) {
-            return Some(Step::Walk(to));
+        if allowed(to)
+            && let Some(step) = approach_step(world, from, to)
+        {
+            return Some((
+                step,
+                approach_cost(world, step, distance_squared(from, to).sqrt()),
+            ));
         }
         let mut costs = vec![f32::INFINITY; self.points.len()];
         let mut queue = BinaryHeap::new();
         let mut first = vec![None; self.points.len()];
         for (id, &point) in self.points.iter().enumerate() {
             let distance = distance_squared(from, point);
-            if distance <= EDGE_LIMIT.powi(2) && walk_link(world, from, point) {
+            if distance <= EDGE_LIMIT.powi(2)
+                && let Some(step) = approach_step(world, from, point)
+            {
                 if (from.2 - point.2).abs() > 48.0
                     || (from.0 - point.0).hypot(from.1 - point.1) >= WAYPOINT_RADIUS
                 {
                     if !allowed(point) {
                         continue;
                     }
-                    first[id] = Some(Step::Walk(point));
+                    first[id] = Some(step);
                 }
-                costs[id] = distance.sqrt();
+                costs[id] = approach_cost(world, step, distance.sqrt());
                 queue.push(RouteCandidate {
                     id,
                     cost: costs[id],
@@ -462,10 +480,13 @@ impl Navigation {
             if closing <= EDGE_LIMIT.powi(2)
                 && costs[id] + closing.sqrt() < best
                 && (first[id].is_some() || allowed(to))
-                && walk_link(world, point, to)
+                && let Some(step) = approach_step(world, point, to)
             {
-                best = costs[id] + closing.sqrt();
-                waypoint = first[id].or(Some(Step::Walk(to)));
+                let total = costs[id] + approach_cost(world, step, closing.sqrt());
+                if total < best {
+                    best = total;
+                    waypoint = first[id].or(Some(step));
+                }
             }
             for edge in &self.edges[id] {
                 if !allowed(self.points[edge.to]) {
@@ -482,7 +503,7 @@ impl Navigation {
                 }
             }
         }
-        waypoint
+        waypoint.map(|step| (step, best))
     }
 
     pub(super) fn recovery(
@@ -501,9 +522,9 @@ impl Navigation {
                     && blocked
                         .iter()
                         .all(|&(failed, _)| distance_squared(point, failed) > 48.0_f32.powi(2))
-                    && walk_link(world, from, point)
             })
-            .min_by(|&a, &b| {
+            .filter_map(|point| Some((point, approach_step(world, from, point)?)))
+            .min_by(|&(a, _), &(b, _)| {
                 let score = |point| {
                     objective.map_or(distance_squared(from, point), |goal| {
                         distance_squared(goal, point)
@@ -511,7 +532,31 @@ impl Navigation {
                 };
                 score(a).total_cmp(&score(b))
             })
-            .map(Step::Walk)
+            .map(|(_, step)| step)
+    }
+}
+
+fn approach_step(world: &Collision, from: Vec3, to: Vec3) -> Option<Step> {
+    use crate::collision::{PLAYER_HEIGHT, PLAYER_RADIUS};
+    if world.regions.at(from).water {
+        let delta = to - from;
+        if !world.regions.at(to).pain
+            && world
+                .projectile_surface(from, delta, PLAYER_RADIUS, PLAYER_HEIGHT)
+                .is_none()
+        {
+            return Some(Step::Swim(to));
+        }
+        return None;
+    }
+    walk_link(world, from, to).then_some(Step::Walk(to))
+}
+
+fn approach_cost(world: &Collision, step: Step, distance: f32) -> f32 {
+    if matches!(step, Step::Swim(_)) {
+        distance * (world.profile.ground_speed / world.profile.water_speed.max(1.0)).max(1.0)
+    } else {
+        distance
     }
 }
 

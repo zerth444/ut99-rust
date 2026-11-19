@@ -85,14 +85,25 @@ pub(super) struct Objectives {
     pub scores: [i16; 2],
     pub player_captured: bool,
     flags: Option<[Flag; 2]>,
-    zones: Vec<(Vec3, Option<usize>)>,
+    zones: Vec<ZoneControl>,
     next_score: f32,
+    time_limit: u16,
+    team_credit: [u8; 2],
+    player_credit: Vec<u8>,
+}
+
+struct ZoneControl {
+    position: Vec3,
+    owner: Option<(usize, usize)>,
+    score_at: f32,
+    touching: Vec<bool>,
 }
 
 pub(super) enum FlagNotice {
     Taken,
     Returned,
     Captured(usize),
+    PointTaken(usize, usize),
 }
 
 impl FlagNotice {
@@ -102,6 +113,8 @@ impl FlagNotice {
             Self::Returned => "Flag returned",
             Self::Captured(0) => "Red scored a capture",
             Self::Captured(_) => "Blue scored a capture",
+            Self::PointTaken(0, _) => "Red took a control point",
+            Self::PointTaken(_, _) => "Blue took a control point",
         }
     }
 
@@ -109,7 +122,7 @@ impl FlagNotice {
         match *self {
             Self::Captured(team) => Some(team),
             Self::Returned => Some(2),
-            Self::Taken => None,
+            Self::Taken | Self::PointTaken(..) => None,
         }
     }
 }
@@ -123,7 +136,7 @@ fn touching(map: &Map, position: Vec3, fighter: &Fighter) -> bool {
 }
 
 impl Objectives {
-    pub(super) fn new(map: &Map, mode: Mode) -> Self {
+    pub(super) fn new(map: &Map, mode: Mode, time_limit: u16) -> Self {
         let flags = if mode == Mode::CaptureTheFlag {
             map.flag_bases[0].zip(map.flag_bases[1]).map(|(red, blue)| {
                 [red, blue].map(|base| Flag {
@@ -138,7 +151,12 @@ impl Objectives {
         let zones = if mode == Mode::Domination {
             map.control_points
                 .iter()
-                .map(|&point| (point, None))
+                .map(|point| ZoneControl {
+                    position: point.position,
+                    owner: None,
+                    score_at: f32::INFINITY,
+                    touching: Vec::new(),
+                })
                 .collect()
         } else {
             Vec::new()
@@ -148,7 +166,10 @@ impl Objectives {
             player_captured: false,
             flags,
             zones,
-            next_score: 2.0,
+            next_score: 1.0,
+            time_limit,
+            team_credit: [0; 2],
+            player_credit: Vec::new(),
         }
     }
 
@@ -223,28 +244,71 @@ impl Objectives {
                 }
             }
         }
-        for (position, control) in &mut self.zones {
-            if let Some(team) = fighters
+        self.score_control_points(time, fighters);
+        for (index, zone) in self.zones.iter_mut().enumerate() {
+            zone.touching.resize(fighters.len(), false);
+            let new_controller = fighters
                 .iter()
-                .filter(|fighter| touching(map, *position, fighter))
-                .min_by(|a, b| {
-                    distance_squared(a.walker.position, *position)
-                        .total_cmp(&distance_squared(b.walker.position, *position))
+                .enumerate()
+                .zip(&mut zone.touching)
+                .filter_map(|((id, fighter), was_touching)| {
+                    let team = fighter.team?;
+                    let now_touching = touching(map, zone.position, fighter);
+                    let already_touching = std::mem::replace(was_touching, now_touching);
+                    (now_touching && !already_touching).then_some((team, id, fighter))
                 })
-                .and_then(|fighter| fighter.team)
-            {
-                *control = Some(team);
-            }
-        }
-        if time >= self.next_score && !self.zones.is_empty() {
-            self.next_score += 2.0;
-            for &(_, owner) in &self.zones {
-                if let Some(team) = owner {
-                    self.scores[team] = self.scores[team].saturating_add(1);
+                .min_by(|(_, _, a), (_, _, b)| {
+                    distance_squared(a.walker.position, zone.position)
+                        .total_cmp(&distance_squared(b.walker.position, zone.position))
+                });
+            if let Some((team, controller, _)) = new_controller {
+                let changed_team = zone.owner.is_none_or(|(owner, _)| team != owner);
+                zone.owner = Some((team, controller));
+                if changed_team {
+                    zone.score_at = time + 2.0;
+                    notice = Some(FlagNotice::PointTaken(team, index));
                 }
             }
         }
         notice
+    }
+
+    fn score_control_points(&mut self, time: f32, fighters: &mut [Fighter]) {
+        if self.zones.is_empty() || time < self.next_score {
+            return;
+        }
+        self.player_credit.resize(fighters.len(), 0);
+        while self.next_score <= time {
+            let remaining = (f32::from(self.time_limit) - self.next_score).max(0.0);
+            let minutes = f32::from(self.time_limit) / 60.0;
+            let credit = if remaining < minutes * 0.1 {
+                4
+            } else if remaining < minutes * 0.25 {
+                2
+            } else {
+                1
+            };
+            for zone in &self.zones {
+                if self.next_score < zone.score_at {
+                    continue;
+                }
+                let Some((team, controller)) = zone.owner else {
+                    continue;
+                };
+                for (fraction, score) in [
+                    (&mut self.team_credit[team], &mut self.scores[team]),
+                    (
+                        &mut self.player_credit[controller],
+                        &mut fighters[controller].score,
+                    ),
+                ] {
+                    *fraction += credit;
+                    *score = score.saturating_add(i16::from(*fraction / 5));
+                    *fraction %= 5;
+                }
+            }
+            self.next_score += 1.0;
+        }
     }
 
     pub(super) fn carries_flag(&self, id: usize) -> bool {
@@ -295,14 +359,24 @@ impl Objectives {
                 }
             });
         }
+        self.uncontrolled_points(team).min_by(|&a, &b| {
+            distance_squared(fighter.walker.position, a)
+                .total_cmp(&distance_squared(fighter.walker.position, b))
+        })
+    }
+
+    pub(super) fn uncontrolled_points(&self, team: usize) -> impl Iterator<Item = Vec3> + '_ {
+        self.zones.iter().filter_map(move |zone| {
+            zone.owner
+                .is_none_or(|(owner, _)| owner != team)
+                .then_some(zone.position)
+        })
+    }
+
+    pub(super) fn point_owners(&self) -> impl Iterator<Item = Option<usize>> + '_ {
         self.zones
             .iter()
-            .filter(|(_, owner)| *owner != Some(team))
-            .min_by(|(a, _), (b, _)| {
-                distance_squared(fighter.walker.position, *a)
-                    .total_cmp(&distance_squared(fighter.walker.position, *b))
-            })
-            .map(|&(position, _)| position)
+            .map(|zone| zone.owner.map(|(team, _)| team))
     }
 
     pub(super) fn flag_status(&self) -> Option<[&'static str; 2]> {
@@ -364,7 +438,8 @@ impl Objectives {
         flags.chain(
             self.zones
                 .iter()
-                .map(|&(position, owner)| (position, Marker::ControlPoint, owner)),
+                .zip(self.point_owners())
+                .map(|(zone, owner)| (zone.position, Marker::ControlPoint, owner)),
         )
     }
 }

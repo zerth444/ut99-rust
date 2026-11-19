@@ -429,6 +429,9 @@ pub struct ObjectiveArt {
     pub portal: [Motion; 2],
     pub base: [Motion; 2],
     pub flag: [Motion; 2],
+    pub control: [Vec<Face>; 3],
+    pub control_icons: [Option<Arc<Texture>>; 3],
+    pub control_sound: Option<Arc<Wave>>,
 }
 
 pub fn load(
@@ -622,6 +625,43 @@ pub fn load(
         .iter()
         .any(|actor| map.object_name(actor.class) == Some("VisibleTeleporter"));
     let mut objectives = ObjectiveArt::default();
+    if actors
+        .iter()
+        .any(|actor| map.object_name(actor.class) == Some("ControlPoint"))
+    {
+        objectives.control = [
+            ("DomR", "RedSkin2"),
+            ("DomB", "BlueSkin2"),
+            ("DomN", "JDomN0"),
+        ]
+        .map(|(name, skin)| {
+            let object = find_export(&assets, "botpack", name, "LodMesh")
+                .or_else(|| find_export(&assets, "botpack", name, "Mesh"));
+            let Some(object) = object else {
+                return Vec::new();
+            };
+            let (package, export) = assets.object(object);
+            let Ok(mesh) = Mesh::read(package, export) else {
+                return Vec::new();
+            };
+            let visual = Appearance {
+                skin: find_export(&assets, "botpack", skin, "Texture"),
+                scale: 0.4,
+                ..Appearance::default()
+            };
+            let vertices = effect_vertices(&mesh, mesh.frame(0).unwrap_or_default(), visual.scale);
+            mesh_faces(&mut assets, &mut textures, object, visual, &mesh, &vertices)
+        });
+        objectives.control_sound = cached_wave(
+            &assets,
+            &mut waves,
+            find_export(&assets, "botpack", "ControlSound", "Sound"),
+        );
+        objectives.control_icons = ["I_TeamR", "I_TeamB", "I_TeamN"].map(|name| {
+            let id = find_export(&assets, "botpack", name, "Texture")?;
+            cached_texture(&assets, &mut textures, id)
+        });
+    }
     if has_flags {
         objectives.base = [0, 1].map(|team| {
             objective_motion(
@@ -662,7 +702,9 @@ pub fn load(
         if matches!(
             map.object_name(actor.class),
             Some("FlagBase" | "VisibleTeleporter")
-        ) {
+        ) || (map.object_name(actor.class) == Some("ControlPoint")
+            && !objectives.control[2].is_empty())
+        {
             continue;
         }
         let item = map.object_name(actor.class).and_then(Item::from_class);

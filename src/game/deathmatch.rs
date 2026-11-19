@@ -936,7 +936,7 @@ impl Match {
             dm_training,
             ctf_training,
             training_keys: None,
-            objectives: objectives::Objectives::new(map, rules.mode),
+            objectives: objectives::Objectives::new(map, rules.mode, rules.seconds),
             assault: map
                 .assault
                 .as_ref()
@@ -1357,6 +1357,10 @@ impl Match {
         self.objectives.flag_models(&self.fighters, map, blend)
     }
 
+    pub(crate) fn control_owners(&self) -> impl Iterator<Item = Option<usize>> + '_ {
+        self.objectives.point_owners()
+    }
+
     pub fn fighter_carries_flag(&self, id: usize) -> bool {
         self.objectives.carries_flag(id)
     }
@@ -1423,7 +1427,7 @@ impl Match {
         self.bolts.clear();
         self.pickups.fill(None);
         self.restore_map(map);
-        self.objectives = objectives::Objectives::new(map, self.rules.mode);
+        self.objectives = objectives::Objectives::new(map, self.rules.mode, self.rules.seconds);
         self.announcement = None;
         self.first_frag = false;
         self.player_frags = (0, f32::NEG_INFINITY);
@@ -2314,6 +2318,14 @@ impl Match {
                 .and_then(|index| map.ctf_announcer[index].as_ref())
             {
                 sounds.push(wave.clone());
+            }
+            if let objectives::FlagNotice::PointTaken(_, index) = notice {
+                sounds.extend_at(
+                    map.objective_art.control_sound.iter().cloned(),
+                    map.control_points[index].position,
+                    CONTACT_SOUND_RADIUS,
+                    1.0,
+                );
             }
         }
         if let Some(data) = &map.ctf_training
@@ -4653,7 +4665,21 @@ impl Match {
                     fort.destination
                 }
             })
-            .or_else(|| self.objectives.destination(&self.fighters, id));
+            .or_else(|| {
+                let previous = fighter.bot.navigation_objective;
+                if self.rules.mode == Mode::Domination
+                    && let Some(team) = fighter.team
+                    && let Some(point) = previous
+                    && self
+                        .objectives
+                        .uncontrolled_points(team)
+                        .any(|other| distance_squared(point, other) < 1.0)
+                {
+                    Some(point)
+                } else {
+                    self.objectives.destination(&self.fighters, id)
+                }
+            });
         let carrying_flag = self.objectives.carries_flag(id);
         if let Some((fort, true)) = assault
             && !fort.touch
@@ -5058,27 +5084,49 @@ impl Match {
             bot.blocked_waypoints
                 .retain(|&(_, until)| self.time < until);
             let blocked = &bot.blocked_waypoints;
-            let objective_step = objective
-                .and_then(|point| {
-                    self.navigation
-                        .next_step_avoiding(&map.collision, position, point, blocked)
-                })
-                .or_else(|| {
-                    assault.and_then(|(fort, attacking)| {
-                        (attacking
-                            && fort.touch
-                            && distance_squared(fort.destination, fort.volume.position) > 1.0)
-                            .then(|| {
-                                self.navigation.next_step_avoiding(
-                                    &map.collision,
-                                    position,
-                                    fort.destination,
-                                    blocked,
-                                )
-                            })
-                            .flatten()
-                    })
+            let control_route = (self.rules.mode == Mode::Domination)
+                .then_some(fighter.team)
+                .flatten()
+                .and_then(|team| {
+                    self.objectives
+                        .uncontrolled_points(team)
+                        .filter_map(|point| {
+                            let (step, cost) = self.navigation.route_avoiding(
+                                &map.collision,
+                                position,
+                                point,
+                                blocked,
+                            )?;
+                            Some((point, step, cost))
+                        })
+                        .min_by(|a, b| a.2.total_cmp(&b.2))
                 });
+            let objective_step = if let Some((point, step, _)) = control_route {
+                bot.navigation_objective = Some(point);
+                Some(step)
+            } else {
+                objective
+                    .and_then(|point| {
+                        self.navigation
+                            .next_step_avoiding(&map.collision, position, point, blocked)
+                    })
+                    .or_else(|| {
+                        assault.and_then(|(fort, attacking)| {
+                            (attacking
+                                && fort.touch
+                                && distance_squared(fort.destination, fort.volume.position) > 1.0)
+                                .then(|| {
+                                    self.navigation.next_step_avoiding(
+                                        &map.collision,
+                                        position,
+                                        fort.destination,
+                                        blocked,
+                                    )
+                                })
+                                .flatten()
+                        })
+                    })
+            };
             bot.goal = objective_step.or_else(|| {
                 if stalled {
                     return None;
@@ -5162,7 +5210,21 @@ impl Match {
         if let Some(command) = follow_transfer(map, fighter, self.time, dt) {
             return command;
         }
-        if let Some(Step::Walk(goal)) = fighter.bot.goal {
+        if let Some(goal) = fighter.bot.goal.and_then(Step::movement_goal)
+            && map.collision.regions.at(position).water
+        {
+            let delta = goal - position;
+            let (yaw, pitch) = aim_error(delta, fighter.yaw, fighter.pitch);
+            let turn = 4.6 * dt;
+            return Command {
+                look: [yaw.clamp(-turn, turn), pitch.clamp(-turn, turn)],
+                movement: [0.8, 0.0],
+                jump: delta.2 > 18.0 && delta.0.hypot(delta.1) < 120.0,
+                normal_jump: true,
+                ..Command::default()
+            };
+        }
+        if let Some(goal) = fighter.bot.goal.and_then(Step::movement_goal) {
             let route = steer(fighter, goal, dt);
             if let Some(mut fire) = fire_while_carrying {
                 let [forward, strafe] = route.movement;
@@ -5176,18 +5238,6 @@ impl Match {
                 return fire;
             }
             return route;
-        }
-        if let Some(Step::Swim(goal)) = fighter.bot.goal {
-            if map.collision.regions.at(position).water {
-                let (yaw, pitch) = aim_error(goal - position, fighter.yaw, fighter.pitch);
-                let turn = 4.6 * dt;
-                return Command {
-                    look: [yaw.clamp(-turn, turn), pitch.clamp(-turn, turn)],
-                    movement: [0.8, 0.0],
-                    ..Command::default()
-                };
-            }
-            return steer(fighter, goal, dt);
         }
         if self.rules.mode.team_based() {
             if let Some(fire) = fire_while_carrying {
@@ -7139,16 +7189,24 @@ mod tests {
         game.objectives.tick(&map, &mut game.fighters, 26.2);
         assert!(distance_squared(game.objective_markers(&map).nth(1).unwrap().0, blue) < 0.01);
 
-        map.control_points = vec![red];
+        map.control_points = vec![crate::map::ControlPoint {
+            position: red,
+            name: "Test point".into(),
+            visible: true,
+        }];
         let mut game = new_match(&map, Mode::Domination, 1);
         game.objectives.tick(&map, &mut game.fighters, 1.0);
         assert_eq!(game.team_scores(), Some([0, 0]));
-        game.objectives.tick(&map, &mut game.fighters, 2.1);
+        game.objectives.tick(&map, &mut game.fighters, 6.9);
+        assert_eq!(game.team_scores(), Some([0, 0]));
+        game.objectives.tick(&map, &mut game.fighters, 7.0);
         assert_eq!(game.team_scores(), Some([1, 0]));
         game.fighters[0].walker.position = blue;
         game.fighters[1].walker.position = red;
-        game.objectives.tick(&map, &mut game.fighters, 4.1);
+        game.objectives.tick(&map, &mut game.fighters, 8.0);
+        game.objectives.tick(&map, &mut game.fighters, 14.0);
         assert_eq!(game.team_scores(), Some([1, 1]));
+        assert_eq!((game.fighters[0].score, game.fighters[1].score), (1, 1));
     }
 
     #[test]
@@ -9598,6 +9656,22 @@ mod tests {
                 !map.reach_links.is_empty(),
                 "{name} has no authored bot routes"
             );
+            if mode == Mode::Domination {
+                assert_eq!(map.control_points.len(), 3);
+                assert!(
+                    map.control_points
+                        .iter()
+                        .all(|point| !point.name.is_empty())
+                );
+                assert!(
+                    map.objective_art
+                        .control
+                        .iter()
+                        .all(|faces| !faces.is_empty())
+                );
+                assert!(map.objective_art.control_icons.iter().all(Option::is_some));
+                assert!(map.objective_art.control_sound.is_some());
+            }
             let mut game = Match::new(
                 &map,
                 0,
@@ -9650,6 +9724,14 @@ mod tests {
                             .any(|score| score > 0)
                 ),
                 "AS-Frigate.unr" => assert_eq!((game.finished, by_half), (true, [3, 3])),
+                "DOM-Sesmar.unr" => assert!(
+                    game.finished
+                        && game
+                            .team_scores()
+                            .unwrap()
+                            .into_iter()
+                            .any(|score| score >= 3)
+                ),
                 _ => {}
             }
         }

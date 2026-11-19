@@ -93,7 +93,7 @@ pub struct Map {
     pub(crate) objective_art: crate::props::ObjectiveArt,
     #[cfg(windows)]
     pub(crate) score_font: Option<crate::frontend::font::MenuFont>,
-    pub(crate) control_points: Vec<Vec3>,
+    pub(crate) control_points: Vec<ControlPoint>,
     pub(crate) assault: Option<crate::assault::AssaultMap>,
     pub(crate) dm_training: Option<crate::game::deathmatch::dm_training::Data>,
     pub(crate) ctf_training: Option<crate::game::deathmatch::ctf_training::Data>,
@@ -228,10 +228,15 @@ impl Map {
                 let mut position = Vec3::default();
                 let mut team = 0;
                 let mut yaw = 0.0;
-                while let Some((name, mut value)) = properties.next()? {
-                    match name {
+                let mut name = String::new();
+                let mut visible = true;
+                while let Some(property) = properties.next_tag()? {
+                    let mut value = property.value;
+                    match property.name {
                         "Location" => position = Vec3::read(&mut value)?,
                         "Rotation" => yaw = crate::mover::read_rotation(&mut value)?.1,
+                        "PointName" => name = value.string(package.version)?,
+                        "bSelfDisplayed" => visible = property.boolean.unwrap_or(true),
                         "Team" | "TeamNumber" if class == Some("FlagBase") => {
                             team = usize::from(value.byte()?)
                         }
@@ -239,7 +244,11 @@ impl Map {
                     }
                 }
                 if class == Some("ControlPoint") {
-                    control_points.push(position);
+                    control_points.push(ControlPoint {
+                        position,
+                        name,
+                        visible,
+                    });
                 } else if let Some(base) = flag_bases.get_mut(team) {
                     *base = Some(position);
                     flag_yaws[team] = yaw;
@@ -411,6 +420,13 @@ pub(crate) fn native_data<'a>(package: &Package<'a>, export: &Export) -> io::Res
     let mut properties = package.properties(export)?;
     while properties.next()?.is_some() {}
     Ok(properties.reader)
+}
+
+#[derive(Debug)]
+pub(crate) struct ControlPoint {
+    pub position: Vec3,
+    pub name: String,
+    pub visible: bool,
 }
 
 pub(crate) struct ReachLink {

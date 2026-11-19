@@ -161,6 +161,43 @@ impl Hud {
                 );
             }
         }
+        let point_scale = (scale * 0.65)
+            .min(frame.height as f32 / (140.0 * map.control_points.len().max(1) as f32));
+        for (index, (point, owner)) in map
+            .control_points
+            .iter()
+            .zip(game.control_owners())
+            .enumerate()
+        {
+            let color = [[1.0, 0.45, 0.42], [0.52, 0.73, 1.0], white][owner.unwrap_or(2)];
+            let y = (frame.height as f32 * 0.24 + index as f32 * 80.0 * point_scale).round() as i32;
+            let x = if let Some(icon) = &map.objective_art.control_icons[owner.unwrap_or(2)] {
+                let (w, h) = icon.size();
+                let size = (48.0 * point_scale).round().max(8.0) as i32;
+                frame.translucent_tile(
+                    icon.image(0.0),
+                    [10, y, size, size],
+                    [0.0, 0.0, w, h],
+                    [1.0; 3],
+                );
+                16 + size
+            } else {
+                10
+            };
+            let label = if point.name.is_empty() {
+                "Control point"
+            } else {
+                &point.name
+            };
+            self.text(
+                frame,
+                x,
+                y + (10.0 * point_scale) as i32,
+                scale * 0.75,
+                label,
+                color,
+            );
+        }
         if !has_art {
             self.text(
                 frame,
