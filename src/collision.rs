@@ -209,6 +209,24 @@ impl Collision {
         self.sweep(start, delta, PLAYER)
     }
 
+    pub(crate) fn player_fits(&self, point: Vec3) -> bool {
+        !self.hulls.iter().any(|hull| {
+            let min = hull.min - PLAYER;
+            let max = hull.max + PLAYER;
+            point.0 > min.0
+                && point.0 < max.0
+                && point.1 > min.1
+                && point.1 < max.1
+                && point.2 > min.2
+                && point.2 < max.2
+                && hull.planes.iter().all(|plane| {
+                    let n = plane.normal;
+                    let support = Vec3(n.0.abs(), n.1.abs(), n.2.abs()).dot(PLAYER);
+                    n.dot(point) < plane.distance + support - SKIN
+                })
+        })
+    }
+
     fn water_jump_clear(&self, position: Vec3, forward: Vec3) -> bool {
         let higher = position + UP * (1.1 * self.profile.step_height);
         self.trace(position, forward * PLAYER_RADIUS)

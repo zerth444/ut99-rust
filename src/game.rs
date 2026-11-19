@@ -25,10 +25,11 @@ pub enum Weapon {
     Rocket,
     Sniper,
     Redeemer,
+    Translocator,
 }
 
 impl Weapon {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Hammer,
         Self::Enforcer,
         Self::Bio,
@@ -40,6 +41,7 @@ impl Weapon {
         Self::Rocket,
         Self::Sniper,
         Self::Redeemer,
+        Self::Translocator,
     ];
 
     pub fn class(self) -> &'static str {
@@ -55,6 +57,7 @@ impl Weapon {
             Self::Rocket => "UT_Eightball",
             Self::Sniper => "SniperRifle",
             Self::Redeemer => "WarheadLauncher",
+            Self::Translocator => "Translocator",
         }
     }
 
@@ -71,15 +74,22 @@ impl Weapon {
             Self::Rocket => "ROCKET LAUNCHER",
             Self::Sniper => "SNIPER RIFLE",
             Self::Redeemer => "REDEEMER",
+            Self::Translocator => "TRANSLOCATOR",
         }
     }
 
     pub fn slot(self) -> u8 {
-        if matches!(self, Self::Sniper | Self::Redeemer) {
+        if self == Self::Translocator {
+            1
+        } else if matches!(self, Self::Sniper | Self::Redeemer) {
             0
         } else {
             ((self as u8) + 1) % 10
         }
+    }
+
+    fn uses_ammo(self) -> bool {
+        !matches!(self, Self::Hammer | Self::Translocator)
     }
 
     fn switch_priority(self) -> u8 {
@@ -96,12 +106,13 @@ impl Weapon {
             Self::Flak => 11,
             Self::Rocket => 12,
             Self::Redeemer => 13,
+            Self::Translocator => 1,
         }
     }
 
     fn initial(self) -> u16 {
         match self {
-            Self::Hammer => 0,
+            Self::Hammer | Self::Translocator => 0,
             Self::Enforcer => 30,
             Self::Bio => 25,
             Self::Shock => 20,
@@ -117,7 +128,7 @@ impl Weapon {
 
     fn maximum(self) -> u16 {
         match self {
-            Self::Hammer => 0,
+            Self::Hammer | Self::Translocator => 0,
             Self::Enforcer | Self::Minigun => 199,
             Self::Bio => 100,
             Self::Shock => 50,
@@ -172,6 +183,7 @@ pub struct WeaponAssets {
     pub rocket: Option<RocketAnimations>,
     pub loaded: Motion,
     pub walking: Motion,
+    pub translocator: Option<deathmatch::translocation::Art>,
 }
 
 #[derive(Default)]
@@ -432,11 +444,9 @@ pub enum Item {
 
 impl Item {
     pub fn from_class(class: &str) -> Option<Self> {
-        if let Some(weapon) = Weapon::ALL
-            .iter()
-            .copied()
-            .find(|weapon| weapon.class().eq_ignore_ascii_case(class))
-        {
+        if let Some(weapon) = Weapon::ALL.iter().copied().find(|weapon| {
+            *weapon != Weapon::Translocator && weapon.class().eq_ignore_ascii_case(class)
+        }) {
             return Some(Self::Gun(weapon));
         }
         Some(match class.to_ascii_lowercase().as_str() {
@@ -704,8 +714,8 @@ pub struct Practice {
     amp_until: f32,
     amp_warning: f32,
     invis_until: f32,
-    owned: [bool; 11],
-    ammo: [u16; 11],
+    owned: [bool; Weapon::ALL.len()],
+    ammo: [u16; Weapon::ALL.len()],
     respawn: Vec<Option<f32>>,
     pub shock: shock::Shots,
     pub pulse_beam: Option<PulseBeam>,
@@ -768,8 +778,8 @@ impl Practice {
             amp_until: 0.0,
             amp_warning: 0.0,
             invis_until: 0.0,
-            owned: [false; 11],
-            ammo: [0; 11],
+            owned: [false; Weapon::ALL.len()],
+            ammo: [0; Weapon::ALL.len()],
             respawn: vec![None; map.props.len()],
             shock: shock::Shots::default(),
             pulse_beam: None,
@@ -1045,6 +1055,7 @@ impl Practice {
                     outgoing_scale: self.damage_scale(),
                 });
                 self.owned.fill(true);
+                self.owned[Weapon::Translocator as usize] = false;
                 for weapon in Weapon::ALL {
                     let pool = weapon.ammo_pool();
                     self.ammo[pool] = self.ammo[pool].max(initial_ammo(&map.arsenal, weapon));
@@ -2745,7 +2756,10 @@ mod tests {
         let bytes = std::fs::read(path).unwrap();
         let mut map = Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap();
         let camera = Camera::from_start(map.starts[11]);
-        for weapon in Weapon::ALL {
+        for weapon in Weapon::ALL
+            .into_iter()
+            .filter(|&weapon| weapon != Weapon::Translocator)
+        {
             let art = &map.arsenal[&weapon];
             assert!(
                 !art.primary_motion.frames.is_empty(),
@@ -2886,7 +2900,7 @@ mod tests {
         };
         game.reset_player(&map.arsenal);
         game.place_training_target(&map, &camera);
-        assert!(game.target.is_some() && game.owned().count() == Weapon::ALL.len());
+        assert!(game.target.is_some() && game.owned().count() == Weapon::ALL.len() - 1);
         game.weapon = Weapon::Rocket;
         game.weapon_state = WeaponState::Ready;
         for _ in 0..130 {

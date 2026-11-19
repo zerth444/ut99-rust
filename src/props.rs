@@ -799,6 +799,16 @@ pub fn load(
             alternate: cached_wave(&assets, &mut waves, visual.alt_sound),
             ..Default::default()
         };
+        if weapon == Weapon::Translocator {
+            weapon_assets.translocator = read_translocator(
+                &mut assets,
+                &mut class_cache,
+                &mut textures,
+                &mut waves,
+                class,
+                visual,
+            );
+        }
         if weapon == Weapon::Shock {
             weapon_assets.shock = Some(read_shock(
                 &mut assets,
@@ -1053,6 +1063,12 @@ pub fn load(
                     if weapon == Weapon::Enforcer {
                         weapon_assets.attack_start = motion(&["T1"], 1.3);
                         weapon_assets.attack_end = motion(&["T2"], 0.9);
+                    }
+                    if weapon == Weapon::Translocator {
+                        weapon_assets.primary_motion = motion(&["Throw"], 1.0);
+                        weapon_assets.alternate_motion = motion(&["Thrown"], 1.2);
+                        weapon_assets.select_motion = motion(&["Select"], 1.1);
+                        weapon_assets.loaded = motion(&["ThrownFrame"], 1.0);
                     }
                     weapon_assets.view = pose(rest);
                 }
@@ -1549,6 +1565,60 @@ fn projectile_art(
         }
     }
     art
+}
+
+fn read_translocator(
+    assets: &mut Assets<'_>,
+    classes: &mut HashMap<Object, Appearance>,
+    textures: &mut HashMap<Object, Option<Arc<Texture>>>,
+    waves: &mut HashMap<Object, Option<Arc<Wave>>>,
+    class: Object,
+    weapon: Appearance,
+) -> Option<crate::game::deathmatch::translocation::Art> {
+    use crate::game::deathmatch::translocation::Art;
+    let (package, export) = assets.object(class);
+    let mut properties = class_properties(package, export).ok()?;
+    let mut launch_speed = 1000.0;
+    while let Some(mut prop) = properties.next_tag().ok()? {
+        if prop.name == "MaxTossForce" {
+            launch_speed = prop.value.f32().ok()?.max(1.0);
+        }
+    }
+    let target = find_export(assets, "botpack", "TranslocatorTarget", "Class")?;
+    let appearance = appearance(assets, classes, Some(target));
+    let (package, export) = assets.object(target);
+    let mut properties = class_properties(package, export).ok()?;
+    let (mut threshold, mut mass, mut impact) = (20.0, 10.0, None);
+    while let Some(mut prop) = properties.next_tag().ok()? {
+        match prop.name {
+            "DisruptionThreshold" => threshold = prop.value.f32().ok()?.max(0.0),
+            "Mass" => mass = prop.value.f32().ok()?.max(1.0),
+            "ImpactSound" => impact = Some(prop.value.compact().ok()?),
+            _ => {}
+        }
+    }
+    let impact = impact.and_then(|reference| assets.resolve(target.package, reference));
+    let object = appearance.mesh?;
+    let (package, export) = assets.object(object);
+    let mesh = Mesh::read(package, export).ok()?;
+    let mut module = effect_motion(assets, textures, object, appearance, &mesh, &["Open"]);
+    module.rate *= 0.1;
+    let impact = cached_wave(assets, waves, impact);
+    let mut sound =
+        |name| cached_wave(assets, waves, find_export(assets, "botpack", name, "Sound"));
+    Some(Art {
+        module,
+        launch_speed,
+        threshold,
+        mass,
+        impact,
+        radius: appearance.collision_radius.unwrap_or(8.0),
+        height: appearance.collision_height.unwrap_or(4.0),
+        pickup: sound("AmmoPick"),
+        disrupted: sound("TDisrupt"),
+        teleport: sound("Resp2A"),
+        offset: weapon.fire_offset.unwrap_or_default(),
+    })
 }
 
 fn effect_motion(

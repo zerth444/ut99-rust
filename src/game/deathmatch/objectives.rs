@@ -71,6 +71,7 @@ enum FlagState {
 struct Flag {
     base: Vec3,
     state: FlagState,
+    previous_carrier: Option<(usize, f32)>,
 }
 
 #[derive(Clone, Copy)]
@@ -128,6 +129,7 @@ impl Objectives {
                 [red, blue].map(|base| Flag {
                     base,
                     state: FlagState::Home,
+                    previous_carrier: None,
                 })
             })
         } else {
@@ -183,6 +185,10 @@ impl Objectives {
                 if let Some((id, fighter)) = fighters
                     .iter()
                     .enumerate()
+                    .filter(|(id, _)| {
+                        flag.previous_carrier
+                            .is_none_or(|(owner, until)| owner != *id || time >= until)
+                    })
                     .filter(|(_, fighter)| touching(map, position, fighter))
                     .filter(|(_, fighter)| {
                         fighter.team != Some(team) || matches!(flag.state, FlagState::Dropped(..))
@@ -247,6 +253,23 @@ impl Objectives {
                 .iter()
                 .any(|flag| matches!(flag.state, FlagState::Held(owner) if owner == id))
         })
+    }
+
+    pub(super) fn drop_for_teleport(&mut self, id: usize, point: Vec3, time: f32, map: &Map) {
+        let Some(flag) = self
+            .flags
+            .iter_mut()
+            .flatten()
+            .find(|flag| matches!(flag.state, FlagState::Held(holder) if holder == id))
+        else {
+            return;
+        };
+        flag.state = if map.collision.ray(point, Vec3(0.0, 0.0, -250.0)).is_some() {
+            FlagState::Dropped(point, time + 25.0)
+        } else {
+            FlagState::Home
+        };
+        flag.previous_carrier = Some((id, time + 0.5));
     }
 
     pub(super) fn destination(&self, fighters: &[Fighter], id: usize) -> Option<Vec3> {

@@ -26,7 +26,7 @@ impl Inventory {
 
     pub fn grant_training_weapon(&mut self, weapon: Weapon) {
         self.owned[weapon as usize] = true;
-        if weapon != Weapon::Hammer {
+        if weapon.uses_ammo() {
             let pool = weapon.ammo_pool();
             self.training_capacity[pool] = true;
             self.ammo[pool] = 199;
@@ -42,7 +42,7 @@ impl Inventory {
     }
 
     pub fn usable(&self, weapon: Weapon) -> bool {
-        self.owns(weapon) && (weapon == Weapon::Hammer || self.ammo(weapon) > 0)
+        self.owns(weapon) && (!weapon.uses_ammo() || self.ammo(weapon) > 0)
     }
 
     pub fn grant_ammo(
@@ -125,7 +125,7 @@ impl Inventory {
             |weapon| rating(weapon, distance) + if Some(weapon) == favorite { 22.0 } else { 0.0 };
         Weapon::ALL
             .into_iter()
-            .filter(|&weapon| self.usable(weapon))
+            .filter(|&weapon| weapon != Weapon::Translocator && self.usable(weapon))
             .max_by(|&a, &b| score(a).total_cmp(&score(b)))
             .unwrap_or(Weapon::Hammer)
     }
@@ -243,6 +243,7 @@ pub(super) fn shot(weapon: Weapon, alt: bool) -> Shot {
     }
     use Kind::*;
     match (weapon, alt) {
+        (Weapon::Translocator, _) => trace(0, 0.0, 0, 0.0),
         (Weapon::Hammer, false) => trace(44, 0.58, 0, 96.0),
         (Weapon::Hammer, true) => trace(28, 0.34, 0, 78.0),
         (Weapon::Enforcer, _) => bullet(),

@@ -11,6 +11,7 @@ mod guidance;
 mod navigation;
 mod objectives;
 mod timestep;
+pub(crate) mod translocation;
 mod turrets;
 
 use super::{
@@ -86,6 +87,8 @@ pub struct Fighter {
     power: ActivePowerups,
     inventory: Inventory,
     pub weapon: Weapon,
+    translocator: Option<translocation::Module>,
+    translocator_ready: f32,
     pub selected_at: f32,
     pickup_time: f32,
     pickup: Option<Item>,
@@ -153,6 +156,8 @@ impl Fighter {
             power: ActivePowerups::default(),
             inventory: Inventory::new(map),
             weapon: Weapon::Enforcer,
+            translocator: None,
+            translocator_ready: 0.5,
             selected_at: f32::NEG_INFINITY,
             pickup_time: f32::NEG_INFINITY,
             pickup: None,
@@ -208,7 +213,9 @@ impl Fighter {
     }
 
     pub fn ammo(&self) -> Option<u16> {
-        (self.weapon != Weapon::Hammer).then(|| self.inventory.ammo(self.weapon))
+        self.weapon
+            .uses_ammo()
+            .then(|| self.inventory.ammo(self.weapon))
     }
 
     pub fn zoomed(&self) -> bool {
@@ -305,6 +312,11 @@ impl Fighter {
             .or_else(|| {
                 art.select_motion
                     .sample_toward(time - self.selected_at, Some(&art.view))
+            })
+            .or_else(|| {
+                (self.weapon == Weapon::Translocator && self.translocator.is_some())
+                    .then(|| art.loaded.sample(0.0))
+                    .flatten()
             })
             .or_else(|| {
                 (self.weapon == Weapon::Bio && self.gait != Gait::Idle)
@@ -692,7 +704,11 @@ pub(crate) struct DroppedWeapon {
 impl DroppedWeapon {
     fn from_fighter(map: &Map, fighter: &Fighter, time: f32) -> Option<Self> {
         let weapon = fighter.weapon;
-        if matches!(weapon, Weapon::Hammer | Weapon::Enforcer) || !fighter.inventory.owns(weapon) {
+        if matches!(
+            weapon,
+            Weapon::Hammer | Weapon::Enforcer | Weapon::Translocator
+        ) || !fighter.inventory.owns(weapon)
+        {
             return None;
         }
         let prop = map
@@ -763,7 +779,12 @@ impl shock::Targets for ShockTargets<'_> {
                 .map(|(id, at)| (shock::Target::Projectile(id), at)),
         );
         shock::nearest(
-            contact,
+            shock::nearest(
+                contact,
+                self.game
+                    .translocator_hit(self.map, owner, start, delta)
+                    .map(|(id, at)| (shock::Target::Translocator(id), at)),
+            ),
             self.game
                 .objective_target(self.map, owner, start, delta)
                 .map(|(at, target)| (shock::Target::Objective(target), at)),
@@ -790,6 +811,13 @@ impl shock::Targets for ShockTargets<'_> {
                 self.game
                     .intercept(self.map, index, owner, self.hits, sounds);
             }
+            shock::Target::Translocator(id) => self.game.damage_translocator(
+                self.map,
+                id,
+                owner,
+                damage.saturating_mul(self.game.shock_damage_scale(owner)),
+                direction * (f32::from(damage) * 3.4),
+            ),
             shock::Target::Objective(target) => {
                 let scale = self.game.shock_damage_scale(owner);
                 self.game.damage_objective(
@@ -982,7 +1010,16 @@ impl Match {
     fn spawn_at(&mut self, map: &Map, start: usize) -> Fighter {
         self.recent_spawns[start] = Some(self.spawn_sequence);
         self.spawn_sequence += 1;
-        Fighter::spawn(map, start, self.time)
+        let mut fighter = Fighter::spawn(map, start, self.time);
+        if matches!(self.mode(), Mode::CaptureTheFlag | Mode::Domination)
+            && map
+                .arsenal
+                .get(&Weapon::Translocator)
+                .is_some_and(|assets| assets.translocator.is_some())
+        {
+            fighter.inventory.pickup(&map.arsenal, Weapon::Translocator);
+        }
+        fighter
     }
 
     pub fn mode(&self) -> Mode {
@@ -1509,7 +1546,7 @@ impl Match {
             ammo: player.has_weapon().then(|| player.ammo()).flatten(),
             owned: Weapon::ALL.map(|weapon| player.inventory.owns(weapon)),
             fractions: Weapon::ALL.map(|weapon| {
-                (weapon != Weapon::Hammer).then(|| {
+                weapon.uses_ammo().then(|| {
                     f32::from(player.inventory.ammo(weapon))
                         / f32::from(player.inventory.capacity(&map.arsenal, weapon).max(1))
                 })
@@ -2181,6 +2218,7 @@ impl Match {
         self.separate_fighters(map);
         self.collect(map, &mut sounds);
         self.update_drops(map, dt, &mut sounds);
+        self.move_translocators(map, dt, &mut sounds);
         self.update_rocket_locks(map, &mut sounds);
         if let Some(detonation) = manual_detonation {
             self.detonate(map, vec![detonation], &mut hits, &mut sounds);
@@ -2814,6 +2852,10 @@ impl Match {
             fighter.wait_for_fire_release = false;
         }
         let weapon = fighter.weapon;
+        if weapon == Weapon::Translocator {
+            self.use_translocator(map, id, input, hits, sounds);
+            return;
+        }
         let held_alt = input.alternate && !input.primary;
         let holding = input.primary || input.alternate;
         fighter.zoom.update(held_alt, dt, weapon == Weapon::Sniper);
@@ -3192,21 +3234,38 @@ impl Match {
                 let clipped = end - start;
                 let target = nearest_hit(&self.fighters, id, start, clipped, [0.0, 0.0]);
                 let projectile = self.closest_explosive(map, start, clipped);
+                let module = (!pulse_alt)
+                    .then(|| self.translocator_hit(map, id, start, clipped))
+                    .flatten();
                 let objective = (!pulse_alt)
                     .then(|| self.objective_target(map, id, start, clipped))
                     .flatten()
                     .filter(|&(at, _)| {
                         target.is_none_or(|(_, other)| at < other)
                             && projectile.is_none_or(|(_, other)| at < other)
+                            && module.is_none_or(|(_, other)| at < other)
                     });
                 let intercepted = projectile.filter(|&(_, at)| {
-                    objective.is_none() && target.is_none_or(|(_, victim_at)| at < victim_at)
+                    objective.is_none()
+                        && target.is_none_or(|(_, victim_at)| at < victim_at)
+                        && module.is_none_or(|(_, other)| at < other)
                 });
                 let fraction = if let Some((at, objective)) = objective {
                     self.damage_objective(map, id, objective, damage, "shot");
                     at
                 } else if let Some((projectile, at)) = intercepted {
                     self.intercept(map, projectile, id, hits, sounds);
+                    at
+                } else if let Some((owner, at)) =
+                    module.filter(|&(_, at)| target.is_none_or(|(_, victim_at)| at < victim_at))
+                {
+                    self.damage_translocator(
+                        map,
+                        owner,
+                        id,
+                        damage,
+                        unit(delta) * (3.4 * f32::from(base_damage)),
+                    );
                     at
                 } else if let Some((victim, at)) = target
                     && !pulse_alt
@@ -3264,7 +3323,10 @@ impl Match {
                             delta,
                             visible: clipped * fraction,
                             wall: wall.filter(|_| {
-                                target.is_none() && intercepted.is_none() && objective.is_none()
+                                target.is_none()
+                                    && intercepted.is_none()
+                                    && objective.is_none()
+                                    && module.is_none()
                             }),
                             case_origin,
                         },
@@ -3420,6 +3482,7 @@ impl Match {
     fn shock_blast(&mut self, map: &Map, owner: usize, blast: shock::Blast, hits: &mut Vec<Hit>) {
         let scale = self.shock_damage_scale(owner);
         self.objective_blast(map, owner, &blast, scale, "jolted");
+        self.blast_translocators(map, owner, &blast, scale);
         for (victim, fighter) in self
             .fighters
             .iter()
@@ -4099,6 +4162,7 @@ impl Match {
                 if warhead { damage_scale } else { 1 },
                 damage_type,
             );
+            self.blast_translocators(map, owner, &blast, if warhead { damage_scale } else { 1 });
             for (victim, fighter) in self
                 .fighters
                 .iter()
@@ -4260,7 +4324,9 @@ impl Match {
         let victim = &mut self.fighters[hit.victim];
         if victim.health == 0
             || hit.damage == 0
-            || ((hit.owner.is_some() || cannon) && self.time < victim.protected_until)
+            || (hit.damage != u16::MAX
+                && (hit.owner.is_some() || cannon)
+                && self.time < victim.protected_until)
         {
             return;
         }
@@ -8623,7 +8689,10 @@ mod tests {
         );
         let mut sounds = SoundEvents::default();
         let mut hits = Vec::new();
-        for weapon in Weapon::ALL {
+        for weapon in Weapon::ALL
+            .into_iter()
+            .filter(|&weapon| weapon != Weapon::Translocator)
+        {
             for alternate in [false, true] {
                 game.time += 10.0;
                 let fighter = &mut game.fighters[1];

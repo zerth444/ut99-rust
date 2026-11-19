@@ -459,6 +459,20 @@ impl Frame {
         );
         self.layer(Layer::World);
         let view = self.camera_view(camera);
+        for (position, direction, pose) in game.translocator_modules(map) {
+            let model = view.in_model(position, direction, 1.0);
+            self.draw_lit_faces(
+                pose.current,
+                &model,
+                game.time,
+                false,
+                Some(pose),
+                None,
+                &map.scene_lights,
+                None,
+                None,
+            );
+        }
         for (barrel, offset) in game.training_barrels(map) {
             let model = View {
                 eye: view.eye - offset,
