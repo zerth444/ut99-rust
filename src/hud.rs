@@ -289,10 +289,9 @@ impl Hud {
                 .winner()
                 .map(|winner| (winner, game.fighters[winner].team))
             {
-                Some((_, Some(0))) => "Red team wins".to_owned(),
-                Some((_, Some(_))) => "Blue team wins".to_owned(),
+                Some((_, Some(team))) => format!("{} wins", game.team_label(team)),
                 Some((0, None)) => "You won".to_owned(),
-                Some((winner, None)) => format!("{} wins", Match::label(winner)),
+                Some((winner, None)) => format!("{} wins", game.fighter_label(winner)),
                 None => "Match drawn".to_owned(),
             }
         } else if game.training_assault() {
@@ -365,6 +364,16 @@ impl Hud {
             &details,
             dim,
         );
+        if let Some((allies, enemy)) = game.named_assault_teams() {
+            self.text(
+                frame,
+                left + px(22.0),
+                top + px(56.0),
+                0.85 * scale,
+                &format!("{allies} vs {enemy}"),
+                dim,
+            );
+        }
         let columns = if game.finished {
             [22.0, 222.0, 289.0]
         } else {
@@ -399,11 +408,7 @@ impl Hud {
                 frame.shade([left, y, width, px(26.0)], [0.20, 0.25, 0.31], 0.17);
             }
             for (x, value) in columns.into_iter().zip([
-                if id == 0 {
-                    "Player (you)".into()
-                } else {
-                    Match::label(id)
-                },
+                game.fighter_label(id),
                 fighter.score.to_string(),
                 game.lives_left(id)
                     .map_or_else(|| fighter.deaths.to_string(), |lives| lives.to_string()),

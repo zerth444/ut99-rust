@@ -799,8 +799,14 @@ impl shock::Targets for ShockTargets<'_> {
     }
 }
 
+pub(crate) struct AssaultRoster {
+    pub allies: usize,
+    pub teams: [Option<String>; 2],
+    pub bots: Vec<Option<String>>,
+}
+
 pub struct Match {
-    assault_allies: Option<usize>,
+    assault_roster: Option<AssaultRoster>,
     rules: Rules,
     objectives: objectives::Objectives,
     assault: Option<assault::Round>,
@@ -847,18 +853,18 @@ pub struct AssaultStatus<'a> {
 
 impl Match {
     pub fn new(map: &Map, start: usize, rules: Rules) -> Self {
-        Self::with_assault_allies(map, start, rules, None)
+        Self::with_assault_roster(map, start, rules, None)
     }
 
-    pub(crate) fn with_assault_allies(
+    pub(crate) fn with_assault_roster(
         map: &Map,
         start: usize,
         rules: Rules,
-        assault_allies: Option<usize>,
+        assault_roster: Option<AssaultRoster>,
     ) -> Self {
         let mut game = Self {
             rules,
-            assault_allies,
+            assault_roster,
             objectives: objectives::Objectives::new(map, rules.mode),
             assault: map
                 .assault
@@ -1059,8 +1065,8 @@ impl Match {
         {
             return Some(usize::from(fighter > training.allies));
         }
-        if let Some(allies) = self.assault_allies {
-            return Some(usize::from(fighter > allies));
+        if let Some(roster) = &self.assault_roster {
+            return Some(usize::from(fighter > roster.allies));
         }
         self.rules.mode.team_based().then_some(fighter % 2)
     }
@@ -1335,12 +1341,28 @@ impl Match {
             .then_some(first)
     }
 
-    pub fn label(id: usize) -> String {
+    pub fn fighter_label(&self, id: usize) -> String {
         if id == 0 {
-            "PLAYER".into()
-        } else {
-            format!("BOT {id}")
+            return "Player (you)".into();
         }
+        self.assault_roster
+            .as_ref()
+            .and_then(|roster| roster.bots.get(id - 1))
+            .and_then(|name| name.clone())
+            .unwrap_or_else(|| format!("BOT {id}"))
+    }
+
+    pub fn team_label(&self, team: usize) -> &str {
+        self.assault_roster
+            .as_ref()
+            .and_then(|roster| roster.teams.get(team))
+            .and_then(|name| name.as_deref())
+            .unwrap_or(if team == 0 { "Red team" } else { "Blue team" })
+    }
+
+    pub fn named_assault_teams(&self) -> Option<(&str, &str)> {
+        let roster = self.assault_roster.as_ref()?;
+        Some((roster.teams[0].as_deref()?, roster.teams[1].as_deref()?))
     }
 
     pub fn pickup_notice(&self) -> Option<Item> {
@@ -5412,6 +5434,16 @@ mod tests {
             );
             assert!(!rated.training_assault());
             assert_eq!(frontend.next_ladder_stage(next, &rated), None);
+            let (allies, enemies) = rated.named_assault_teams().unwrap();
+            assert_ne!(allies, enemies);
+            assert!(
+                rated
+                    .fighters
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .all(|(id, _)| !rated.fighter_label(id).starts_with("BOT "))
+            );
         }
         game.step(
             &mut map,

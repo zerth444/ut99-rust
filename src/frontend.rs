@@ -30,7 +30,7 @@ pub struct Frontend {
     pub logo: Option<(Map, Camera)>,
     match_maps: Vec<PathBuf>,
     pub pending_arena: Option<Map>,
-    ladder: Vec<ladder::Stage>,
+    ladder: ladder::Campaign,
     art: MenuArt,
 }
 
@@ -150,6 +150,7 @@ impl Frontend {
     pub fn load_ladder(&self, stage: usize) -> io::Result<Map> {
         let index = self
             .ladder
+            .stages
             .get(stage)
             .and_then(|entry| entry.installed)
             .ok_or_else(|| {
@@ -173,13 +174,22 @@ impl Frontend {
 
     pub fn ladder_names(&self) -> Vec<(String, bool)> {
         self.ladder
+            .stages
             .iter()
             .map(|stage| (stage.map.clone(), stage.installed.is_some()))
             .collect()
     }
 
     pub fn ladder_len(&self) -> usize {
-        self.ladder.len()
+        self.ladder.stages.len()
+    }
+
+    pub fn ladder_teams(&self) -> Vec<String> {
+        self.ladder
+            .teams
+            .iter()
+            .map(|team| team.name.clone())
+            .collect()
     }
 
     pub fn next_ladder_stage(&self, stage: usize, game: &Match) -> Option<usize> {
@@ -204,8 +214,9 @@ impl Frontend {
                 },
             ),
             Action::StartLadder(index) => {
-                let entry = &self.ladder[index];
-                Match::with_assault_allies(map, start, entry.rules(settings), Some(entry.allies))
+                let entry = &self.ladder.stages[index];
+                let roster = self.ladder.roster(entry, settings.assault_team);
+                Match::with_assault_roster(map, start, entry.rules(settings), Some(roster))
             }
             _ => unreachable!("starting a match requires a launch action"),
         }
@@ -386,7 +397,9 @@ pub struct Menu {
     pub session: MenuSession,
     pub match_names: Vec<String>,
     pub ladder_names: Vec<(String, bool)>,
+    pub ladder_teams: Vec<String>,
     pub ladder_stage: Option<usize>,
+    pub ladder_team: usize,
     match_setup: Option<MatchSetup>,
     preferences: bool,
     tab: usize,
@@ -728,11 +741,20 @@ impl Menu {
         Action::None
     }
 
+    fn shift_ladder_team(&mut self, settings: &Settings, direction: i32) {
+        let count = self.ladder_teams.len() as i32;
+        if settings.assault_progress == 0 && count > 1 {
+            self.ladder_team = (self.ladder_team as i32 + direction).rem_euclid(count) as usize;
+        }
+    }
+
     pub fn key(&mut self, key: u16, settings: &mut Settings) -> Action {
         if let Some(stage) = self.ladder_stage {
             self.status.clear();
             match key {
                 VK_ESCAPE => self.ladder_stage = None,
+                VK_LEFT => self.shift_ladder_team(settings, -1),
+                VK_RIGHT => self.shift_ladder_team(settings, 1),
                 VK_UP => self.ladder_stage = Some(stage.saturating_sub(1)),
                 VK_DOWN => {
                     self.ladder_stage =
@@ -873,6 +895,10 @@ impl Menu {
                 || ((222..305).contains(&x) && (210..226).contains(&y))
             {
                 self.ladder_stage = None;
+            } else if (26..45).contains(&y) && (128..151).contains(&x) {
+                self.shift_ladder_team(settings, -1);
+            } else if (26..45).contains(&y) && (391..415).contains(&x) {
+                self.shift_ladder_team(settings, 1);
             } else if (12..416).contains(&x) && (47..191).contains(&y) {
                 let row = stage / MAPS_PER_PAGE * MAPS_PER_PAGE + ((y - 47) / 18) as usize;
                 if row < self.ladder_names.len() {
@@ -1135,6 +1161,14 @@ impl Menu {
             ui.window(frame, art, rect);
             label(frame, x + 5, y + 1, "Tournament");
             label(frame, x + 12, y + 29, "Assault");
+            if let Some(team) = self.ladder_teams.get(self.ladder_team) {
+                ui.tile(frame, None, [x + 129, y + 26, 286, 18], FIELD_COLOR);
+                label(frame, x + 156, y + 29, &format!("Team  {team}"));
+                if settings.assault_progress == 0 && self.ladder_teams.len() > 1 {
+                    label(frame, x + 136, y + 29, "<");
+                    label(frame, x + 398, y + 29, ">");
+                }
+            }
             ui.tile(frame, None, [x + 12, y + 47, 404, 144], FIELD_COLOR);
             let page = stage / MAPS_PER_PAGE * MAPS_PER_PAGE;
             for (row, (map, installed)) in self
@@ -1725,7 +1759,10 @@ mod tests {
             ("AS-Frigate".into(), true),
             ("AS-HiSpeed".into(), false),
         ];
+        menu.ladder_teams = vec!["First team".into(), "Second team".into()];
         assert!(menu.activate(1, &settings) == Action::None);
+        menu.key(VK_RIGHT, &mut settings);
+        assert_eq!(menu.ladder_team, 1);
         assert!(menu.key(VK_RETURN, &mut settings) == Action::StartLadder(0));
         menu.key(VK_DOWN, &mut settings);
         assert!(menu.key(VK_RETURN, &mut settings) == Action::None);
@@ -1734,6 +1771,8 @@ mod tests {
         assert!(!settings.record_assault_win(0));
         assert!(!settings.record_assault_win(2));
         menu.activate(1, &settings);
+        menu.key(VK_LEFT, &mut settings);
+        assert_eq!(menu.ladder_team, 1);
         assert!(menu.key(VK_RETURN, &mut settings) == Action::StartLadder(1));
         assert!(settings.record_assault_win(1));
         menu.key(VK_DOWN, &mut settings);

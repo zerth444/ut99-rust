@@ -38,6 +38,7 @@ pub struct Settings {
     pub frag_limit: u32,
     pub match_minutes: u32,
     pub assault_progress: usize,
+    pub assault_team: usize,
     pub gui_skin: usize,
     pub field_of_view: u32,
     pub hud_scale: u32,
@@ -66,6 +67,7 @@ impl Default for Settings {
             frag_limit: 10,
             match_minutes: 5,
             assault_progress: 0,
+            assault_team: 0,
             gui_skin: 0,
             field_of_view: 90,
             hud_scale: 100,
@@ -118,6 +120,7 @@ impl Settings {
                 "frag_limit" => settings.frag_limit = value.min(100),
                 "match_minutes" => settings.match_minutes = value.min(60),
                 "assault_progress" => settings.assault_progress = value.min(32) as usize,
+                "assault_team" => settings.assault_team = value.min(31) as usize,
                 "gui_skin" => settings.gui_skin = (value as usize).min(GUI_SKINS.len() - 1),
                 "fov" => settings.field_of_view = value.clamp(75, 120),
                 "hud_scale" => settings.hud_scale = value.clamp(50, 150),
@@ -182,8 +185,12 @@ impl Settings {
         use std::fmt::Write;
         let _ = writeln!(
             text,
-            "bot_count={}\nfrag_limit={}\nmatch_minutes={}\nassault_progress={}",
-            self.bot_count, self.frag_limit, self.match_minutes, self.assault_progress
+            "bot_count={}\nfrag_limit={}\nmatch_minutes={}\nassault_progress={}\nassault_team={}",
+            self.bot_count,
+            self.frag_limit,
+            self.match_minutes,
+            self.assault_progress,
+            self.assault_team
         );
         for (index, key) in self.bindings.iter().enumerate() {
             let _ = writeln!(text, "bind{index}={key}");
@@ -248,6 +255,7 @@ mod tests {
         settings.match_minutes = 12;
         assert!(settings.record_assault_win(0));
         assert!(settings.record_assault_win(1));
+        settings.assault_team = 3;
         settings.bind(0, b'I' as u16);
         settings.bind(6, 2);
         settings.save(&path).unwrap();

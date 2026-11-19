@@ -1130,6 +1130,10 @@ fn run_frontend(
     menu.session = session;
     menu.match_names = frontend.match_names();
     menu.ladder_names = frontend.ladder_names();
+    menu.ladder_teams = frontend.ladder_teams();
+    menu.ladder_team = settings
+        .assault_team
+        .min(menu.ladder_teams.len().saturating_sub(1));
     let logo = frontend.logo.as_ref().map(|(map, _)| map);
     let mut frame = Frame::hardware(
         intro
@@ -1245,6 +1249,12 @@ fn run_frontend(
                         },
                         Action::StartLadder(stage) => match frontend.load_ladder(stage) {
                             Ok(arena) => {
+                                if settings.assault_progress == 0
+                                    && settings.assault_team != menu.ladder_team
+                                {
+                                    settings.assault_team = menu.ladder_team;
+                                    save_settings(settings, settings_path);
+                                }
                                 frontend.pending_arena = Some(arena);
                                 return Ok(action);
                             }
