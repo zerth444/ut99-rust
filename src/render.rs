@@ -424,7 +424,7 @@ impl Frame {
         let player = &game.fighters[0];
         let piloting = game.guidance_left().is_some();
         let dead = player.fell_at.is_some();
-        let (roll, height) = game.view_shake(map, camera.position);
+        let (roll, height) = game.view_shake(camera.position);
         let shaken = Camera {
             position: camera.position + Vec3(0.0, 0.0, height),
             ..*camera

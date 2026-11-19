@@ -19,8 +19,69 @@ struct Scheduled {
 }
 
 struct GroundShake {
-    started: f32,
-    toss_at: f32,
+    remaining: f32,
+    next: f32,
+    initial: bool,
+}
+
+#[derive(Default)]
+struct ViewShake {
+    remaining: f32,
+    magnitude: f32,
+    roll: f32,
+    increasing: bool,
+    height: f32,
+    height_timer: f32,
+}
+
+impl ViewShake {
+    fn start(&mut self, duration: f32, magnitude: f32) {
+        if magnitude > self.magnitude || duration >= self.remaining {
+            self.remaining = duration;
+            self.magnitude = magnitude;
+            self.height_timer = 0.0;
+            self.height = -1.1 * 0.015 * magnitude;
+        }
+    }
+
+    fn step(&mut self, dt: f32, rng: &mut u32) {
+        let roll_step = 10.0 * dt.min(0.1);
+        if self.remaining <= 0.0 {
+            self.height = 0.0;
+            self.roll -=
+                self.roll.signum() * (self.roll.abs().max(500.0) * roll_step).min(self.roll.abs());
+            return;
+        }
+        self.remaining = (self.remaining - dt).max(0.0);
+        if self.height_timer == 0.0 {
+            self.height_timer = 0.1;
+            self.height = -1.1 * 0.015 * self.magnitude;
+        } else {
+            self.height_timer -= dt;
+            if self.height_timer < 0.0 {
+                self.height_timer = 0.2 * roll(rng);
+                self.height = ballistics::jitter(rng) * 0.015 * self.magnitude;
+            }
+        }
+
+        let direction = if self.increasing { 1.0 } else { -1.0 };
+        self.roll += direction * (roll_step * self.magnitude).trunc();
+        let outward = self.roll * direction;
+        let turn = (0.5 + roll(rng)) * self.magnitude;
+        if outward > 1.3 * self.magnitude {
+            self.roll = direction * 1.3 * self.magnitude;
+            self.increasing = direction < 0.0;
+        } else {
+            self.increasing = if direction > 0.0 {
+                outward < turn
+            } else {
+                outward > 0.0 && outward > turn
+            };
+            if roll(rng) < 3.0 * dt {
+                self.increasing = !self.increasing;
+            }
+        }
+    }
 }
 
 struct Shell {
@@ -47,6 +108,8 @@ pub(super) struct Environment {
     charges: Vec<f32>,
     timers: Vec<Scheduled>,
     quakes: Vec<Option<GroundShake>>,
+    view_shake: ViewShake,
+    view_rng: u32,
     shells: Vec<Shell>,
     explosions: Vec<Explosion>,
     rng: u32,
@@ -76,6 +139,8 @@ impl Environment {
                 })
                 .collect(),
             quakes: data.quakes.iter().map(|_| None).collect(),
+            view_shake: ViewShake::default(),
+            view_rng: 0x78a3_194e ^ side as u32,
             shells: Vec::new(),
             explosions: Vec::new(),
             rng,
@@ -125,8 +190,9 @@ impl Environment {
         for (quake, active) in data.quakes.iter().zip(&mut self.quakes) {
             if quake.tag == event {
                 *active = Some(GroundShake {
-                    started: time,
-                    toss_at: time,
+                    remaining: quake.duration.unwrap_or_default(),
+                    next: time,
+                    initial: true,
                 });
             }
         }
@@ -167,61 +233,50 @@ impl Environment {
         }
     }
 
-    pub fn quake_impulse(&mut self, data: &Effects, player: &Fighter, time: f32) -> Vec3 {
+    pub fn tick_quakes(&mut self, data: &Effects, player: &Fighter, time: f32, dt: f32) -> Vec3 {
         let mut impulse = Vec3::default();
         for (quake, active) in data.quakes.iter().zip(&mut self.quakes) {
             let Some(state) = active else {
                 continue;
             };
-            let age = time - state.started;
-            if age > quake.duration.unwrap_or_default() {
-                *active = None;
+            if time < state.next {
                 continue;
             }
-            if !quake.toss.unwrap_or(false) || time < state.toss_at {
-                continue;
-            }
-            state.toss_at += 0.5;
+            let magnitude = quake.magnitude.unwrap_or_default();
+            let toss = quake.toss.unwrap_or(false);
             let delta = player.walker.position - quake.position;
-            if player.health == 0
-                || !player.walker.grounded
-                || delta.dot(delta) >= quake.radius.unwrap_or_default().powi(2)
-            {
-                continue;
+            if player.health > 0 && delta.dot(delta) < quake.radius.unwrap_or_default().powi(2) {
+                self.view_shake.start(state.remaining, magnitude);
+                if toss && player.walker.grounded {
+                    let strength = magnitude * if state.initial { 0.18 } else { 0.15 };
+                    let angle = roll(&mut self.rng) * std::f32::consts::TAU;
+                    let pitch = ballistics::jitter(&mut self.rng);
+                    let horizontal = strength * (1.0 - pitch * pitch).max(0.0).sqrt();
+                    impulse = impulse
+                        + Vec3(
+                            horizontal * angle.cos(),
+                            horizontal * angle.sin(),
+                            (strength * pitch).abs().max(120.0),
+                        );
+                }
             }
-            let strength =
-                quake.magnitude.unwrap_or_default() * if age < 0.5 { 0.18 } else { 0.15 };
-            let angle = roll(&mut self.rng) * std::f32::consts::TAU;
-            let pitch = ballistics::jitter(&mut self.rng);
-            let horizontal = strength * (1.0 - pitch * pitch).max(0.0).sqrt();
-            impulse = impulse
-                + Vec3(
-                    horizontal * angle.cos(),
-                    horizontal * angle.sin(),
-                    (strength * pitch).abs().max(120.0),
-                );
+            if toss && state.remaining > 0.5 {
+                state.next += 0.5;
+                state.remaining -= 0.5;
+                state.initial = false;
+            } else {
+                *active = None;
+            }
         }
+        self.view_shake.step(dt, &mut self.view_rng);
         impulse
     }
 
-    pub fn shake(&self, data: &Effects, eye: Vec3, time: f32) -> (f32, f32) {
-        let mut roll = 0.0;
-        let mut z = 0.0;
-        for (quake, active) in data.quakes.iter().zip(&self.quakes) {
-            let Some(active) = active else {
-                continue;
-            };
-            let age = time - active.started;
-            let duration = quake.duration.unwrap_or_default();
-            let offset = eye - quake.position;
-            if age >= duration || offset.dot(offset) >= quake.radius.unwrap_or_default().powi(2) {
-                continue;
-            }
-            let magnitude = quake.magnitude.unwrap_or_default() * (1.0 - age / duration);
-            roll += (age * 27.0).sin() * magnitude * std::f32::consts::TAU / 65_536.0;
-            z += (age * 32.0).sin() * 0.015 * magnitude;
-        }
-        (roll, z)
+    pub fn shake(&self) -> (f32, f32) {
+        (
+            self.view_shake.roll * std::f32::consts::TAU / 65_536.0,
+            self.view_shake.height,
+        )
     }
 
     pub fn tick(
@@ -461,6 +516,26 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn view_shake_keeps_the_stronger_active_pulse_and_levels_afterward() {
+        let mut shake = ViewShake::default();
+        let mut rng = 0x1ce9_fa3d;
+        shake.start(1.5, 1000.0);
+        shake.step(0.025, &mut rng);
+        assert_eq!(shake.roll, -250.0);
+        assert!((shake.height + 16.5).abs() < 0.001);
+        shake.start(0.5, 500.0);
+        assert_eq!(shake.magnitude, 1000.0);
+        for _ in 0..60 {
+            shake.step(0.025, &mut rng);
+            assert!(shake.roll.abs() <= 1300.0);
+        }
+        for _ in 0..20 {
+            shake.step(0.025, &mut rng);
+        }
+        assert_eq!((shake.roll, shake.height), (0.0, 0.0));
+    }
+
+    #[test]
     #[ignore = "requires the local reference-client map installation"]
     fn overlord_launches_its_mortar_on_the_map_timer_and_reaches_the_bsp() {
         let path = Path::new("local/reference-client/Maps/AS-Overlord.unr");
@@ -559,6 +634,9 @@ mod tests {
         let mut spent = 0;
         let mut shook = false;
         for _ in 0..630 {
+            if (3.85..4.0).contains(&game.time) {
+                game.fighters[0].walker.position = tremor_center;
+            }
             game.step(&mut map, Command::default(), 1.0 / 60.0);
             let environment = &game.assault.as_ref().unwrap().environment;
             spent = environment
@@ -566,7 +644,7 @@ mod tests {
                 .iter()
                 .filter(|&&stage| stage == f32::NEG_INFINITY)
                 .count();
-            let (roll, height) = game.view_shake(&map, tremor_center);
+            let (roll, height) = game.view_shake(tremor_center);
             shook |= roll != 0.0 || height != 0.0;
             if spent > 1 && shook {
                 break;

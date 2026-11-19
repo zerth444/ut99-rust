@@ -1574,15 +1574,12 @@ impl Match {
         )
     }
 
-    pub(crate) fn view_shake(&self, map: &Map, eye: Vec3) -> (f32, f32) {
+    pub(crate) fn view_shake(&self, eye: Vec3) -> (f32, f32) {
         let (nuclear_roll, nuclear_height) = self.warhead_shake(eye);
         let (roll, height) = self
             .assault
             .as_ref()
-            .zip(map.assault.as_ref())
-            .map_or((0.0, 0.0), |(round, data)| {
-                round.environment.shake(&data.effects, eye, self.time)
-            });
+            .map_or((0.0, 0.0), |round| round.environment.shake());
         (roll + nuclear_roll, height + nuclear_height)
     }
 
@@ -1936,13 +1933,17 @@ impl Match {
         self.ballistics
             .update(map, None, self.time, dt, &mut sounds);
         self.tick_defenses(map, dt, &mut sounds);
+        let debris_view = self
+            .assault
+            .as_ref()
+            .map(|_| self.render_view(map, 1.0, 0.0));
         if let Some(round) = &mut self.assault {
             round.tick(map, &self.fighters, self.time, &mut sounds);
             if let Some(data) = &map.assault {
                 let impulse =
                     round
                         .environment
-                        .quake_impulse(&data.effects, &self.fighters[0], self.time);
+                        .tick_quakes(&data.effects, &self.fighters[0], self.time, dt);
                 self.fighters[0].walker.add_velocity(impulse);
             }
             let (hazard_hits, wall_events) = round.environment.tick(
@@ -1958,10 +1959,10 @@ impl Match {
             for event in wall_events {
                 round.emit(self.time, event, false);
             }
-            if let Some(data) = &map.assault {
+            if let (Some(data), Some(view)) = (&map.assault, &debris_view) {
                 round
                     .debris
-                    .tick(map, &data.effects, self.time, dt, &mut sounds);
+                    .tick(map, &data.effects, view, self.time, dt, &mut sounds);
             }
             for hit in hazard_hits {
                 self.apply_hit(map, hit, &mut sounds);

@@ -1,8 +1,10 @@
 use crate::{
     assault::Effects,
+    collision::Collision,
     game::{ballistics, shock::Blast},
     map::{Face, Map, Vec3},
     mover::rotate,
+    render::Camera,
     sound::{CONTACT_SOUND_RADIUS, SoundEvents},
 };
 
@@ -23,6 +25,42 @@ struct Fragment {
     resting: bool,
     in_water: bool,
     expires: f32,
+    phase: Phase,
+}
+
+enum Phase {
+    Flying { until: f32 },
+    Dying { check_at: f32 },
+}
+
+impl Fragment {
+    fn begin_dying(&mut self, time: f32) {
+        if matches!(self.phase, Phase::Flying { .. }) {
+            self.phase = Phase::Dying {
+                check_at: time + 1.5,
+            };
+        }
+    }
+
+    fn keep(&mut self, collision: &Collision, view: &Camera, time: f32) -> bool {
+        if time >= self.expires {
+            return false;
+        }
+        match &mut self.phase {
+            Phase::Flying { until } if time >= *until => {
+                let until = *until;
+                self.begin_dying(until);
+            }
+            Phase::Dying { check_at } if time >= *check_at => {
+                *check_at += 1.5;
+                let offset = self.position - view.position;
+                return offset.dot(view.look_direction()) > 0.0
+                    && collision.ray(view.position, offset).is_none();
+            }
+            _ => {}
+        }
+        true
+    }
 }
 
 pub(super) struct Debris {
@@ -184,6 +222,7 @@ impl Debris {
                     resting: false,
                     in_water: false,
                     expires: time + 20.0 + 40.0 * roll(&mut self.rng),
+                    phase: Phase::Flying { until: time + 5.0 },
                 });
             }
         }
@@ -194,6 +233,7 @@ impl Debris {
         &mut self,
         map: &Map,
         data: &Effects,
+        view: &Camera,
         time: f32,
         dt: f32,
         sounds: &mut SoundEvents,
@@ -209,19 +249,30 @@ impl Debris {
         }
         let rng = &mut self.rng;
         self.fragments.retain_mut(|fragment| {
-            if time >= fragment.expires {
+            if !fragment.keep(&map.collision, view, time) {
                 return false;
             }
             if fragment.resting {
                 return true;
             }
             let zone = map.collision.regions.at(fragment.position);
-            if zone.pain {
+            if zone.pain && zone.damage_per_second > 0 {
                 return false;
             }
-            if zone.water && !fragment.in_water {
+            if zone.water && !fragment.in_water && matches!(fragment.phase, Phase::Flying { .. }) {
                 fragment.velocity = fragment.velocity * 0.2;
                 fragment.spin = fragment.spin * 0.2;
+                if let Some([entry, _]) = zone.liquid_audio.and_then(|id| map.liquid_audio.get(id))
+                {
+                    let gain = (0.0005 * (250.0 - 0.5 * fragment.velocity.2)).max(0.0);
+                    sounds.extend_at(
+                        entry.iter().cloned(),
+                        fragment.position,
+                        CONTACT_SOUND_RADIUS,
+                        gain,
+                    );
+                }
+                fragment.begin_dying(time);
             }
             fragment.in_water = zone.water;
             let material = &data.walls[fragment.wall].materials[fragment.material];
@@ -243,14 +294,22 @@ impl Debris {
                 (fragment.velocity - normal * (2.0 * fragment.velocity.dot(normal))) * 0.5;
             fragment.spin = fragment.spin * 0.75;
             let speed_squared = fragment.velocity.dot(fragment.velocity);
+            let flying = matches!(fragment.phase, Phase::Flying { .. });
             if fragment.first_impact && speed_squared < 400.0_f32.powi(2) {
                 fragment.first_impact = false;
                 fragment.rotation = Vec3(0.0, fragment.rotation.1, 0.0);
                 fragment.spin = Vec3(0.0, fragment.spin.1, 0.0);
             }
-            if speed_squared < 60.0_f32.powi(2) && normal.2 > 0.7 {
+            let settled = if flying {
+                speed_squared < 60.0_f32.powi(2)
+            } else {
+                fragment.velocity.2 < 50.0
+            };
+            let impact_speed: f32 = if flying { 50.0 } else { 80.0 };
+            if settled && normal.2 > 0.7 {
                 fragment.resting = true;
-            } else if speed_squared > 50.0_f32.powi(2) {
+                fragment.begin_dying(time);
+            } else if speed_squared > impact_speed.powi(2) {
                 let sound = usize::from(roll(rng) >= 0.5);
                 sounds.extend_at(
                     material.impacts[sound].iter().cloned(),
@@ -299,6 +358,39 @@ mod tests {
         package::Package,
     };
     use std::path::Path;
+
+    #[test]
+    fn settled_fragments_check_visibility_and_still_expire() {
+        let mut fragment = Fragment {
+            wall: 0,
+            material: 0,
+            model: 0,
+            position: Vec3(100.0, 0.0, 0.0),
+            velocity: Vec3::default(),
+            rotation: Vec3::default(),
+            spin: Vec3::default(),
+            first_impact: false,
+            resting: true,
+            in_water: false,
+            expires: 20.0,
+            phase: Phase::Flying { until: 5.0 },
+        };
+        let mut collision = Collision::test_world();
+        let mut view = Camera {
+            position: Vec3::default(),
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        fragment.begin_dying(1.0);
+        assert!(fragment.keep(&collision, &view, 2.5));
+        view.yaw = std::f32::consts::PI;
+        assert!(fragment.keep(&collision, &view, 3.99));
+        assert!(!fragment.keep(&collision, &view, 4.0));
+        view.yaw = 0.0;
+        collision.add_box(Vec3(30.0, -10.0, -10.0), Vec3(40.0, 10.0, 10.0));
+        assert!(!fragment.keep(&collision, &view, 5.5));
+        assert!(!fragment.keep(&collision, &view, 20.0));
+    }
 
     #[test]
     #[ignore = "requires the local reference-client map installation"]
