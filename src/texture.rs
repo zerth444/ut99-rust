@@ -393,6 +393,10 @@ impl Texture {
         let frame = (progress * self.frames.len() as f32) as usize;
         &self.frames[frame.min(self.frames.len() - 1)]
     }
+
+    pub(crate) fn animation_duration(&self) -> f32 {
+        self.frames.len() as f32 / self.rate
+    }
 }
 
 fn read_source_image(

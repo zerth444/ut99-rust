@@ -976,6 +976,17 @@ impl Match {
             })
     }
 
+    pub(crate) fn turret_smoke<'a>(
+        &'a self,
+        map: &'a Map,
+    ) -> impl Iterator<Item = (Vec3, &'a crate::texture::TextureImage, f32)> + 'a {
+        self.assault
+            .as_ref()
+            .zip(map.assault.as_ref())
+            .into_iter()
+            .flat_map(|(round, data)| round.defenses.smoke(data, self.time))
+    }
+
     pub(crate) fn assault_effects<'a>(
         &'a self,
         map: &'a Map,
@@ -1877,27 +1888,7 @@ impl Match {
         self.decals.follow_movers(&map.movers);
         self.ballistics
             .update(map, None, self.time, dt, &mut sounds);
-        if let Some(round) = &mut self.assault {
-            let cannon_hits = round.defenses.tick(
-                map,
-                &self.fighters,
-                round.attack_team,
-                self.time,
-                dt,
-                if self.rules.difficulty == Difficulty::Easy {
-                    0.55
-                } else {
-                    1.0
-                },
-                &mut self.shock,
-                &mut self.ballistics,
-                &mut self.decals,
-                &mut sounds,
-            );
-            for hit in cannon_hits {
-                self.apply_hit_from(map, hit, &mut sounds, true);
-            }
-        }
+        self.tick_defenses(map, dt, &mut sounds);
         if let Some(round) = &mut self.assault {
             round.tick(map, &self.fighters, self.time, &mut sounds);
             if let Some(data) = &map.assault {
@@ -3062,6 +3053,65 @@ impl Match {
                 hits,
                 sounds,
             );
+        }
+    }
+
+    fn tick_defenses(&mut self, map: &Map, dt: f32, sounds: &mut SoundEvents) {
+        let Some(round) = &mut self.assault else {
+            return;
+        };
+        let warheads: Vec<_> = self
+            .bolts
+            .iter()
+            .filter(|bolt| bolt.payload.kind.warhead() && self.time < bolt.expires)
+            .map(|bolt| {
+                let art = &map.ordnance[bolt.payload.kind as usize];
+                let age = self.time - bolt.born;
+                turrets::Warhead {
+                    id: turrets::WarheadId {
+                        owner: bolt.owner,
+                        born: bolt.born,
+                    },
+                    position: bolt.position,
+                    velocity: bolt.velocity,
+                    collision: [
+                        art.collision_radius.max(4.0) * bolt.payload.scale,
+                        art.collision_height.max(4.0) * bolt.payload.scale,
+                    ],
+                    warning: (age / 0.6).floor() > ((age - dt).max(0.0) / 0.6).floor(),
+                }
+            })
+            .collect();
+        let (hits, interceptions) = round.defenses.tick(
+            map,
+            &self.fighters,
+            round.attack_team,
+            self.time,
+            dt,
+            if self.rules.difficulty == Difficulty::Easy {
+                0.55
+            } else {
+                1.0
+            },
+            &warheads,
+            &mut self.shock,
+            &mut self.ballistics,
+            &mut self.decals,
+            sounds,
+        );
+        let mut blasts = Vec::new();
+        for id in interceptions {
+            if let Some(index) = self.bolts.iter().position(|bolt| {
+                bolt.payload.kind.warhead() && bolt.owner == id.owner && bolt.born == id.born
+            }) {
+                self.intercept(map, index, id.owner, &mut blasts, sounds);
+            }
+        }
+        for hit in blasts {
+            self.apply_hit(map, hit, sounds);
+        }
+        for hit in hits {
+            self.apply_hit_from(map, hit, sounds, true);
         }
     }
 
@@ -4982,6 +5032,7 @@ mod tests {
             ],
             triggers: Vec::new(),
             turrets: Vec::new(),
+            turret_smoke: None,
             effects: crate::assault::Effects::default(),
         });
         let mut game = Match::new(
@@ -5097,13 +5148,14 @@ mod tests {
                 let mut shock = shock::Shots::default();
                 let mut totals = [0u16; 2];
                 for tick in from..to {
-                    let hits = round.defenses.tick(
+                    let (hits, _) = round.defenses.tick(
                         map,
                         fighters,
                         round.attack_team,
                         tick as f32 / 120.0,
                         1.0 / 120.0,
                         1.0,
+                        &[],
                         &mut shock,
                         &mut effects,
                         &mut marks,
@@ -5153,6 +5205,118 @@ mod tests {
             );
             assert!(if minigun { observed[1] } else { observed[0] });
             assert!(sound.len() > 0);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the local reference-client map installation"]
+    fn assault_installed_turrets_can_intercept_both_redeemers_and_emit_damage_smoke() {
+        for (name, kind, owner) in [
+            ("AS-Frigate.unr", ordnance::Kind::GuidedWarhead, 0),
+            ("AS-Guardia.unr", ordnance::Kind::Warhead, 1),
+        ] {
+            let path = std::path::Path::new("local/reference-client/Maps").join(name);
+            let bytes = std::fs::read(&path).unwrap();
+            let mut data = Map::load(&Package::read(&bytes).unwrap(), Some(&path))
+                .unwrap()
+                .assault
+                .unwrap();
+            data.turrets.truncate(1);
+            data.turrets[0].yaw = 0.0;
+            let minigun = data.turrets[0].minigun;
+            data.turrets[0].volume.position = Vec3(0.0, 0.0, if minigun { 30.0 } else { 145.0 });
+            let smoke = data
+                .turret_smoke
+                .as_ref()
+                .expect("UT_BlackSmoke from the original package");
+            assert_eq!(smoke.variants.len(), 3);
+            assert_eq!((smoke.rise, smoke.scale), (70.0, 2.2));
+            let (mut map, _) = flight_fixture();
+            map.assault = Some(data);
+            let cover = map
+                .collision
+                .add_box(Vec3(125.0, -100.0, 0.0), Vec3(155.0, 100.0, 250.0));
+            let mut game = Match::new(
+                &map,
+                0,
+                Rules {
+                    mode: Mode::Assault,
+                    bots: 1,
+                    ..Rules::default()
+                },
+            );
+            let dt = 1.0 / 120.0;
+            for blocked in [true, false] {
+                if !blocked {
+                    map.collision.set_box(
+                        cover,
+                        Vec3(-220.0, -100.0, 0.0),
+                        Vec3(-200.0, 100.0, 250.0),
+                    );
+                }
+                game.restart(&mut map);
+                game.fighters[0].walker.position = Vec3(-500.0, 600.0, 39.2);
+                game.fighters[1].walker.position = Vec3(-510.0, 620.0, 39.2);
+                let launch = Camera {
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    position: Vec3(190.0, 0.0, if minigun { 72.0 } else { 85.0 }),
+                };
+                game.bolts.push(Bolt {
+                    owner,
+                    position: launch.position,
+                    velocity: Vec3(18.0, 0.0, 0.0),
+                    born: 0.0,
+                    expires: 9.0,
+                    payload: ProjectilePayload {
+                        kind,
+                        damage: 240,
+                        blast: 350.0,
+                        gravity: 0.0,
+                        rebounds: 0,
+                        scale: 1.0,
+                    },
+                    pilot: (owner == 0).then(|| Pilot::new(&launch)),
+                    next_trail: 0.0,
+                    gel: None,
+                    gel_trigger: None,
+                    seeking: None,
+                    flight_audio: None,
+                });
+                let mut sounds = SoundEvents::default();
+                for step in 1..=720 {
+                    game.time = step as f32 * dt;
+                    let Some(bolt) = game.bolts.first_mut() else {
+                        break;
+                    };
+                    bolt.position = bolt.position + bolt.velocity * dt;
+                    game.tick_defenses(&map, dt, &mut sounds);
+                }
+                assert_eq!(game.bolts.is_empty(), !blocked, "{name} blocked={blocked}");
+                if !blocked {
+                    assert!(
+                        game.traces
+                            .iter()
+                            .any(|trace| trace.explosion.warhead() && !trace.draws_wave())
+                    );
+                    assert!(game.pilot_index().is_none());
+                }
+            }
+            game.restart(&mut map);
+            let mut sounds = SoundEvents::default();
+            game.assault.as_mut().unwrap().defenses.damage(0, 1000, 1.0);
+            for time in [1.0, 2.5, 3.5, 4.5] {
+                game.time = time;
+                game.tick_defenses(&map, dt, &mut sounds);
+                assert!(game.turret_smoke(&map).next().is_some(), "{name} at {time}");
+            }
+            game.time = 7.0;
+            game.tick_defenses(&map, dt, &mut sounds);
+            assert!(game.turret_smoke(&map).next().is_none());
+            assert!(!game.assault.as_ref().unwrap().defenses.guns[0].targetable());
+            game.time = 17.6;
+            game.tick_defenses(&map, dt, &mut sounds);
+            assert!(game.assault.as_ref().unwrap().defenses.guns[0].targetable());
         }
     }
 

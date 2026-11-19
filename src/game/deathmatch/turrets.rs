@@ -6,18 +6,19 @@ use crate::{
     sound::{CONTACT_SOUND_RADIUS, SoundEvents},
 };
 
-use super::{Fighter, Hit, angle_delta, nearest_hit, unit};
+use super::{Fighter, Hit, angle_delta, cylinder_hit, nearest_hit, unit};
 
 pub(super) struct Defenses {
     pub guns: Vec<Gun>,
     pub shots: Vec<Shot>,
     shutdown_audio: Vec<usize>,
+    smoke: Vec<Puff>,
 }
 
 pub(super) struct Gun {
     health: i32,
     disabled_until: f32,
-    target: Option<usize>,
+    target: Option<Tracking>,
     pub yaw: f32,
     pitch: usize,
     active_since: f32,
@@ -27,6 +28,7 @@ pub(super) struct Gun {
     rng: u32,
     cadence: ballistics::Cadence,
     pub flash: Option<(Vec3, Vec3, f32)>,
+    smoke_started: Option<(f32, usize)>,
 }
 
 pub(crate) struct Shot {
@@ -34,6 +36,32 @@ pub(crate) struct Shot {
     pub position: Vec3,
     pub born: f32,
     velocity: Vec3,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct WarheadId {
+    pub owner: usize,
+    pub born: f32,
+}
+
+pub(super) struct Warhead {
+    pub id: WarheadId,
+    pub position: Vec3,
+    pub velocity: Vec3,
+    pub collision: [f32; 2],
+    pub warning: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Tracking {
+    Pawn(usize),
+    Warhead(WarheadId),
+}
+
+struct Puff {
+    origin: Vec3,
+    born: f32,
+    variant: usize,
 }
 
 impl Gun {
@@ -66,7 +94,9 @@ impl Gun {
         self.health = -1;
         self.disabled_until = until;
         self.target = None;
+        self.flash = None;
         self.idle_since = time;
+        self.smoke_started = None;
     }
 }
 
@@ -90,10 +120,12 @@ impl Defenses {
                     rng: (index as u32).wrapping_mul(137).wrapping_add(1),
                     cadence: ballistics::Cadence::default(),
                     flash: None,
+                    smoke_started: None,
                 })
                 .collect(),
             shots: Vec::new(),
             shutdown_audio: Vec::new(),
+            smoke: Vec::new(),
         }
     }
 
@@ -119,8 +151,61 @@ impl Defenses {
         gun.health = gun.health.saturating_sub(i32::from(damage));
         if gun.health < 0 {
             gun.disable(time, time + 16.5);
+            gun.smoke_started = Some((time, 0));
             self.shutdown_audio.push(index);
         }
+    }
+
+    fn emit_smoke(&mut self, map: &AssaultMap, time: f32) {
+        let Some(art) = &map.turret_smoke else {
+            return;
+        };
+        self.smoke.retain(|puff| time < puff.born + art.lifetime);
+        for (turret, gun) in map.turrets.iter().zip(&mut self.guns) {
+            let Some((start, emitted)) = gun.smoke_started else {
+                continue;
+            };
+            let offsets = [0.0, 1.5, 2.5, 3.5];
+            let mut count = emitted;
+            for &offset in &offsets[emitted..] {
+                let born = start + offset;
+                if born > time {
+                    break;
+                }
+                count += 1;
+                if time < born + art.lifetime {
+                    let variant = ((ballistics::jitter(&mut gun.rng) + 1.0)
+                        * 0.5
+                        * art.variants.len() as f32) as usize;
+                    self.smoke.push(Puff {
+                        origin: turret.volume.position,
+                        born,
+                        variant: variant.min(art.variants.len() - 1),
+                    });
+                }
+            }
+            gun.smoke_started = (count < offsets.len()).then_some((start, count));
+        }
+    }
+
+    pub fn smoke<'a>(
+        &'a self,
+        data: &'a AssaultMap,
+        time: f32,
+    ) -> impl Iterator<Item = (Vec3, &'a crate::texture::TextureImage, f32)> + 'a {
+        self.smoke.iter().filter_map(move |puff| {
+            let art = data.turret_smoke.as_ref()?;
+            let age = time - puff.born;
+            if age >= art.lifetime {
+                return None;
+            }
+            let texture = art.variants.get(puff.variant)?;
+            Some((
+                puff.origin + Vec3(0.0, 0.0, art.rise * age),
+                texture.image_once(age / art.lifetime),
+                art.scale,
+            ))
+        })
     }
 
     pub fn tick(
@@ -131,14 +216,17 @@ impl Defenses {
         time: f32,
         dt: f32,
         damage_scale: f32,
+        warheads: &[Warhead],
         plasma: &mut shock::Shots,
         effects: &mut ballistics::Effects,
         marks: &mut decals::Marks,
         sounds: &mut SoundEvents,
-    ) -> Vec<Hit> {
+    ) -> (Vec<Hit>, Vec<WarheadId>) {
         let Some(data) = &map.assault else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
+        self.emit_smoke(data, time);
+        let mut intercepted = Vec::new();
         for index in self.shutdown_audio.drain(..) {
             let turret = &data.turrets[index];
             sounds.extend_at(
@@ -169,14 +257,33 @@ impl Defenses {
                 travel,
                 [projectile.radius, projectile.height],
             );
-            if contact.is_some() || wall.is_some() {
+            let missile = trace_warheads(
+                warheads,
+                &intercepted,
+                shot.position,
+                travel,
+                [projectile.radius, projectile.height],
+                dt,
+            )
+            .filter(|&(_, at)| contact.is_none_or(|(_, other)| at < other));
+            let contact = contact.filter(|_| missile.is_none());
+            if contact.is_some() || missile.is_some() || wall.is_some() {
                 let direction = unit(shot.velocity);
-                let impact = shot.position + travel * contact.map_or(1.0, |(_, fraction)| fraction);
+                let at = missile
+                    .map(|(_, at)| at)
+                    .or(contact.map(|(_, at)| at))
+                    .unwrap_or(1.0);
+                let impact = shot.position + travel * at;
+                if let Some((id, _)) = missile
+                    && (f32::from(projectile.damage) * damage_scale) as u16 > 5
+                {
+                    intercepted.push(id);
+                }
                 if projectile.shock
                     && let Some(assets) = shock::assets(map)
                 {
                     let offset = wall
-                        .filter(|_| contact.is_none())
+                        .filter(|_| contact.is_none() && missile.is_none())
                         .map_or(direction * -8.0, |(_, normal)| normal * 8.0);
                     let blast = plasma.bolt_impact(assets, impact, offset, direction, time, sounds);
                     for (victim, fighter) in fighters
@@ -238,18 +345,50 @@ impl Defenses {
                     && (fighter.invis_left(time) <= 0.0 || time - fighter.fired_at < 0.42)
                     && map.collision.ray(pivot, delta).is_none()
             };
-            let target = gun.target.filter(|&id| visible(id)).or_else(|| {
-                let facing = Vec3(gun.yaw.cos(), gun.yaw.sin(), 0.0);
-                (0..fighters.len())
-                    .filter(|&id| {
-                        let offset = fighters[id].walker.position - pivot;
-                        facing.dot(offset) >= offset.0.hypot(offset.1) * turret.fov && visible(id)
+            let missile = gun
+                .target
+                .and_then(|target| {
+                    let Tracking::Warhead(id) = target else {
+                        return None;
+                    };
+                    warheads
+                        .iter()
+                        .find(|warhead| warhead.id == id && !intercepted.contains(&id))
+                })
+                .or_else(|| {
+                    warheads.iter().find(|warhead| {
+                        warhead.warning
+                            && !intercepted.contains(&warhead.id)
+                            && map.collision.ray(pivot, warhead.position - pivot).is_none()
                     })
-                    .min_by(|&a, &b| {
-                        super::distance_squared(pivot, fighters[a].walker.position)
-                            .total_cmp(&super::distance_squared(pivot, fighters[b].walker.position))
+                });
+            let was_tracking = matches!(gun.target, Some(Tracking::Warhead(_)));
+            let target = missile
+                .map(|missile| Tracking::Warhead(missile.id))
+                .or_else(|| {
+                    let pawn = gun.target.and_then(|target| match target {
+                        Tracking::Pawn(id) if visible(id) => Some(id),
+                        _ => None,
+                    });
+                    pawn.or_else(|| {
+                        let facing = Vec3(gun.yaw.cos(), gun.yaw.sin(), 0.0);
+                        (0..fighters.len())
+                            .filter(|&id| {
+                                let offset = fighters[id].walker.position - pivot;
+                                (was_tracking
+                                    || facing.dot(offset) >= offset.0.hypot(offset.1) * turret.fov)
+                                    && visible(id)
+                            })
+                            .min_by(|&a, &b| {
+                                super::distance_squared(pivot, fighters[a].walker.position)
+                                    .total_cmp(&super::distance_squared(
+                                        pivot,
+                                        fighters[b].walker.position,
+                                    ))
+                            })
                     })
-            });
+                    .map(Tracking::Pawn)
+                });
             let Some(target) = target else {
                 if gun.target.take().is_some() {
                     gun.idle_since = time + 5.0;
@@ -260,7 +399,8 @@ impl Defenses {
                 }
                 continue;
             };
-            if gun.target.replace(target).is_none() {
+            let previous = gun.target.replace(target);
+            if previous.is_none() || (missile.is_some() && previous != Some(target)) {
                 gun.active_since = time;
                 gun.ready_at = time + turret.activate.duration() + turret.sample;
                 sounds.extend_at(
@@ -270,13 +410,29 @@ impl Defenses {
                     1.0,
                 );
             }
-            let center = fighters[target].walker.position;
+            let (center, velocity) = match target {
+                Tracking::Pawn(id) => {
+                    (fighters[id].walker.position, fighters[id].walker.velocity())
+                }
+                Tracking::Warhead(_) => {
+                    let warhead =
+                        missile.expect("warhead target was acquired from the live snapshot");
+                    (warhead.position, warhead.velocity)
+                }
+            };
             let offset = center - pivot;
             let yaw = offset.1.atan2(offset.0);
             let pitch = offset.2.atan2(offset.0.hypot(offset.1));
             let turn = angle_delta(yaw, gun.yaw);
             gun.yaw += turn.clamp(-dt * turret.tracking, dt * turret.tracking);
-            if time < gun.ready_at || turn.abs() > 0.12 {
+            if time < gun.ready_at
+                || turn.abs()
+                    > if missile.is_some() {
+                        std::f32::consts::TAU * 2000.0 / 65536.0
+                    } else {
+                        0.12
+                    }
+            {
                 continue;
             }
             let pitch_units = pitch * 65_536.0 / std::f32::consts::TAU;
@@ -359,6 +515,16 @@ impl Defenses {
                 let wall = map.collision.ray_surface(muzzle, delta);
                 let clipped = wall.map_or(delta, |(point, _)| point - muzzle);
                 let target = nearest_hit(fighters, usize::MAX, muzzle, clipped, [0.0; 2]);
+                let warhead =
+                    trace_warheads(warheads, &intercepted, muzzle, clipped, [0.0; 2], 0.0)
+                        .filter(|&(_, at)| target.is_none_or(|(_, other)| at < other));
+                let target = target.filter(|_| warhead.is_none());
+                if let Some((id, _)) = warhead {
+                    let damage = 5 + ((jitter() + 1.0) * 2.0) as u16;
+                    if (f32::from(damage) * damage_scale) as u16 > 5 {
+                        intercepted.push(id);
+                    }
+                }
                 if let Some((victim, _)) = target
                     && fighters[victim].team == Some(attack_team)
                 {
@@ -379,8 +545,12 @@ impl Defenses {
                     ballistics::Bullet {
                         start: muzzle,
                         delta,
-                        visible: clipped * target.map_or(1.0, |(_, at)| at),
-                        wall: wall.filter(|_| target.is_none()),
+                        visible: clipped
+                            * warhead
+                                .map(|(_, at)| at)
+                                .or(target.map(|(_, at)| at))
+                                .unwrap_or(1.0),
+                        wall: wall.filter(|_| target.is_none() && warhead.is_none()),
                         case_origin: None,
                     },
                     &mut gun.cadence,
@@ -390,9 +560,7 @@ impl Defenses {
             } else if let Some(projectile) = &turret.projectile {
                 let aim = if turret.lead {
                     let to = center - muzzle;
-                    let predicted = to
-                        + fighters[target].walker.velocity()
-                            * (to.dot(to).sqrt() / projectile.speed);
+                    let predicted = to + velocity * (to.dot(to).sqrt() / projectile.speed);
                     unit(if map.collision.ray(muzzle, predicted).is_none() {
                         predicted
                     } else {
@@ -405,12 +573,36 @@ impl Defenses {
                     turret: index,
                     position: muzzle,
                     born: time,
-                    velocity: aim * projectile.speed,
+                    velocity: aim * projectile.speed * if missile.is_some() { 2.0 } else { 1.0 },
                 });
             }
         }
-        hits
+        (hits, intercepted)
     }
+}
+
+fn trace_warheads(
+    warheads: &[Warhead],
+    intercepted: &[WarheadId],
+    start: Vec3,
+    delta: Vec3,
+    extent: [f32; 2],
+    dt: f32,
+) -> Option<(WarheadId, f32)> {
+    warheads
+        .iter()
+        .filter(|warhead| !intercepted.contains(&warhead.id))
+        .filter_map(|warhead| {
+            let motion = warhead.velocity * dt;
+            let at = cylinder_hit(
+                start - (warhead.position - motion),
+                delta - motion,
+                warhead.collision[0] + extent[0],
+                warhead.collision[1] + extent[1],
+            )?;
+            (at < 1.0).then_some((warhead.id, at))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
 }
 
 fn gun_hit(victim: usize, damage: u16, direction: Vec3, map: &Map) -> Hit {

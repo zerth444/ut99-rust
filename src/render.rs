@@ -482,6 +482,9 @@ impl Frame {
         for (position, image, scale) in game.turret_projectiles(map) {
             self.world_sprite(&view, position, image, scale, 1.0);
         }
+        for (position, image, scale) in game.turret_smoke(map) {
+            self.world_sprite_mode(&view, position, image, scale, 1.0, Mode::Modulated);
+        }
         for visual in game.assault_effects(map) {
             self.draw_world_effect(&view, game.time, visual);
         }
@@ -765,7 +768,7 @@ impl Frame {
                 ],
                 [0.0, 0.0, w, h],
                 [1.0; 3],
-                true,
+                Mode::Screen,
                 None,
             );
         }
@@ -1162,6 +1165,18 @@ impl Frame {
         scale: f32,
         glow: f32,
     ) {
+        self.world_sprite_mode(view, position, image, scale, glow, Mode::ScreenDepth);
+    }
+
+    fn world_sprite_mode(
+        &mut self,
+        view: &View,
+        position: Vec3,
+        image: &TextureImage,
+        scale: f32,
+        glow: f32,
+        mode: Mode,
+    ) {
         let position = view.point(position);
         if position.2 < NEAR {
             return;
@@ -1191,7 +1206,7 @@ impl Frame {
             ],
             [0.0, 0.0, w, h],
             [glow; 3],
-            true,
+            mode,
             Some(screen.2),
         );
     }
@@ -1203,7 +1218,7 @@ impl Frame {
         source: [f32; 4],
         tint: [f32; 3],
     ) {
-        self.blit_tile(texture, rect, source, tint, false, None);
+        self.blit_tile(texture, rect, source, tint, Mode::Ui, None);
     }
 
     pub fn translucent_tile(
@@ -1213,7 +1228,7 @@ impl Frame {
         source: [f32; 4],
         tint: [f32; 3],
     ) {
-        self.blit_tile(texture, rect, source, tint, true, None);
+        self.blit_tile(texture, rect, source, tint, Mode::Screen, None);
     }
 
     #[cfg(windows)]
@@ -1353,7 +1368,7 @@ impl Frame {
         rect: [i32; 4],
         source: [f32; 4],
         tint: [f32; 3],
-        translucent: bool,
+        mode: Mode,
         inverse_depth: Option<f32>,
     ) {
         let [x, y, w, h] = rect;
@@ -1363,11 +1378,6 @@ impl Frame {
         }
         if let Some(commands) = &mut self.commands {
             let (id, [tw, th]) = commands.texture(Some(texture));
-            let mode = match (translucent, inverse_depth) {
-                (true, Some(_)) => Mode::ScreenDepth,
-                (true, None) => Mode::Screen,
-                _ => Mode::Ui,
-            };
             quad(
                 commands,
                 [self.width, self.height],
@@ -1391,10 +1401,18 @@ impl Frame {
                 if let Some([r, g, b]) = texture.sample(u, v, true) {
                     let c = |value: f32, gain: f32| (value * gain).clamp(0.0, 255.0) as u32;
                     let color = (c(r, tint[0]) << 16) | (c(g, tint[1]) << 8) | c(b, tint[2]);
-                    self.pixels[index] = if translucent {
-                        blend_light(color, self.pixels[index])
-                    } else {
-                        color
+                    self.pixels[index] = match mode {
+                        Mode::Screen | Mode::ScreenDepth => blend_light(color, self.pixels[index]),
+                        Mode::Modulated => {
+                            let destination = self.pixels[index];
+                            let channel = |shift: u32| {
+                                let source = (color >> shift) & 255;
+                                let background = (destination >> shift) & 255;
+                                ((2 * source * background / 255).min(255)) << shift
+                            };
+                            channel(16) | channel(8) | channel(0)
+                        }
+                        _ => color,
                     };
                 }
             }

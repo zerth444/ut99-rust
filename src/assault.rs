@@ -15,7 +15,15 @@ pub(crate) struct AssaultMap {
     pub relays: Vec<Relay>,
     pub seconds: u16,
     pub turrets: Vec<Turret>,
+    pub turret_smoke: Option<TurretSmoke>,
     pub effects: Effects,
+}
+
+pub(crate) struct TurretSmoke {
+    pub variants: Vec<Arc<crate::texture::Texture>>,
+    pub lifetime: f32,
+    pub rise: f32,
+    pub scale: f32,
 }
 
 pub(crate) struct Turret {
@@ -169,6 +177,7 @@ impl AssaultMap {
             relays: Vec::new(),
             seconds: 60,
             turrets: Vec::new(),
+            turret_smoke: None,
             effects: Effects::load(package, actors)?,
         };
         let mut paths = std::collections::HashMap::new();

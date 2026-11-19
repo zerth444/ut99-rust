@@ -708,6 +708,11 @@ pub fn load(
             });
         }
     }
+    if let Some(assault) = assault
+        && !assault.turrets.is_empty()
+    {
+        assault.turret_smoke = turret_smoke_art(&mut assets, &mut class_cache, &mut textures);
+    }
     let mut arsenal = HashMap::new();
     for weapon in Weapon::ALL {
         let Some(class) = find_export(&assets, "botpack", weapon.class(), "Class") else {
@@ -1627,6 +1632,46 @@ fn read_shock(
         })();
     }
     art
+}
+
+fn turret_smoke_art(
+    assets: &mut Assets<'_>,
+    classes: &mut HashMap<Object, Appearance>,
+    textures: &mut HashMap<Object, Option<Arc<Texture>>>,
+) -> Option<crate::assault::TurretSmoke> {
+    let class = find_export(assets, "botpack", "UT_BlackSmoke", "Class")?;
+    let visual = appearance(assets, classes, Some(class));
+    let (package, export) = assets.object(class);
+    let mut properties = class_properties(package, export).ok()?;
+    let mut references = [0; 4];
+    let mut rise = None;
+    while let Some(property) = properties.next_tag().ok()? {
+        let mut value = property.value;
+        match property.name {
+            "SSprites" if property.array_index < references.len() => {
+                references[property.array_index] = value.compact().ok()?
+            }
+            "RisingRate" => rise = value.f32().ok(),
+            _ => {}
+        }
+    }
+    let variants: Vec<_> = references
+        .into_iter()
+        .filter_map(|reference| {
+            let object = assets.resolve(class.package, reference)?;
+            cached_texture(assets, textures, object)
+        })
+        .collect();
+    let duration = variants.first()?.animation_duration();
+    Some(crate::assault::TurretSmoke {
+        variants,
+        scale: visual.scale,
+        rise: rise?,
+        lifetime: visual
+            .lifetime
+            .filter(|&value| value > 0.0)
+            .unwrap_or(duration),
+    })
 }
 
 fn read_turret(
