@@ -704,7 +704,8 @@ unsafe fn message_loop(
                         ],
                         ..deathmatch::Command::default()
                     };
-                    let controls = briefing_page.is_none();
+                    let controls = briefing_page.is_none()
+                        && (game.finished || game.assault_end_camera(map).is_none());
                     let events = match_clock.advance(
                         game,
                         map,

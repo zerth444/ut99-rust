@@ -1237,11 +1237,13 @@ impl Match {
     }
 
     pub fn remaining(&self) -> u16 {
-        let limit = self
+        let (limit, time) = self
             .assault
             .as_ref()
-            .map_or(f32::from(self.rules.seconds), |round| round.limit);
-        (limit - self.time).ceil().max(0.0) as u16
+            .map_or((f32::from(self.rules.seconds), self.time), |round| {
+                (round.limit, round.conquered_at().unwrap_or(self.time))
+            });
+        (limit - time).ceil().max(0.0) as u16
     }
 
     pub fn assault_status<'a>(&self, map: &'a Map) -> Option<AssaultStatus<'a>> {
@@ -1534,7 +1536,7 @@ impl Match {
     }
 
     pub(crate) fn render_view(&self, map: &Map, blend: f32, bob: f32) -> Camera {
-        if self.finished || self.pilot_index().is_some() {
+        if self.finished || self.pilot_index().is_some() || self.assault_end_camera(map).is_some() {
             return self.player_view(map);
         }
         if let Some(camera) = self.death_camera(map, blend) {
@@ -1568,6 +1570,13 @@ impl Match {
     }
 
     pub(crate) fn result_camera(&self, map: &Map) -> Option<Camera> {
+        if let Some(camera) = self.assault_end_camera(map) {
+            return Some(Camera {
+                position: camera.position,
+                yaw: camera.rotation.1,
+                pitch: camera.rotation.0,
+            });
+        }
         if !self.finished {
             return None;
         }
@@ -1596,6 +1605,14 @@ impl Match {
             }
         }
         None
+    }
+
+    pub(crate) fn assault_end_camera<'a>(
+        &self,
+        map: &'a Map,
+    ) -> Option<&'a crate::assault::EndCamera> {
+        self.assault.as_ref()?.conquered_at()?;
+        map.assault.as_ref()?.end_camera.as_ref()
     }
 
     pub(crate) fn guided_roll(&self) -> f32 {
@@ -2010,13 +2027,22 @@ impl Match {
             }
         }
         if let Some(round) = &mut self.assault {
-            let conquered = round.completed_at.filter(|&at| at <= round.limit);
+            let conquered = round.conquered_at();
+            let map_assault = map
+                .assault
+                .as_ref()
+                .expect("Assault round requires map objectives");
+            let camera_delay = map_assault.result_delay();
             if let Some(result_at) = conquered
-                .map(|at| at + 2.0)
+                .map(|at| at + camera_delay)
                 .or_else(|| (self.time >= round.limit).then_some(round.limit))
                 && self.time >= result_at
             {
-                if round.tutorial.is_some() {
+                // A rated match ends if the player's opening attack runs out of time.
+                let opening_loss = self.assault_roster.is_some()
+                    && round.first_attack.is_none()
+                    && conquered.is_none();
+                if round.tutorial.is_some() || opening_loss {
                     self.finished = true;
                     if conquered.is_some() {
                         self.objectives.scores[0] = 1;
@@ -2049,11 +2075,7 @@ impl Match {
                         self.announce(map, sound, text, &mut sounds);
                     }
                 } else {
-                    let data = map
-                        .assault
-                        .as_ref()
-                        .expect("Assault round requires map objectives");
-                    self.assault = Some(assault::Round::new(data, 1, Some(conquered)));
+                    self.assault = Some(assault::Round::new(map_assault, 1, Some(conquered)));
                     self.reset_round(map);
                     self.announcement = Some(("SWITCHING SIDES", 3.0));
                 }
@@ -5138,6 +5160,10 @@ mod tests {
                     tag: 3,
                     action: RelayAction::Starts(vec![0]),
                 },
+                Relay {
+                    tag: 4,
+                    action: RelayAction::Starts(vec![1]),
+                },
             ],
             triggers: Vec::new(),
             turrets: Vec::new(),
@@ -5145,6 +5171,12 @@ mod tests {
             effects: crate::assault::Effects::default(),
             tutorial: None,
             briefing: Vec::new(),
+            end_camera: Some(crate::assault::EndCamera {
+                position: Vec3(128.0, 192.0, 120.0),
+                rotation: Vec3(-0.4, 0.3, 0.0),
+                event: Some(4),
+                delay: Some(2.0),
+            }),
         });
         let mut game = Match::new(
             &map,
@@ -5186,6 +5218,13 @@ mod tests {
         game.time = 2.3;
         game.step(&mut map, Command::default(), 1.0 / 120.0);
         assert_eq!(game.assault_status(&map).unwrap().completed, 2);
+        assert!(
+            !map.starts[1].enabled,
+            "the end camera's event must fire when the objective completes"
+        );
+        let shot = game.render_view(&map, 1.0, 0.0);
+        assert!(distance_squared(shot.position, Vec3(128.0, 192.0, 120.0)) < 0.001);
+        assert_eq!((shot.pitch, shot.yaw), (-0.4, 0.3));
         game.time = 4.4;
         game.step(&mut map, Command::default(), 1.0 / 120.0);
         let status = game.assault_status(&map).unwrap();
@@ -5194,6 +5233,8 @@ mod tests {
             (2, false, 0)
         );
         assert!(map.starts[0].enabled);
+        assert!(map.starts[1].enabled);
+        assert!(game.assault_end_camera(&map).is_none());
         assert_eq!(game.remaining(), 3);
         assert!(distance_squared(game.fighters[0].walker.position, map.starts[1].position) < 1.0);
         game.time = 3.0;
@@ -5401,7 +5442,7 @@ mod tests {
         game.damage_objective(&map, 0, Target::Fort(protected), 1000, "shot");
         assert!(!game.assault.as_ref().unwrap().active(protected));
         game.damage_objective(&map, 0, Target::Fort(final_fort), 1000, "shot");
-        game.time += 2.0;
+        game.time += map.assault.as_ref().unwrap().result_delay();
         let events = game.step(&mut map, Command::default(), dt);
         assert!(game.finished && game.winner() == Some(0));
         assert!(game.player_won_assault());
@@ -5455,6 +5496,184 @@ mod tests {
         );
         assert_eq!(game.fighters.len(), 1);
         assert!(!game.finished && game.tutorial_subtitle(&map).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires the local reference-client map installation"]
+    fn assault_tournament_advances_every_stock_stage_and_recovers_after_losses() {
+        use crate::{
+            assault::Target,
+            frontend::{Action, Frontend},
+            settings::Settings,
+        };
+        let path = std::path::Path::new("local/reference-client/Maps/AS-Tutorial.unr");
+        let frontend = Frontend::load(path, false);
+        let preferences =
+            std::env::temp_dir().join(format!("ut99-assault-campaign-{}.ini", std::process::id()));
+        let mut settings = Settings {
+            assault_team: 1,
+            ..Settings::default()
+        };
+        let dt = 1.0 / 120.0;
+        let mut stage = 0;
+        let mut cameras = 0;
+        loop {
+            let mut map = frontend.load_ladder(stage).unwrap();
+            let mut game = frontend.start_match(&map, 0, Action::StartLadder(stage), &settings);
+            assert_eq!(settings.assault_progress, stage);
+            assert_eq!(frontend.next_ladder_stage(stage, &game), None);
+            if stage == 1 {
+                game.time = game.assault.as_ref().unwrap().limit;
+                game.step(&mut map, Command::default(), dt);
+                assert!(game.finished && !game.player_won_assault());
+                assert_eq!(game.assault_status(&map).unwrap().half, 1);
+                assert_eq!(game.team_scores(), Some([0, 1]));
+                assert_eq!(frontend.next_ladder_stage(stage, &game), None);
+                game.step(
+                    &mut map,
+                    Command {
+                        restart: true,
+                        ..Command::default()
+                    },
+                    dt,
+                );
+                assert!(!game.finished && game.assault_status(&map).unwrap().attacking);
+            }
+            if stage == 0 {
+                let mut at = 3.0;
+                let spans = map
+                    .assault
+                    .as_ref()
+                    .unwrap()
+                    .tutorial
+                    .as_ref()
+                    .unwrap()
+                    .lessons
+                    .iter()
+                    .map(|lesson| lesson.audio.duration().floor() + 2.0)
+                    .collect::<Vec<_>>();
+                for span in spans {
+                    game.time = at;
+                    game.step(&mut map, Command::default(), dt);
+                    at += span;
+                }
+                game.time = at;
+                game.step(&mut map, Command::default(), dt);
+                assert!(
+                    game.assault
+                        .as_ref()
+                        .unwrap()
+                        .tutorial
+                        .as_ref()
+                        .unwrap()
+                        .ready
+                );
+            }
+            game.time = game.time.max(12.0);
+            complete_attack(&mut game, &mut map, 0);
+            let captured_at = game
+                .assault
+                .as_ref()
+                .unwrap()
+                .completed_at
+                .unwrap_or_else(|| panic!("Stage {stage} did not accept its final objective"));
+            let data = map.assault.as_ref().unwrap();
+            let result_delay = data.result_delay();
+            if let Some(expected) = &data.end_camera {
+                cameras += 1;
+                let actual = game.render_view(&map, 1.0, 0.0);
+                assert!(distance_squared(actual.position, expected.position) < 0.001);
+                assert!((actual.yaw - expected.rotation.1).abs() < 0.001);
+                assert!((actual.pitch - expected.rotation.0).abs() < 0.001);
+            }
+            game.time = captured_at + result_delay;
+            game.step(&mut map, Command::default(), dt);
+            if stage != 0 {
+                let round = game.assault.as_ref().unwrap();
+                assert_eq!(round.attack_team, 1);
+                assert_eq!(round.limit, captured_at);
+                assert!(!game.finished);
+                if stage == 1 {
+                    let attacker = game
+                        .fighters
+                        .iter()
+                        .position(|fighter| fighter.team == Some(1))
+                        .unwrap();
+                    game.time = 5.0;
+                    complete_attack(&mut game, &mut map, attacker);
+                    let captured = game.assault.as_ref().unwrap().completed_at.unwrap();
+                    game.time = captured + result_delay;
+                    game.step(&mut map, Command::default(), dt);
+                    assert!(game.finished && !game.player_won_assault());
+                    assert_eq!(frontend.next_ladder_stage(stage, &game), None);
+                    game.step(
+                        &mut map,
+                        Command {
+                            restart: true,
+                            ..Command::default()
+                        },
+                        dt,
+                    );
+                    game.time = 12.0;
+                    complete_attack(&mut game, &mut map, 0);
+                    game.time = game.assault.as_ref().unwrap().completed_at.unwrap() + result_delay;
+                    game.step(&mut map, Command::default(), dt);
+                }
+                game.time = game.assault.as_ref().unwrap().limit;
+                game.step(&mut map, Command::default(), dt);
+            }
+            assert!(game.player_won_assault(), "stage {stage}");
+            let next = frontend.next_ladder_stage(stage, &game);
+            assert!(settings.record_assault_win(stage));
+            settings.save(&preferences).unwrap();
+            settings = Settings::load(&preferences).unwrap();
+            assert_eq!(settings.assault_progress, stage + 1);
+            assert_eq!(settings.assault_team, 1);
+            let Some(next) = next else {
+                assert_eq!(settings.assault_progress, frontend.ladder_len());
+                break;
+            };
+            assert_eq!(next, settings.assault_progress);
+            stage = next;
+        }
+        assert!(cameras > 0, "stock maps must resolve SpectatorCam actors");
+        std::fs::remove_file(preferences).unwrap();
+
+        fn complete_attack(game: &mut Match, map: &mut Map, fighter: usize) {
+            let mut objectives = map
+                .assault
+                .as_ref()
+                .unwrap()
+                .forts
+                .iter()
+                .enumerate()
+                .map(|(index, fort)| (fort.final_fort, index))
+                .collect::<Vec<_>>();
+            objectives.sort_unstable();
+            for (_, index) in objectives {
+                let round = game.assault.as_ref().unwrap();
+                if round.completed_at.is_some() {
+                    break;
+                }
+                if !round.active(index) {
+                    continue;
+                }
+                let fort = &map.assault.as_ref().unwrap().forts[index];
+                if fort.touch {
+                    game.fighters[fighter].walker.position = fort.volume.position;
+                    let mut sounds = SoundEvents::default();
+                    game.assault.as_mut().unwrap().tick(
+                        map,
+                        &game.fighters,
+                        game.time,
+                        &mut sounds,
+                    );
+                } else {
+                    game.damage_objective(map, fighter, Target::Fort(index), u16::MAX, "exploded");
+                }
+            }
+        }
     }
 
     #[test]

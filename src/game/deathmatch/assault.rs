@@ -100,6 +100,10 @@ impl Round {
         self.pending.push((time, event, attacker));
     }
 
+    pub fn conquered_at(&self) -> Option<f32> {
+        self.completed_at.filter(|&time| time <= self.limit)
+    }
+
     pub fn briefing_step(
         &mut self,
         data: &crate::assault::Tutorial,
@@ -153,8 +157,15 @@ impl Round {
             self.emit(time, event, true);
         }
         self.notice = Some((index, time + 3.0));
-        if fort.final_fort || self.forts.iter().all(|state| state.complete) {
-            self.completed_at.get_or_insert(time);
+        if (fort.final_fort || self.forts.iter().all(|state| state.complete))
+            && self.completed_at.is_none()
+        {
+            self.completed_at = Some(time);
+            if time <= self.limit
+                && let Some(event) = map.end_camera.as_ref().and_then(|camera| camera.event)
+            {
+                self.emit(time, event, false);
+            }
         }
     }
 

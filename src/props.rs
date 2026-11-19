@@ -717,10 +717,23 @@ pub fn load(
             });
         }
     }
-    if let Some(assault) = assault
-        && !assault.turrets.is_empty()
-    {
-        assault.turret_smoke = turret_smoke_art(&mut assets, &mut class_cache, &mut textures);
+    if let Some(assault) = assault {
+        if !assault.turrets.is_empty() {
+            assault.turret_smoke = turret_smoke_art(&mut assets, &mut class_cache, &mut textures);
+        }
+        if let Some(camera) = &mut assault.end_camera
+            && camera.delay.is_none()
+            && let Some(class) = find_export(&assets, "botpack", "SpectatorCam", "Class")
+        {
+            let (package, export) = assets.object(class);
+            let mut properties = class_properties(package, export)?;
+            while let Some((name, mut value)) = properties.next()? {
+                if name == "FadeOutTime" {
+                    camera.delay = Some(value.f32()?.max(0.0));
+                    break;
+                }
+            }
+        }
     }
     let mut arsenal = HashMap::new();
     for weapon in Weapon::ALL {

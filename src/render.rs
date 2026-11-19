@@ -422,26 +422,30 @@ impl Frame {
         scoreboard: bool,
     ) {
         let player = &game.fighters[0];
-        let piloting = game.guidance_left().is_some();
+        let end_camera = game.assault_end_camera(map);
+        let piloting = end_camera.is_none() && game.guidance_left().is_some();
         let dead = player.fell_at.is_some();
         let (roll, height) = game.view_shake(camera.position);
         let shaken = Camera {
             position: camera.position + Vec3(0.0, 0.0, height),
             ..*camera
         };
-        let camera = if piloting || game.finished || dead {
+        let camera = if piloting || game.finished || dead || end_camera.is_some() {
             camera
         } else {
             &shaken
         };
-        self.roll = if piloting {
+        self.roll = if let Some(camera) = end_camera {
+            camera.rotation.2
+        } else if piloting {
             game.guided_roll()
         } else if game.finished || dead {
             0.0
         } else {
             roll
         };
-        let fov = if player.zoomed() && !piloting && !game.finished && !dead {
+        let fov = if player.zoomed() && !piloting && !game.finished && !dead && end_camera.is_none()
+        {
             player.field_of_view(fov)
         } else {
             fov
@@ -665,7 +669,7 @@ impl Frame {
         }
         self.zoom = 1.0;
         self.roll = 0.0;
-        if player.health > 0 && !game.finished {
+        if player.health > 0 && !game.finished && end_camera.is_none() {
             if !player.zoomed()
                 && !piloting
                 && let Some(weapon) = map.arsenal.get(&player.weapon)
@@ -687,7 +691,7 @@ impl Frame {
             }
         }
         self.layer(Layer::Hud);
-        if game.finished || scoreboard {
+        if game.finished || scoreboard || end_camera.is_some() {
             return;
         }
         if self.draw_guidance_hud(

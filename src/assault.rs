@@ -19,6 +19,14 @@ pub(crate) struct AssaultMap {
     pub effects: Effects,
     pub tutorial: Option<Tutorial>,
     pub briefing: Vec<ObjectivePage>,
+    pub end_camera: Option<EndCamera>,
+}
+
+pub(crate) struct EndCamera {
+    pub position: Vec3,
+    pub rotation: Vec3,
+    pub event: Option<usize>,
+    pub delay: Option<f32>,
 }
 
 pub(crate) struct ObjectivePage {
@@ -183,6 +191,13 @@ pub(crate) enum Target {
 }
 
 impl AssaultMap {
+    pub fn result_delay(&self) -> f32 {
+        self.end_camera
+            .as_ref()
+            .and_then(|camera| camera.delay)
+            .unwrap_or(2.0)
+    }
+
     pub fn load(package: &Package<'_>, actors: &[&Export]) -> io::Result<Option<Self>> {
         if !actors
             .iter()
@@ -201,9 +216,12 @@ impl AssaultMap {
             effects: Effects::load(package, actors)?,
             tutorial: None,
             briefing: Vec::new(),
+            end_camera: None,
         };
         let mut paths = std::collections::HashMap::new();
         let mut destinations = Vec::new();
+        let mut end_camera_tag = None;
+        let mut cameras = Vec::new();
         let read_name = |value: &mut crate::package::Reader<'_>| -> io::Result<Option<usize>> {
             let index = value.index()?;
             Ok((!package.name(index)?.eq_ignore_ascii_case("None")).then_some(index))
@@ -219,6 +237,7 @@ impl AssaultMap {
                     | "Counter"
                     | "SpecialEvent"
                     | "PathNode"
+                    | "SpectatorCam"
             ) {
                 continue;
             }
@@ -242,6 +261,8 @@ impl AssaultMap {
             let mut thresholds = [0.0; 8];
             let mut sound = 0;
             let mut sound_local = None;
+            let mut rotation = Vec3::default();
+            let mut camera_delay = None;
             while let Some(property) = properties.next_tag()? {
                 let mut value = property.value;
                 let slot = property.array_index;
@@ -249,6 +270,15 @@ impl AssaultMap {
                     "Tag" => tag = read_name(&mut value)?,
                     "Event" => event = read_name(&mut value)?,
                     "Location" => volume.position = Vec3::read(&mut value)?,
+                    "Rotation" if class == "SpectatorCam" => {
+                        rotation = crate::mover::read_rotation(&mut value)?
+                    }
+                    "FadeOutTime" if class == "SpectatorCam" => {
+                        camera_delay = Some(value.f32()?.max(0.0));
+                    }
+                    "EndCamTag" if is_fort => {
+                        end_camera_tag = read_name(&mut value)?.or(end_camera_tag);
+                    }
                     "CollisionRadius" => volume.radius = value.f32()?.max(0.0),
                     "CollisionHeight" => volume.height = value.f32()?.max(0.0),
                     "FortName" => fort_name = value.string(package.version)?,
@@ -377,6 +407,19 @@ impl AssaultMap {
                         paths.insert(tag, volume.position);
                     }
                 }
+                "SpectatorCam" => {
+                    if let Some(tag) = tag {
+                        cameras.push((
+                            tag,
+                            EndCamera {
+                                position: volume.position,
+                                rotation,
+                                event,
+                                delay: camera_delay,
+                            },
+                        ));
+                    }
+                }
                 _ => {}
             }
         }
@@ -404,6 +447,12 @@ impl AssaultMap {
             if let Some(point) = path.and_then(|tag| paths.get(&tag)) {
                 fort.destination = *point;
             }
+        }
+        if let Some(tag) = end_camera_tag {
+            map.end_camera = cameras
+                .into_iter()
+                .find(|(camera_tag, _)| *camera_tag == tag)
+                .map(|(_, camera)| camera);
         }
         Ok(Some(map))
     }
