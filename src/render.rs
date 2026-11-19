@@ -420,7 +420,7 @@ impl Frame {
         let player = &game.fighters[0];
         let piloting = game.guidance_left().is_some();
         let dead = player.fell_at.is_some();
-        let (roll, height) = game.warhead_shake(camera.position);
+        let (roll, height) = game.view_shake(map, camera.position);
         let shaken = Camera {
             position: camera.position + Vec3(0.0, 0.0, height),
             ..*camera
@@ -477,6 +477,9 @@ impl Frame {
         self.layer(Layer::Effects);
         for (position, image, scale) in game.turret_projectiles(map) {
             self.world_sprite(&view, position, image, scale, 1.0);
+        }
+        for visual in game.assault_effects(map) {
+            self.draw_world_effect(&view, game.time, visual);
         }
         for (position, direction, faces) in game.turret_muzzles(map) {
             let model = view.in_model(position, direction, 1.0);

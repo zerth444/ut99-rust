@@ -486,6 +486,83 @@ pub fn load(
     let mut textures = HashMap::<Object, Option<Arc<Texture>>>::new();
     let mut waves = HashMap::new();
     if let Some(assault) = assault.as_deref_mut() {
+        let effects = &mut assault.effects;
+        if !effects.quakes.is_empty()
+            && let Some(class) = find_export(&assets, "unrealshare", "Earthquake", "Class")
+        {
+            let (package, export) = assets.object(class);
+            if let Ok(mut props) = class_properties(package, export) {
+                while let Ok(Some(property)) = props.next_tag() {
+                    let mut value = property.value;
+                    let field = property.name.to_ascii_lowercase();
+                    match field.as_str() {
+                        "magnitude" | "duration" | "radius" => {
+                            let default = value.f32()?;
+                            for quake in &mut effects.quakes {
+                                match field.as_str() {
+                                    "magnitude" => &mut quake.magnitude,
+                                    "duration" => &mut quake.duration,
+                                    _ => &mut quake.radius,
+                                }
+                                .get_or_insert(default);
+                            }
+                        }
+                        "bthrowplayer" => {
+                            for quake in &mut effects.quakes {
+                                quake.toss.get_or_insert(property.boolean.unwrap_or(false));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if !effects.mortars.is_empty() {
+            let default_sound =
+                find_export(&assets, "botpack", "MortarSpawner", "Class").and_then(|class| {
+                    appearance(&mut assets, &mut class_cache, Some(class)).fire_sound
+                });
+            for mortar in &mut effects.mortars {
+                let sound = mortar
+                    .sound_ref
+                    .map_or(default_sound, |reference| assets.resolve(0, reference));
+                mortar.sound = cached_wave(&assets, &mut waves, sound);
+            }
+            let class = find_export(&assets, "botpack", "BlastMark", "Class");
+            let mark = appearance(&mut assets, &mut class_cache, class);
+            effects.mortar_mark = mark
+                .texture
+                .and_then(|object| cached_texture(&assets, &mut textures, object))
+                .map(|image| {
+                    (
+                        image,
+                        mark.scale,
+                        mark.lifetime.filter(|&life| life > 0.0).unwrap_or(23.0),
+                    )
+                });
+        }
+        if !effects.charges.is_empty() {
+            let class = find_export(&assets, "unrealshare", "SpriteBallExplosion", "Class");
+            let effect = appearance(&mut assets, &mut class_cache, class);
+            let image = effect.texture.or_else(|| {
+                let class = class?;
+                let (package, export) = assets.object(class);
+                let mut properties = class_properties(package, export).ok()?;
+                while let Ok(Some((name, mut value))) = properties.next() {
+                    if name == "SpriteAnim" {
+                        return assets.resolve(class.package, value.compact().ok()?);
+                    }
+                }
+                None
+            });
+            effects.charge_image =
+                image.and_then(|object| cached_texture(&assets, &mut textures, object));
+            effects.charge_sound = cached_wave(
+                &assets,
+                &mut waves,
+                find_export(&assets, "unrealshare", "Explo1", "Sound"),
+            );
+        }
         for relay in &mut assault.relays {
             if let crate::assault::RelayAction::Sound {
                 reference, wave, ..

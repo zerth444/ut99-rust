@@ -21,6 +21,7 @@ struct TriggerStatus {
 
 pub(super) struct Round {
     pub defenses: super::turrets::Defenses,
+    pub environment: super::assault_effects::Environment,
     pub attack_team: usize,
     pub limit: f32,
     pub first_attack: Option<Option<f32>>,
@@ -37,6 +38,7 @@ impl Round {
     pub fn new(map: &AssaultMap, attack_team: usize, first_attack: Option<Option<f32>>) -> Self {
         Self {
             defenses: super::turrets::Defenses::new(map),
+            environment: super::assault_effects::Environment::new(&map.effects, attack_team),
             attack_team,
             limit: first_attack.flatten().unwrap_or(f32::from(map.seconds)),
             first_attack,
@@ -113,6 +115,8 @@ impl Round {
         let Some(data) = &map.assault else {
             return;
         };
+        self.pending
+            .extend(self.environment.timers(&data.effects, time));
         for (index, fort) in data.forts.iter().enumerate() {
             if fort.touch
                 && !self.forts[index].complete
@@ -129,6 +133,7 @@ impl Round {
             let status = &mut self.triggers[index];
             if trigger.damage.is_some() || !status.enabled || status.spent {
                 if !status.enabled && status.touching != 0 && !status.spent {
+                    self.environment.release(&data.effects, trigger.event);
                     for mover in &mut map.movers {
                         mover.release_signal(trigger.event);
                     }
@@ -155,6 +160,7 @@ impl Round {
             if entered {
                 self.activate_trigger(data, index, time, attacker);
             } else if left {
+                self.environment.release(&data.effects, trigger.event);
                 for mover in &mut map.movers {
                     mover.release_signal(trigger.event);
                 }
@@ -246,6 +252,7 @@ impl Round {
                 mover.signal(event, attacker);
             }
             self.defenses.signal(data, event, due, sounds);
+            self.environment.signal(&data.effects, event, due, attacker);
         }
     }
 
@@ -299,9 +306,21 @@ impl Round {
                 }
                 Some((turret.volume.trace(start, delta)?, Target::Turret(index)))
             });
+        let charges = data
+            .effects
+            .charges
+            .iter()
+            .enumerate()
+            .filter_map(|(index, charge)| {
+                if !self.environment.targetable(&data.effects, index) {
+                    return None;
+                }
+                Some((charge.volume.trace(start, delta)?, Target::Charge(index)))
+            });
         forts
             .chain(triggers)
             .chain(turrets)
+            .chain(charges)
             .min_by(|a, b| a.0.total_cmp(&b.0))
     }
 
@@ -317,6 +336,7 @@ impl Round {
             return;
         }
         match target {
+            Target::Charge(index) => self.environment.arm(&data.effects, index, time),
             Target::Turret(index) => self.defenses.damage(index, damage, time),
             Target::Trigger(index) => {
                 let state = &self.triggers[index];

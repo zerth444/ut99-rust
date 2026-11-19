@@ -3,6 +3,7 @@
 mod ai;
 mod arsenal;
 mod assault;
+mod assault_effects;
 mod guidance;
 mod navigation;
 mod objectives;
@@ -969,6 +970,15 @@ impl Match {
             })
     }
 
+    pub(crate) fn assault_effects<'a>(
+        &'a self,
+        map: &'a Map,
+    ) -> impl Iterator<Item = ordnance::Visual<'a>> + 'a {
+        self.assault
+            .iter()
+            .flat_map(move |round| round.environment.visuals(map, self.time))
+    }
+
     pub(crate) fn turret_muzzles<'a>(
         &'a self,
         map: &'a Map,
@@ -1497,6 +1507,18 @@ impl Match {
         )
     }
 
+    pub(crate) fn view_shake(&self, map: &Map, eye: Vec3) -> (f32, f32) {
+        let (nuclear_roll, nuclear_height) = self.warhead_shake(eye);
+        let (roll, height) = self
+            .assault
+            .as_ref()
+            .zip(map.assault.as_ref())
+            .map_or((0.0, 0.0), |(round, data)| {
+                round.environment.shake(&data.effects, eye, self.time)
+            });
+        (roll + nuclear_roll, height + nuclear_height)
+    }
+
     pub(crate) fn bolts(
         &self,
     ) -> impl Iterator<Item = (super::ordnance::Kind, Vec3, Vec3, f32, f32, Option<f32>)> + '_ {
@@ -1861,6 +1883,27 @@ impl Match {
         }
         if let Some(round) = &mut self.assault {
             round.tick(map, &self.fighters, self.time, &mut sounds);
+            if let Some(data) = &map.assault {
+                let impulse =
+                    round
+                        .environment
+                        .quake_impulse(&data.effects, &self.fighters[0], self.time);
+                self.fighters[0].walker.add_velocity(impulse);
+            }
+            let hazard_hits = round.environment.tick(
+                map,
+                &self.fighters,
+                self.time,
+                dt,
+                &mut self.ballistics,
+                &mut self.decals,
+                &mut sounds,
+            );
+            for hit in hazard_hits {
+                self.apply_hit(map, hit, &mut sounds);
+            }
+        }
+        if let Some(round) = &mut self.assault {
             let conquered = round.completed_at.filter(|&at| at <= round.limit);
             if let Some(result_at) = conquered
                 .map(|at| at + 2.0)
@@ -3856,6 +3899,15 @@ impl Match {
                     .damage(index, damage.saturating_mul(scale), self.time);
             }
         }
+        for (index, charge) in data.effects.charges.iter().enumerate() {
+            if round.environment.targetable(&data.effects, index)
+                && blast
+                    .hit_actor(&map.collision, charge.volume.position, charge.volume.radius)
+                    .is_some()
+            {
+                round.environment.arm(&data.effects, index, self.time);
+            }
+        }
     }
 
     fn bot_command(&mut self, map: &Map, id: usize, dt: f32) -> Command {
@@ -4867,6 +4919,7 @@ mod tests {
             ],
             triggers: Vec::new(),
             turrets: Vec::new(),
+            effects: crate::assault::Effects::default(),
         });
         let mut game = Match::new(
             &map,

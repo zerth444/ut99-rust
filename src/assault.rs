@@ -5,12 +5,16 @@ use crate::{
     package::{Export, Package},
 };
 
+mod effects;
+pub(crate) use effects::{Effects, Timer};
+
 pub(crate) struct AssaultMap {
     pub forts: Vec<Fort>,
     pub triggers: Vec<Trigger>,
     pub relays: Vec<Relay>,
     pub seconds: u16,
     pub turrets: Vec<Turret>,
+    pub effects: Effects,
 }
 
 pub(crate) struct Turret {
@@ -145,6 +149,7 @@ pub(crate) enum Target {
     Fort(usize),
     Trigger(usize),
     Turret(usize),
+    Charge(usize),
 }
 
 impl AssaultMap {
@@ -162,6 +167,7 @@ impl AssaultMap {
             relays: Vec::new(),
             seconds: 60,
             turrets: Vec::new(),
+            effects: Effects::load(package, actors)?,
         };
         let mut paths = std::collections::HashMap::new();
         let mut destinations = Vec::new();
