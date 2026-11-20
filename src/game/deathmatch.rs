@@ -9959,6 +9959,7 @@ mod tests {
                             .any(|score| score > 0)
                 }
                 "AS-Frigate.unr" => game.finished && by_half == [3, 3],
+                "CTF-Niven.unr" => carried > 0,
                 "DOM-Sesmar.unr" => {
                     game.finished
                         && game

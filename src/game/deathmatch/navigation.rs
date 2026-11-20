@@ -587,6 +587,24 @@ pub(super) fn walk_link(world: &Collision, from: Vec3, to: Vec3) -> bool {
     }) {
         return false;
     }
+    use crate::collision::{PLAYER_HEIGHT, PLAYER_RADIUS};
+    let step = world.profile.step_height;
+    let below = Vec3(0.0, 0.0, -(2.0 * PLAYER_HEIGHT + step));
+    // Around pools, a centerline trace alone can miss the wall beside a ledge.
+    if [from, from + delta * 0.5, to]
+        .into_iter()
+        .any(|p| world.regions.at(p + below).water)
+        && world
+            .projectile_surface(
+                from + Vec3(0.0, 0.0, step),
+                delta,
+                PLAYER_RADIUS,
+                (PLAYER_HEIGHT - step).max(1.0),
+            )
+            .is_some_and(|(_, normal)| normal.2.abs() < 0.25)
+    {
+        return false;
+    }
     // Probe several places along the ground so a clear line through a gap is not a walk edge.
     let probes = (horizontal / 48.0).ceil().max(1.0) as u32;
     (1..=probes).all(|i| {
@@ -635,19 +653,33 @@ pub(super) fn swim_to_surface(
     }
     // Look up and around an overhead ledge when no authored route is accessible.
     let vertical = Vec3(0.0, 0.0, 112.0);
+    let lateral = |index: usize| {
+        let (sin, cos) = (index as f32 * std::f32::consts::TAU / 8.0).sin_cos();
+        Vec3(cos, sin, 0.0)
+    };
+    let allowed = |point: Vec3| {
+        blocked
+            .iter()
+            .all(|&(failed, _)| distance_squared(point, failed) > 40.0_f32.powi(2))
+    };
     std::iter::once(from + vertical)
-        .chain((0..8).map(|index| {
-            let (sin, cos) = (index as f32 * std::f32::consts::TAU / 8.0).sin_cos();
-            from + vertical + Vec3(cos, sin, 0.0) * 96.0
-        }))
-        .filter(|&point| {
-            blocked
-                .iter()
-                .all(|&(failed, _)| distance_squared(point, failed) > 40.0_f32.powi(2))
-        })
+        .chain((0..8).map(|index| from + vertical + lateral(index) * 96.0))
+        .filter(|&point| allowed(point))
         .filter_map(|point| Some((point, approach_step(world, from, point)?)))
         .min_by_key(|(point, _)| world.regions.at(*point).water)
         .map(|(_, step)| step)
+        .or_else(|| {
+            // Swim out from beneath a wide ceiling before trying to rise.
+            [96.0, 144.0, 192.0]
+                .into_iter()
+                .flat_map(|distance| (0..8).map(move |index| from + lateral(index) * distance))
+                .filter(|&point| allowed(point) && world.regions.at(point).water)
+                .find_map(|point| {
+                    let step = approach_step(world, from, point)?;
+                    approach_step(world, point, point + vertical)?;
+                    Some(step)
+                })
+        })
 }
 
 pub(super) fn steep_descent(world: &Collision, from: Vec3) -> Option<Vec3> {
@@ -755,4 +787,52 @@ pub(super) fn walk_around_wall(world: &Collision, from: Vec3, to: Vec3) -> Optio
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn waterside_shortcut_requires_clearance_for_the_player_hull() {
+        use crate::collision::Plane;
+        use crate::movement::{RegionNode, Zone};
+
+        let mut world = Collision::test_world();
+        world.add_box(Vec3(-150.0, -180.0, -32.0), Vec3(150.0, 180.0, 0.0));
+        world.add_box(Vec3(16.0, -5.0, 0.0), Vec3(90.0, 5.0, 90.0));
+        world.regions.zones.push(Zone {
+            water: true,
+            ..Zone::default()
+        });
+        world.regions.nodes.push(RegionNode {
+            plane: Plane {
+                normal: Vec3(0.0, 0.0, 1.0),
+                distance: -40.0,
+            },
+            children: [-1, -1],
+            zones: [0, -1],
+        });
+        let from = Vec3(0.0, -120.0, 39.15);
+        let to = Vec3(0.0, 120.0, 39.15);
+        assert!(!walk_link(&world, from, to));
+        let away = Vec3(-20.0, 0.0, 0.0);
+        assert!(walk_link(&world, from + away, to + away));
+    }
+
+    #[test]
+    fn swimmer_moves_sideways_when_the_ceiling_blocks_every_upward_approach() {
+        let mut world = Collision::test_world();
+        world.regions.level.water = true;
+        world.add_box(Vec3(-128.0, -200.0, 60.0), Vec3(128.0, 200.0, 90.0));
+        let start = Vec3::default();
+        let Some(Step::Swim(clearance)) = swim_to_surface(&world, start, &[]) else {
+            panic!("no escape from beneath the ceiling");
+        };
+        assert!(clearance.0.abs() > 145.0 && clearance.2.abs() < 0.01);
+        let Some(Step::Swim(surface)) = swim_to_surface(&world, clearance, &[]) else {
+            panic!("no upward route after clearing the ceiling");
+        };
+        assert!(surface.2 > 100.0);
+    }
 }
