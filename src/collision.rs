@@ -118,10 +118,22 @@ impl Collision {
     }
 
     pub fn set_box(&mut self, id: usize, min: Vec3, max: Vec3) {
+        self.set_hull(id, min, max, []);
+    }
+
+    pub(crate) fn set_hull(
+        &mut self,
+        id: usize,
+        min: Vec3,
+        max: Vec3,
+        planes: impl IntoIterator<Item = Plane>,
+    ) {
         let hull = &mut self.hulls[id];
         hull.min = min;
         hull.max = max;
-        hull.planes.copy_from_slice(&box_planes(min, max));
+        hull.planes.clear();
+        hull.planes.extend(planes);
+        hull.planes.extend(box_planes(min, max));
     }
 
     fn sweep(&self, start: Vec3, delta: Vec3, extent: Vec3) -> Option<Hit> {

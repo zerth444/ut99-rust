@@ -2,7 +2,7 @@ use std::{io, path::Path, sync::Arc};
 
 use crate::{
     map::Vec3,
-    mover::{Mover, rotate},
+    mover::Mover,
     package::Package,
     texture::{Texture, TextureImage, load_materials},
 };
@@ -32,7 +32,7 @@ impl Emitter {
     fn position(&self, movers: &[Mover]) -> Vec3 {
         self.mover.map_or(self.position, |index| {
             let mover = &movers[index];
-            mover.pivot + mover.offset + rotate(self.position - mover.pivot, mover.scene_rotation)
+            mover.transform_point(self.position)
         })
     }
 }

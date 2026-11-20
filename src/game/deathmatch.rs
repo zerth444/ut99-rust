@@ -9922,6 +9922,41 @@ mod tests {
 
     #[test]
     #[ignore = "requires local GOTY data"]
+    fn assault_bots_leave_the_overlord_landing_craft() {
+        let path = std::path::Path::new("local/reference-client/Maps/AS-Overlord.unr");
+        let bytes = std::fs::read(path).unwrap();
+        let package = Package::read(&bytes).unwrap();
+        let mut map = Map::load(&package, Some(path)).unwrap();
+        let mut game = Match::new(
+            &map,
+            0,
+            Rules {
+                mode: Mode::Assault,
+                bots: 5,
+                ..Rules::default()
+            },
+        );
+        game.fighters[0].protected_until = f32::INFINITY;
+        let tick = 1.0 / 120.0;
+        let mut reached_shore = [false; 2];
+        for _ in 0..120 * 20 {
+            game.step(&mut map, Command::default(), tick);
+            for (reached, attacker) in reached_shore
+                .iter_mut()
+                .zip(game.fighters[1..].iter().filter(|f| f.team == Some(0)))
+            {
+                // This line is north of both landing-craft doors.
+                *reached |= attacker.health > 0 && attacker.walker.position.1 < 1600.0;
+            }
+            if reached_shore.into_iter().all(|reached| reached) {
+                return;
+            }
+        }
+        panic!("the attackers were trapped in the landing craft: {reached_shore:?}");
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY data"]
     fn audit_objective_bots() {
         let mut arenas: Vec<_> = std::fs::read_dir("local/reference-client/Maps")
             .unwrap()

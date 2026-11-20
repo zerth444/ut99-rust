@@ -437,9 +437,7 @@ impl Frame {
                         || corona.attach_tag.is_some_and(|tag| mover.tag == Some(tag))
                 })
                 .map_or(corona.position, |mover| {
-                    mover.pivot
-                        + mover.offset
-                        + crate::mover::rotate(corona.position - mover.pivot, mover.scene_rotation)
+                    mover.transform_point(corona.position)
                 });
             let position = view.point(world);
             if position.2 < NEAR
@@ -483,13 +481,13 @@ impl Frame {
     fn mover_view(&self, camera: &Camera, mover: &crate::mover::Mover) -> View {
         let mut view = self.camera_view(camera);
         view.eye = view.eye - mover.offset;
-        if mover.scene_rotation.dot(mover.scene_rotation) > 0.0 {
+        if mover.is_rotated() {
             let [x, y, z] = [
                 Vec3(1.0, 0.0, 0.0),
                 Vec3(0.0, 1.0, 0.0),
                 Vec3(0.0, 0.0, 1.0),
             ]
-            .map(|axis| crate::mover::rotate(axis, mover.scene_rotation));
+            .map(|axis| mover.transform_direction(axis));
             let inverse = |p: Vec3| Vec3(p.dot(x), p.dot(y), p.dot(z));
             view.eye = mover.pivot + inverse(view.eye - mover.pivot);
             view.forward = inverse(view.forward);
@@ -1786,10 +1784,8 @@ impl Frame {
                     * (1.0 / face.vertices.len() as f32);
                 let (center, normal) = mover.map_or((center, normal), |mover| {
                     (
-                        mover.pivot
-                            + mover.offset
-                            + crate::mover::rotate(center - mover.pivot, mover.scene_rotation),
-                        crate::mover::rotate(normal, mover.scene_rotation),
+                        mover.transform_point(center),
+                        mover.transform_direction(normal),
                     )
                 });
                 crate::light::actor_lighting(lights, center, normal, time)

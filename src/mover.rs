@@ -1,6 +1,6 @@
 use std::{io, path::Path};
 
-use crate::collision::{Collision, Walker};
+use crate::collision::{Collision, Plane, Walker};
 use crate::map::{Face, Vec3, brush_polys, material_color};
 use crate::package::{Export, Package, Reader, invalid};
 use crate::texture::load_materials;
@@ -35,8 +35,11 @@ impl Trigger {
 pub struct Mover {
     pub faces: Vec<Face>,
     pub offset: Vec3,
-    pub scene_rotation: Vec3,
+    scene_rotation: Vec3,
     pub pivot: Vec3,
+    home_rotation: Vec3,
+    hull_vertices: Vec<Vec3>,
+    hull_planes: Vec<Plane>,
     min: Vec3,
     max: Vec3,
     travel: Vec3,
@@ -124,8 +127,44 @@ impl LiftStop {
 }
 
 impl Mover {
+    pub(crate) fn is_rotated(&self) -> bool {
+        self.scene_rotation.dot(self.scene_rotation) > f32::EPSILON
+    }
+
+    pub(crate) fn transform_point(&self, point: Vec3) -> Vec3 {
+        self.pivot + self.offset + self.transform_direction(point - self.pivot)
+    }
+
+    pub(crate) fn transform_direction(&self, direction: Vec3) -> Vec3 {
+        self.rotate_from_home(direction, self.scene_rotation)
+    }
+
+    fn rotate_from_home(&self, direction: Vec3, key_rotation: Vec3) -> Vec3 {
+        rotate_from_home(direction, self.home_rotation, key_rotation)
+    }
+
     pub(crate) fn collision_hull(&self) -> Option<usize> {
         self.hull
+    }
+
+    fn set_collision(&self, world: &mut Collision, id: usize, offset: Vec3, rotation: Vec3) {
+        let (min, max) = self.bounds_at(offset, rotation);
+        if self.hull_planes.is_empty() {
+            world.set_box(id, min, max);
+            return;
+        }
+        let [x, y, z] = AXES.map(|axis| self.rotate_from_home(axis, rotation));
+        world.set_hull(
+            id,
+            min,
+            max,
+            self.hull_planes.iter().map(|plane| {
+                let normal = x * plane.normal.0 + y * plane.normal.1 + z * plane.normal.2;
+                let distance =
+                    plane.distance - plane.normal.dot(self.pivot) + normal.dot(self.pivot + offset);
+                Plane { normal, distance }
+            }),
+        );
     }
 
     #[cfg(windows)]
@@ -206,7 +245,11 @@ impl Mover {
                     .collect();
                 let mut mover = brush.mover;
                 if brush.solid {
-                    mover.hull = Some(world.add_box(mover.min, mover.max));
+                    let hull = world.add_box(mover.min, mover.max);
+                    mover.hull = Some(hull);
+                    if !mover.hull_planes.is_empty() {
+                        mover.set_collision(world, hull, mover.offset, mover.scene_rotation);
+                    }
                 }
                 mover.faces = faces;
                 mover
@@ -258,7 +301,7 @@ impl Mover {
         self.signaled = None;
         self.control_sources = 0;
         if let Some(hull) = self.hull {
-            world.set_box(hull, self.min, self.max);
+            self.set_collision(world, hull, self.offset, self.scene_rotation);
         }
     }
 
@@ -476,13 +519,13 @@ impl Mover {
                 .filter(|(_, walker)| on_board(walker))
                 .map(|(index, walker)| (index, walker.position))
                 .collect();
-            world.set_box(id, new_min, new_max);
+            self.set_collision(world, id, offset, rotation);
             for &(index, position) in &riders {
                 let walker = &mut walkers[index];
                 walker.carry(world, delta);
                 let displacement = walker.position - position;
                 if (displacement - delta).dot(displacement - delta) > 1.0 {
-                    world.set_box(id, min, max);
+                    self.set_collision(world, id, self.offset, self.scene_rotation);
                     for (index, position) in riders {
                         walkers[index].position = position;
                     }
@@ -509,14 +552,12 @@ impl Mover {
         }
         let mut min = Vec3(f32::INFINITY, f32::INFINITY, f32::INFINITY);
         let mut max = min * -1.0;
-        for x in [self.min.0, self.max.0] {
-            for y in [self.min.1, self.max.1] {
-                for z in [self.min.2, self.max.2] {
-                    let point = self.pivot + offset + rotate(Vec3(x, y, z) - self.pivot, rotation);
-                    min = Vec3(min.0.min(point.0), min.1.min(point.1), min.2.min(point.2));
-                    max = Vec3(max.0.max(point.0), max.1.max(point.1), max.2.max(point.2));
-                }
-            }
+        let [x, y, z] = AXES.map(|axis| self.rotate_from_home(axis, rotation));
+        for &point in &self.hull_vertices {
+            let relative = point - self.pivot;
+            let point = self.pivot + offset + x * relative.0 + y * relative.1 + z * relative.2;
+            min = Vec3(min.0.min(point.0), min.1.min(point.1), min.2.min(point.2));
+            max = Vec3(max.0.max(point.0), max.1.max(point.1), max.2.max(point.2));
         }
         (min, max)
     }
@@ -693,6 +734,25 @@ impl Brush {
             .filter(|trigger| Some(trigger.event) == tag)
             .copied()
             .collect();
+        #[cfg(windows)]
+        let rotates = keys
+            .get(1)
+            .is_some_and(|(_, key)| key.dot(*key) > f32::EPSILON);
+        #[cfg(not(windows))]
+        let rotates = false;
+        let hull_vertices: Vec<_> = if solid && rotates {
+            polys
+                .iter()
+                .flat_map(|(_, face)| face.vertices.iter().copied())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let hull_planes = if !hull_vertices.is_empty() {
+            convex_planes(&polys, &hull_vertices)
+        } else {
+            Vec::new()
+        };
         Ok(Some(Self {
             solid,
             polys,
@@ -701,6 +761,9 @@ impl Brush {
                 offset: Vec3::default(),
                 scene_rotation: Vec3::default(),
                 pivot: location,
+                home_rotation: rotation,
+                hull_vertices,
+                hull_planes,
                 min,
                 max,
                 travel,
@@ -780,6 +843,47 @@ pub(crate) fn rotate(point: Vec3, rotation: Vec3) -> Vec3 {
     );
     let Vec3(x, y, z) = Vec3(x * cp - z * sp, y, x * sp + z * cp);
     Vec3(x * cy - y * sy, x * sy + y * cy, z)
+}
+
+const AXES: [Vec3; 3] = [
+    Vec3(1.0, 0.0, 0.0),
+    Vec3(0.0, 1.0, 0.0),
+    Vec3(0.0, 0.0, 1.0),
+];
+
+fn convex_planes(polys: &[(i32, Face)], vertices: &[Vec3]) -> Vec<Plane> {
+    let center = vertices.iter().copied().fold(Vec3::default(), |a, b| a + b)
+        * (vertices.len() as f32).recip();
+    let mut planes = Vec::with_capacity(polys.len());
+    for (_, face) in polys {
+        let on_plane = face.vertices[0];
+        let mut normal = face.normal;
+        if normal.dot(normal) < 0.5 {
+            return Vec::new();
+        }
+        if normal.dot(center - on_plane) > 0.0 {
+            normal = normal * -1.0;
+        }
+        if vertices.iter().any(|&p| normal.dot(p - on_plane) > 0.1) {
+            return Vec::new();
+        }
+        planes.push(Plane {
+            normal,
+            distance: normal.dot(on_plane),
+        });
+    }
+    planes
+}
+
+fn rotate_from_home(direction: Vec3, home: Vec3, key: Vec3) -> Vec3 {
+    if key.dot(key) <= f32::EPSILON {
+        return direction;
+    }
+    // KeyRot offsets the actor's home rotator. The mesh vertices are already
+    // baked in that home orientation, so undo it before applying the new pose.
+    let [x, y, z] = AXES.map(|axis| rotate(axis, home));
+    let local = Vec3(direction.dot(x), direction.dot(y), direction.dot(z));
+    rotate(local, home + key)
 }
 
 pub(crate) fn product(a: Vec3, b: Vec3) -> Vec3 {
