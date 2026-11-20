@@ -236,6 +236,7 @@ impl Ord for RouteCandidate {
 pub(super) struct Navigation {
     points: Vec<Vec3>,
     edges: Vec<Vec<Edge>>,
+    check_steep_approaches: bool,
 }
 
 impl Navigation {
@@ -385,7 +386,24 @@ impl Navigation {
         for (source, edge) in transfers {
             edges[source].push(edge);
         }
-        Self { points, edges }
+        Self {
+            points,
+            edges,
+            check_steep_approaches: map.assault.is_some(),
+        }
+    }
+
+    fn approach_step(&self, world: &Collision, from: Vec3, to: Vec3) -> Option<Step> {
+        let step = approach_step(world, from, to)?;
+        // Assault goals can occupy a ramp above another reachable floor.
+        // Other modes retain their established approach and jump routes.
+        if self.check_steep_approaches
+            && matches!(step, Step::Walk(_))
+            && !walk_between_floors(world, from, to)
+        {
+            return None;
+        }
+        Some(step)
     }
 
     pub(super) fn next_step(&self, world: &Collision, from: Vec3, to: Vec3) -> Option<Step> {
@@ -436,7 +454,7 @@ impl Navigation {
             return lift.map(|step| (step, distance_squared(from, to).sqrt()));
         }
         if allowed(to)
-            && let Some(step) = approach_step(world, from, to)
+            && let Some(step) = self.approach_step(world, from, to)
         {
             return Some((
                 step,
@@ -449,7 +467,7 @@ impl Navigation {
         for (id, &point) in self.points.iter().enumerate() {
             let distance = distance_squared(from, point);
             if distance <= EDGE_LIMIT.powi(2)
-                && let Some(step) = approach_step(world, from, point)
+                && let Some(step) = self.approach_step(world, from, point)
             {
                 if (from.2 - point.2).abs() > 48.0
                     || (from.0 - point.0).hypot(from.1 - point.1) >= WAYPOINT_RADIUS
@@ -480,7 +498,7 @@ impl Navigation {
             if closing <= EDGE_LIMIT.powi(2)
                 && costs[id] + closing.sqrt() < best
                 && (first[id].is_some() || allowed(to))
-                && let Some(step) = approach_step(world, point, to)
+                && let Some(step) = self.approach_step(world, point, to)
             {
                 let total = costs[id] + approach_cost(world, step, closing.sqrt());
                 if total < best {
@@ -525,7 +543,7 @@ impl Navigation {
                         .iter()
                         .all(|&(failed, _)| distance_squared(point, failed) > 48.0_f32.powi(2))
             })
-            .filter_map(|point| Some((point, approach_step(world, from, point)?)))
+            .filter_map(|point| Some((point, self.approach_step(world, from, point)?)))
             .min_by(|&(a, _), &(b, _)| {
                 let score = |point| {
                     objective.map_or(distance_squared(from, point), |goal| {
@@ -552,6 +570,36 @@ fn approach_step(world: &Collision, from: Vec3, to: Vec3) -> Option<Step> {
         return None;
     }
     walk_link(world, from, to).then_some(Step::Walk(to))
+}
+
+fn walk_between_floors(world: &Collision, from: Vec3, to: Vec3) -> bool {
+    let delta = to - from;
+    let horizontal = delta.0.hypot(delta.1);
+    let step = world.profile.step_height;
+    // Follow the lower floor uphill. A ray from the waypoints' interpolated
+    // Z can jump from the ground to the top of an overhead ramp.
+    if delta.2 > step + crate::collision::PLAYER_HEIGHT {
+        let up = Vec3(0.0, 0.0, step);
+        let Some(mut floor) = world.floor_position(from + up, step + 56.0) else {
+            return false;
+        };
+        let Some(destination) = world.floor_position(to + up, step + 56.0) else {
+            return false;
+        };
+        let samples = (horizontal / 23.0).ceil().max(1.0) as u32;
+        for i in 1..=samples {
+            let p = from + delta * (i as f32 / samples as f32);
+            let origin = Vec3(p.0, p.1, floor.2) + up;
+            let Some(next) = world.floor_position(origin, 2.0 * step + 8.0) else {
+                return false;
+            };
+            floor = next;
+        }
+        if (floor.2 - destination.2).abs() > step {
+            return false;
+        }
+    }
+    true
 }
 
 fn approach_cost(world: &Collision, step: Step, distance: f32) -> f32 {

@@ -4823,6 +4823,7 @@ impl Match {
                 .map(|(ray, _)| ray)
         });
         let keep_route = carrying_flag
+            || assault.is_some_and(|(fort, attacking)| attacking && fort.touch)
             || (self.rules.mode == Mode::CaptureTheFlag
                 && fighter.bot.goal.and_then(Step::movement_goal).is_some()
                 && target.is_some_and(|(opponent, point, _, distance, _)| {
@@ -5367,6 +5368,19 @@ impl Match {
                 let side = unit(Vec3(-relative.1, relative.0, 0.0));
                 (side.dot(side) > 0.5).then_some((closest, pass, side, blast >= 100.0))
             })
+            .min_by(|a, b| a.0.total_cmp(&b.0));
+        let mortar = self.assault.as_ref().and_then(|round| {
+            round.environment.threatened_by_mortar(
+                map,
+                fighter,
+                self.time,
+                skill.reaction,
+                skill.evade_window * 3.0,
+            )
+        });
+        let threat = threat
+            .into_iter()
+            .chain(mortar)
             .min_by(|a, b| a.0.total_cmp(&b.0))?;
         let (_, pass, side, explosive) = threat;
         let dodge = skill.dodge && explosive;
@@ -9922,11 +9936,19 @@ mod tests {
 
     #[test]
     #[ignore = "requires local GOTY data"]
-    fn assault_bots_leave_the_overlord_landing_craft() {
+    fn assault_bots_land_and_breach_the_overlord_beachhead() {
         let path = std::path::Path::new("local/reference-client/Maps/AS-Overlord.unr");
         let bytes = std::fs::read(path).unwrap();
         let package = Package::read(&bytes).unwrap();
         let mut map = Map::load(&package, Some(path)).unwrap();
+        let beachhead = map
+            .assault
+            .as_ref()
+            .unwrap()
+            .forts
+            .iter()
+            .position(|fort| fort.tag.and_then(|tag| package.name(tag).ok()) == Some("beachFS"))
+            .expect("beachhead objective");
         let mut game = Match::new(
             &map,
             0,
@@ -9939,7 +9961,7 @@ mod tests {
         game.fighters[0].protected_until = f32::INFINITY;
         let tick = 1.0 / 120.0;
         let mut reached_shore = [false; 2];
-        for _ in 0..120 * 20 {
+        for frame in 0..120 * 60 {
             game.step(&mut map, Command::default(), tick);
             for (reached, attacker) in reached_shore
                 .iter_mut()
@@ -9948,11 +9970,18 @@ mod tests {
                 // This line is north of both landing-craft doors.
                 *reached |= attacker.health > 0 && attacker.walker.position.1 < 1600.0;
             }
-            if reached_shore.into_iter().all(|reached| reached) {
+            if frame == 120 * 20 {
+                assert!(
+                    reached_shore.into_iter().all(|reached| reached),
+                    "{reached_shore:?}"
+                );
+            }
+            if !game.assault.as_ref().unwrap().active(beachhead) {
+                assert!(reached_shore.into_iter().all(|reached| reached));
                 return;
             }
         }
-        panic!("the attackers were trapped in the landing craft: {reached_shore:?}");
+        panic!("the attackers did not breach the beachhead");
     }
 
     #[test]

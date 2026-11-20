@@ -116,6 +116,69 @@ pub(super) struct Environment {
 }
 
 impl Environment {
+    pub(super) fn threatened_by_mortar(
+        &self,
+        map: &Map,
+        fighter: &Fighter,
+        time: f32,
+        reaction: f32,
+        horizon: f32,
+    ) -> Option<(f32, Vec3, Vec3, bool)> {
+        let mortars = &map.assault.as_ref()?.effects.mortars;
+        let art = &map.ordnance[Kind::FlakShell as usize];
+        let eye = fighter.camera(map);
+        let world = &map.collision;
+        self.shells
+            .iter()
+            .filter_map(|shell| {
+                let sight = shell.position - eye.position;
+                if time - shell.born < reaction
+                    || sight.dot(sight) > 1250.0_f32.powi(2)
+                    || sight.dot(eye.forward()) <= -0.2 * sight.0.hypot(sight.1)
+                    || world.ray(eye.position, sight).is_some()
+                {
+                    return None;
+                }
+                let gun = &mortars[shell.source];
+                let mut position = shell.position;
+                let mut velocity = shell.velocity;
+                let mut elapsed = 0.0;
+                while elapsed < horizon {
+                    let dt = (horizon - elapsed).min(0.10);
+                    let gravity = world.regions.at(position).gravity;
+                    let travel = (velocity + gravity * (0.5 * dt)) * dt;
+                    let wall = world.projectile_surface(
+                        position,
+                        travel,
+                        art.collision_radius,
+                        art.collision_height,
+                    );
+                    elapsed += dt;
+                    let impact = wall.map_or(position + travel, |(point, _)| point);
+                    let predicted = fighter.walker.position + fighter.walker.velocity() * elapsed;
+                    let pass = impact - predicted;
+                    let clearance = if wall.is_some() {
+                        gun.radius.min(200.0)
+                    } else {
+                        55.0
+                    };
+                    if pass.dot(pass) < clearance * clearance
+                        && world.ray(predicted, pass).is_none()
+                    {
+                        let side = unit(Vec3(-velocity.1, velocity.0, 0.0));
+                        return Some((elapsed, pass, side, true));
+                    }
+                    if wall.is_some() {
+                        return None;
+                    }
+                    position = impact;
+                    velocity = velocity + gravity * dt;
+                }
+                None
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+    }
+
     pub fn new(data: &Effects, side: usize) -> Self {
         let mut rng = 0x6c24_11d3 ^ side as u32;
         Self {
