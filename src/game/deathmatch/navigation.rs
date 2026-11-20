@@ -650,6 +650,16 @@ pub(super) fn swim_to_surface(
         .map(|(_, step)| step)
 }
 
+pub(super) fn steep_descent(world: &Collision, from: Vec3) -> Option<Vec3> {
+    use crate::collision::{PLAYER_HEIGHT, PLAYER_RADIUS};
+    let (_, normal) =
+        world.projectile_surface(from, Vec3(0.0, 0.0, -12.0), PLAYER_RADIUS, PLAYER_HEIGHT)?;
+    if !(0.05..0.7).contains(&normal.2) {
+        return None;
+    }
+    Some(crate::mover::unit(Vec3(normal.0, normal.1, 0.0)))
+}
+
 pub(super) fn walk_around_wall(world: &Collision, from: Vec3, to: Vec3) -> Option<Vec<Vec3>> {
     use crate::collision::{PLAYER_HEIGHT, PLAYER_RADIUS};
     const SIDE: usize = 29;

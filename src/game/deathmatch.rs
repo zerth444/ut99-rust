@@ -5278,6 +5278,15 @@ impl Match {
             }
             return route;
         }
+        if fighter
+            .airborne_since
+            .is_some_and(|since| self.time - since >= 2.0)
+            && fighter.walker.speed() < 15.0
+            && let Some(downhill) = navigation::steep_descent(&map.collision, position)
+        {
+            // A steep face cannot become a walkable floor. Use air control to clear it.
+            return drive(fighter, downhill * 0.65, dt);
+        }
         if self.rules.mode.team_based() {
             if let Some(fire) = covering_fire {
                 return fire;
@@ -5466,7 +5475,9 @@ fn try_retreat(
 fn follow_transfer(map: &Map, fighter: &mut Fighter, time: f32, dt: f32) -> Option<Command> {
     if let Some(&point) = fighter.bot.wall_detour.last() {
         if time < fighter.bot.rethink_at {
-            let next = if near_waypoint(point, fighter.walker.position) {
+            let offset = point - fighter.walker.position;
+            // Advance only after taking the corner, or a short segment cuts back into the wall.
+            let next = if offset.0.hypot(offset.1) < 12.0 && offset.2.abs() < 56.0 {
                 fighter.bot.wall_detour.pop();
                 fighter.bot.rethink_at = time + 3.0;
                 fighter.bot.wall_detour.last().copied()
@@ -9807,6 +9818,43 @@ mod tests {
 
     #[test]
     #[ignore = "requires local GOTY data"]
+    fn niven_bot_crosses_water_and_reaches_the_flag_on_the_ramp() {
+        let path = std::path::Path::new("local/reference-client/Maps/CTF-Niven.unr");
+        let bytes = std::fs::read(path).unwrap();
+        let mut map = Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap();
+        let mut game = Match::new(
+            &map,
+            0,
+            Rules {
+                mode: Mode::CaptureTheFlag,
+                bots: 1,
+                ..Rules::default()
+            },
+        );
+        let start = map
+            .start_teams
+            .iter()
+            .position(|team| *team == Some(0))
+            .unwrap();
+        game.fighters[0].health = 0;
+        game.fighters[0].fell_at = Some(f32::INFINITY);
+        game.fighters[1].team = Some(0);
+        game.fighters[1].walker = Walker::spawn(&map.collision, map.starts[start].position);
+        let mut swam = false;
+        for _ in 0..(120 * 100) {
+            game.step(&mut map, Command::default(), 1.0 / 120.0);
+            let pos = game.fighters[1].walker.position;
+            swam |= map.collision.regions.at(pos).water;
+            if game.objectives.carries_flag(1) {
+                assert!(swam && game.fighters[1].walker.grounded);
+                return;
+            }
+        }
+        panic!("bot did not reach the flag from the opposite base");
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY data"]
     fn audit_objective_bots() {
         let mut arenas: Vec<_> = std::fs::read_dir("local/reference-client/Maps")
             .unwrap()
@@ -9898,8 +9946,10 @@ mod tests {
                 | "CTF-Dreary.unr"
                 | "CTF-EternalCave.unr"
                 | "CTF-Face.unr"
+                | "CTF-Face][.unr"
                 | "CTF-Gauntlet.unr"
-                | "CTF-Hydro16.unr" => {
+                | "CTF-Hydro16.unr"
+                | "CTF-November.unr" => {
                     carried > 0
                         && game.finished
                         && game

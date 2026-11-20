@@ -429,9 +429,25 @@ pub struct ObjectiveArt {
     pub portal: [Motion; 2],
     pub base: [Motion; 2],
     pub flag: [Motion; 2],
+    pub(crate) flag_collision: FlagCollision,
     pub control: [Vec<Face>; 3],
     pub control_icons: [Option<Arc<Texture>>; 3],
     pub control_sound: Option<Arc<Wave>>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FlagCollision {
+    pub radius: f32,
+    pub height: f32,
+}
+
+impl Default for FlagCollision {
+    fn default() -> Self {
+        Self {
+            radius: 48.0,
+            height: 30.0,
+        }
+    }
 }
 
 pub fn load(
@@ -663,6 +679,24 @@ pub fn load(
         });
     }
     if has_flags {
+        if let Some(class) = find_export(&assets, "botpack", "CTFFlag", "Class") {
+            let (package, export) = assets.object(class);
+            if let Ok(mut props) = class_properties(package, export) {
+                while let Ok(Some((name, mut value))) = props.next() {
+                    let extent = match name {
+                        "CollisionRadius" => &mut objectives.flag_collision.radius,
+                        "CollisionHeight" => &mut objectives.flag_collision.height,
+                        _ => continue,
+                    };
+                    if let Ok(size) = value.f32()
+                        && size.is_finite()
+                        && size > 0.0
+                    {
+                        *extent = size;
+                    }
+                }
+            }
+        }
         objectives.base = [0, 1].map(|team| {
             objective_motion(
                 &mut assets,

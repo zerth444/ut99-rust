@@ -2,7 +2,7 @@ use crate::map::{Map, Vec3};
 
 use super::{Fighter, distance_squared};
 
-const OBJECTIVE_TOUCH_HEIGHT: f32 = 72.0;
+const CONTROL_POINT_TOUCH_HEIGHT: f32 = 72.0;
 
 #[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
 pub enum Mode {
@@ -184,17 +184,19 @@ impl FlagNotice {
     }
 }
 
-fn touching(map: &Map, position: Vec3, fighter: &Fighter) -> bool {
+fn touching(map: &Map, position: Vec3, fighter: &Fighter, radius: f32, height: f32) -> bool {
     let offset = fighter.walker.position - position;
     fighter.health > 0
-        && offset.0.hypot(offset.1) < 50.0
-        && offset.2.abs() < OBJECTIVE_TOUCH_HEIGHT
+        && offset.0.hypot(offset.1) < radius
+        && offset.2.abs() < height
         && map.collision.ray(position, offset).is_none()
 }
 
 impl Objectives {
     pub(super) fn new(map: &Map, mode: Mode, time_limit: u16) -> Self {
         let flags = if mode == Mode::CaptureTheFlag {
+            let reach_height =
+                map.objective_art.flag_collision.height + crate::collision::PLAYER_HEIGHT;
             map.flag_bases[0].zip(map.flag_bases[1]).map(|(red, blue)| {
                 [red, blue].map(|base| Flag {
                     base,
@@ -203,7 +205,7 @@ impl Objectives {
                     } else {
                         // A flag model can stand above the navigable floor.
                         map.collision
-                            .floor_position(base, OBJECTIVE_TOUCH_HEIGHT - 4.0)
+                            .floor_position(base, reach_height - 4.0)
                             .unwrap_or(base)
                     },
                     state: FlagState::Home,
@@ -246,8 +248,11 @@ impl Objectives {
     ) -> Option<FlagNotice> {
         let mut notice = None;
         if let Some(flags) = &mut self.flags {
+            let size = map.objective_art.flag_collision;
+            let home_radius = size.radius + crate::collision::PLAYER_RADIUS;
+            let height = size.height + crate::collision::PLAYER_HEIGHT;
             for (team, flag) in flags.iter_mut().enumerate() {
-                let position = match flag.state {
+                let (position, radius) = match flag.state {
                     FlagState::Held(owner) => {
                         let fighter = &fighters[owner];
                         if fighter.health == 0 {
@@ -259,8 +264,8 @@ impl Objectives {
                         flag.state = FlagState::Home;
                         continue;
                     }
-                    FlagState::Dropped(drop) => drop.position,
-                    FlagState::Home => flag.base,
+                    FlagState::Dropped(drop) => (drop.position, 50.0),
+                    FlagState::Home => (flag.base, home_radius),
                 };
                 if let Some((id, fighter)) = fighters
                     .iter()
@@ -269,7 +274,7 @@ impl Objectives {
                         flag.previous_carrier
                             .is_none_or(|(owner, until)| owner != *id || time >= until)
                     })
-                    .filter(|(_, fighter)| touching(map, position, fighter))
+                    .filter(|(_, fighter)| touching(map, position, fighter, radius, height))
                     .filter(|(_, fighter)| {
                         fighter.team != Some(team) || matches!(flag.state, FlagState::Dropped(..))
                     })
@@ -293,7 +298,7 @@ impl Objectives {
             for team in 0..2 {
                 if let FlagState::Held(owner) = flags[1 - team].state
                     && matches!(flags[team].state, FlagState::Home)
-                    && touching(map, flags[team].base, &fighters[owner])
+                    && touching(map, flags[team].base, &fighters[owner], home_radius, height)
                 {
                     flags[1 - team].state = FlagState::Home;
                     self.scores[team] = self.scores[team].saturating_add(1);
@@ -312,7 +317,13 @@ impl Objectives {
                 .zip(&mut zone.touching)
                 .filter_map(|((id, fighter), was_touching)| {
                     let team = fighter.team?;
-                    let now_touching = touching(map, zone.position, fighter);
+                    let now_touching = touching(
+                        map,
+                        zone.position,
+                        fighter,
+                        50.0,
+                        CONTROL_POINT_TOUCH_HEIGHT,
+                    );
                     let already_touching = std::mem::replace(was_touching, now_touching);
                     (now_touching && !already_touching).then_some((team, id, fighter))
                 })
