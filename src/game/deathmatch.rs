@@ -1635,7 +1635,8 @@ impl Match {
             .unwrap_or(if team == 0 { "Red team" } else { "Blue team" })
     }
 
-    pub fn named_rated_teams(&self) -> Option<(&str, &str)> {
+    #[cfg(test)]
+    fn named_rated_teams(&self) -> Option<(&str, &str)> {
         let roster = self.rated_roster.as_ref()?;
         Some((roster.teams[0].as_deref()?, roster.teams[1].as_deref()?))
     }
@@ -9483,6 +9484,72 @@ mod tests {
                     .batches()
                     .any(|(material, _)| material.texture == key)
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY data"]
+    #[cfg(windows)]
+    fn scoreboard_draws_all_modes_during_play_and_after_the_match() {
+        use crate::{hud::Hud, render::Frame};
+
+        let hud = Hud::new();
+        for (mode, name) in [
+            (Mode::Deathmatch, "DM-Deck16][.unr"),
+            (Mode::TeamDeathmatch, "DM-Deck16][.unr"),
+            (Mode::LastManStanding, "DM-Deck16][.unr"),
+            (Mode::CaptureTheFlag, "CTF-Niven.unr"),
+            (Mode::Domination, "DOM-Sesmar.unr"),
+            (Mode::Assault, "AS-Frigate.unr"),
+        ] {
+            let path = std::path::Path::new("local/reference-client/Maps").join(name);
+            let bytes = std::fs::read(&path).unwrap();
+            let map = Map::load(&Package::read(&bytes).unwrap(), Some(&path)).unwrap();
+            let mut game = Match::new(
+                &map,
+                0,
+                Rules {
+                    mode,
+                    bots: 5,
+                    seconds: 300,
+                    ..Rules::default()
+                },
+            );
+            game.time = 62.0;
+            game.fighters[0].score = 9;
+            game.fighters[0].deaths = 2;
+            if mode == Mode::CaptureTheFlag {
+                let enemy = map.flag_bases[1 - game.fighters[0].team.unwrap()].unwrap();
+                game.fighters[0].walker.position = enemy;
+                game.objectives.tick(&map, &mut game.fighters, game.time);
+                assert!(game.fighter_carries_flag(0));
+            }
+            if mode.team_based() {
+                game.objectives.scores = [2, 1];
+            }
+
+            let draw = |game: &Match, show| {
+                let mut frame = Frame::new();
+                hud.draw_deathmatch(
+                    &mut frame,
+                    game,
+                    &map,
+                    show,
+                    true,
+                    "Enter for rematch    Esc for menu",
+                );
+                frame
+            };
+            let live = draw(&game, true);
+            assert_ne!(draw(&game, false).pixels, live.pixels, "{mode:?}");
+            game.fighters[0].health = 0;
+            game.fighters[0].deaths += 1;
+            let dead = draw(&game, true);
+            assert_ne!(dead.pixels, live.pixels, "{mode:?}");
+            game.finished = true;
+            let result = draw(&game, false);
+            assert_ne!(result.pixels, dead.pixels, "{mode:?}");
+            assert_eq!(result.pixels, draw(&game, true).pixels, "{mode:?}");
         }
     }
 

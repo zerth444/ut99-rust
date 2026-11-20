@@ -221,6 +221,7 @@ unsafe fn message_loop(
     let mut advance_ladder = false;
     let mut ladder_error = false;
     let mut training_bindings = None;
+    let mut scoreboard_held = false;
 
     unsafe {
         loop {
@@ -238,8 +239,15 @@ unsafe fn message_loop(
                         alternate |= button == settings.bindings[7];
                     }
                     match message.message {
-                        WM_KILLFOCUS => mouse.release(),
-                        WM_SIZE if message.wParam == SIZE_MINIMIZED as usize => mouse.release(),
+                        WM_KILLFOCUS => {
+                            scoreboard_held = false;
+                            mouse.release();
+                        }
+                        WM_SIZE if message.wParam == SIZE_MINIMIZED as usize => {
+                            scoreboard_held = false;
+                            mouse.release();
+                        }
+                        WM_KEYUP if message.wParam as u16 == VK_TAB => scoreboard_held = false,
                         WM_SIZE | WM_MOVE if mouse.captured => mouse.clip(),
                         WM_INPUT if mouse.captured => {
                             if let Some((x, y)) = raw_motion(message.lParam) {
@@ -257,6 +265,7 @@ unsafe fn message_loop(
                         }
                         WM_KEYDOWN if message.lParam & (1 << 30) == 0 => {
                             let pressed = message.wParam as u16;
+                            scoreboard_held |= pressed == VK_TAB;
                             primary |= pressed == settings.bindings[6];
                             alternate |= pressed == settings.bindings[7];
                             let pages = deathmatch
@@ -294,6 +303,7 @@ unsafe fn message_loop(
                                 }
                                 VK_ESCAPE if let Some(frontend) = frontend.as_deref_mut() => {
                                     briefing_page = None;
+                                    scoreboard_held = false;
                                     mouse.release();
                                     let action = run_frontend(
                                         window,
@@ -777,7 +787,7 @@ unsafe fn message_loop(
                     game.show_decals = settings.show_decals;
                     let scoreboard = active
                         && briefing_page.is_none()
-                        && (key(VK_TAB) || game.tutorial_forces_scoreboard());
+                        && (scoreboard_held || game.tutorial_forces_scoreboard());
                     frame.draw_deathmatch(
                         map,
                         &view,
