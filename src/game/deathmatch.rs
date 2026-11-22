@@ -4842,13 +4842,14 @@ impl Match {
                         })
                 }));
         let fighter = &mut self.fighters[id];
-        if !keep_route
+        let regroup = assault.is_some_and(|(_, attacking)| attacking) && target.is_none();
+        if (!keep_route || regroup)
             && let Some(command) = try_retreat(
                 &self.navigation,
                 map,
                 fighter,
                 &skill,
-                target.is_some(),
+                target.is_some() || regroup,
                 self.time,
                 dt,
             )
@@ -9936,19 +9937,28 @@ mod tests {
 
     #[test]
     #[ignore = "requires local GOTY data"]
-    fn assault_bots_land_and_breach_the_overlord_beachhead() {
+    fn assault_bots_breach_the_overlord_beachhead_and_boiler_room() {
         let path = std::path::Path::new("local/reference-client/Maps/AS-Overlord.unr");
         let bytes = std::fs::read(path).unwrap();
         let package = Package::read(&bytes).unwrap();
         let mut map = Map::load(&package, Some(path)).unwrap();
-        let beachhead = map
-            .assault
-            .as_ref()
-            .unwrap()
-            .forts
+        let data = map.assault.as_ref().unwrap();
+        let fort_index = |tag| {
+            data.forts
+                .iter()
+                .position(|fort| fort.tag.and_then(|tag| package.name(tag).ok()) == Some(tag))
+                .expect("authored objective")
+        };
+        let beachhead = fort_index("beachFS");
+        let boiler = fort_index("killF1");
+        let attacker_start = |index: usize| map.start_teams[index] == Some(1);
+        let initial_starts: Vec<_> = map
+            .starts
             .iter()
-            .position(|fort| fort.tag.and_then(|tag| package.name(tag).ok()) == Some("beachFS"))
-            .expect("beachhead objective");
+            .enumerate()
+            .filter(|(i, start)| attacker_start(*i) && start.enabled)
+            .map(|(i, _)| i)
+            .collect();
         let mut game = Match::new(
             &map,
             0,
@@ -9961,7 +9971,7 @@ mod tests {
         game.fighters[0].protected_until = f32::INFINITY;
         let tick = 1.0 / 120.0;
         let mut reached_shore = [false; 2];
-        for frame in 0..120 * 60 {
+        for frame in 0..120 * 100 {
             game.step(&mut map, Command::default(), tick);
             for (reached, attacker) in reached_shore
                 .iter_mut()
@@ -9970,18 +9980,26 @@ mod tests {
                 // This line is north of both landing-craft doors.
                 *reached |= attacker.health > 0 && attacker.walker.position.1 < 1600.0;
             }
+            let round = game.assault.as_ref().unwrap();
             if frame == 120 * 20 {
+                assert!(reached_shore.into_iter().all(|reached| reached));
+            }
+            if frame == 120 * 60 {
                 assert!(
-                    reached_shore.into_iter().all(|reached| reached),
-                    "{reached_shore:?}"
+                    !round.active(beachhead),
+                    "the attackers did not breach the beachhead"
                 );
             }
-            if !game.assault.as_ref().unwrap().active(beachhead) {
-                assert!(reached_shore.into_iter().all(|reached| reached));
+            if !round.active(boiler) {
+                assert!(!round.active(beachhead));
+                assert!(initial_starts.iter().all(|&i| !map.starts[i].enabled));
+                let spawn = game.choose_spawn(&map, 2, None);
+                assert!(map.starts[spawn].enabled && map.start_teams[spawn] == Some(1));
+                assert!(!initial_starts.contains(&spawn));
                 return;
             }
         }
-        panic!("the attackers did not breach the beachhead");
+        panic!("the attackers did not breach the boiler room");
     }
 
     #[test]
