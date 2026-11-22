@@ -685,6 +685,36 @@ pub(crate) fn brush_polys<'a>(
         .transpose()
 }
 
+pub(crate) fn brush_collision(
+    package: &Package<'_>,
+    brush: &Export,
+) -> io::Result<Vec<crate::collision::Hull>> {
+    let Model {
+        nodes, mut reader, ..
+    } = read_model(package, brush)?;
+    if !nodes.iter().any(|node| node.collision_bound >= 0) {
+        return Ok(Vec::new());
+    }
+    for _ in 0..reader.count(30)? {
+        LightIndex::read(&mut reader)?;
+    }
+    let light_bytes = reader.count(1)?;
+    reader.take(light_bytes)?;
+    let hulls = read_hull_data(&mut reader)?;
+    let planes: Vec<_> = nodes.iter().map(|node| node.plane).collect();
+    Collision::read_hulls(
+        &planes,
+        nodes.iter().map(|node| node.collision_bound),
+        &hulls,
+    )
+}
+
+fn read_hull_data(reader: &mut Reader<'_>) -> io::Result<Vec<u32>> {
+    let bounds = reader.count(25)?;
+    reader.take(bounds * 25)?;
+    (0..reader.count(4)?).map(|_| reader.u32()).collect()
+}
+
 type MissingMaterials = std::collections::BTreeMap<String, usize>;
 
 fn read_bsp(
@@ -743,11 +773,7 @@ fn read_bsp(
         .collect::<io::Result<Vec<_>>>()?;
     let light_bytes = reader.count(1)?;
     let light_masks = reader.take(light_bytes)?;
-    let bounds = reader.count(25)?;
-    reader.take(bounds * 25)?;
-    let hulls = (0..reader.count(4)?)
-        .map(|_| reader.u32())
-        .collect::<io::Result<Vec<_>>>()?;
+    let hulls = read_hull_data(&mut reader)?;
     for _ in 0..reader.count(11)? {
         reader.compact()?;
         reader.compact()?;

@@ -17,10 +17,11 @@ pub struct Plane {
     pub distance: f32,
 }
 
-struct Hull {
+pub(crate) struct Hull {
     min: Vec3,
     max: Vec3,
     planes: Vec<Plane>,
+    parts: Vec<Hull>,
 }
 
 pub struct Collision {
@@ -50,6 +51,18 @@ impl Collision {
         offsets: impl Iterator<Item = i32>,
         data: &[u32],
     ) -> io::Result<Self> {
+        Ok(Self {
+            hulls: Self::read_hulls(planes, offsets, data)?,
+            profile: Profile::default(),
+            regions: Regions::default(),
+        })
+    }
+
+    pub(crate) fn read_hulls(
+        planes: &[Plane],
+        offsets: impl Iterator<Item = i32>,
+        data: &[u32],
+    ) -> io::Result<Vec<Hull>> {
         let mut hulls = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for offset in offsets.filter_map(|offset| usize::try_from(offset).ok()) {
@@ -98,13 +111,10 @@ impl Collision {
                 min,
                 max,
                 planes: hull_planes,
+                parts: Vec::new(),
             });
         }
-        Ok(Self {
-            hulls,
-            profile: Profile::default(),
-            regions: Regions::default(),
-        })
+        Ok(hulls)
     }
 
     pub fn add_box(&mut self, min: Vec3, max: Vec3) -> usize {
@@ -113,6 +123,7 @@ impl Collision {
             min,
             max,
             planes: box_planes(min, max).to_vec(),
+            parts: Vec::new(),
         });
         id
     }
@@ -134,6 +145,14 @@ impl Collision {
         hull.planes.clear();
         hull.planes.extend(planes);
         hull.planes.extend(box_planes(min, max));
+        hull.parts.clear();
+    }
+
+    pub(crate) fn set_compound_hull(&mut self, id: usize, parts: Vec<Hull>) {
+        let hull = &mut self.hulls[id];
+        (hull.min, hull.max) = bounds(parts.iter().flat_map(|part| [part.min, part.max]));
+        hull.planes.clear();
+        hull.parts = parts;
     }
 
     fn sweep(&self, start: Vec3, delta: Vec3, extent: Vec3) -> Option<Hit> {
@@ -152,17 +171,19 @@ impl Collision {
         let hi = Vec3(start.0.max(end.0), start.1.max(end.1), start.2.max(end.2)) + extent;
         let mut best: Option<Hit> = None;
         for (index, hull) in self.hulls.iter().enumerate() {
-            if ignored == Some(index)
-                || hi.0 < hull.min.0
-                || hi.1 < hull.min.1
-                || hi.2 < hull.min.2
-                || lo.0 > hull.max.0
-                || lo.1 > hull.max.1
-                || lo.2 > hull.max.2
-            {
+            if ignored == Some(index) || !hull.overlaps(lo, hi) {
                 continue;
             }
-            if let Some(mut hit) = hull.sweep(start, delta, extent)
+            let hit = if hull.parts.is_empty() {
+                hull.sweep(start, delta, extent)
+            } else {
+                hull.parts
+                    .iter()
+                    .filter(|part| part.overlaps(lo, hi))
+                    .filter_map(|part| part.sweep(start, delta, extent))
+                    .min_by(|a, b| a.fraction.total_cmp(&b.fraction))
+            };
+            if let Some(mut hit) = hit
                 && best
                     .as_ref()
                     .is_none_or(|best| hit.fraction < best.fraction)
@@ -222,21 +243,7 @@ impl Collision {
     }
 
     pub(crate) fn player_fits(&self, point: Vec3) -> bool {
-        !self.hulls.iter().any(|hull| {
-            let min = hull.min - PLAYER;
-            let max = hull.max + PLAYER;
-            point.0 > min.0
-                && point.0 < max.0
-                && point.1 > min.1
-                && point.1 < max.1
-                && point.2 > min.2
-                && point.2 < max.2
-                && hull.planes.iter().all(|plane| {
-                    let n = plane.normal;
-                    let support = Vec3(n.0.abs(), n.1.abs(), n.2.abs()).dot(PLAYER);
-                    n.dot(point) < plane.distance + support - SKIN
-                })
-        })
+        !self.hulls.iter().any(|hull| hull.contains_player(point))
     }
 
     fn water_jump_clear(&self, position: Vec3, forward: Vec3) -> bool {
@@ -314,7 +321,91 @@ fn box_planes(min: Vec3, max: Vec3) -> [Plane; 6] {
     ]
 }
 
+fn bounds(points: impl IntoIterator<Item = Vec3>) -> (Vec3, Vec3) {
+    let empty = Vec3(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+    points
+        .into_iter()
+        .fold((empty, empty * -1.0), |(min, max), p| {
+            (
+                Vec3(min.0.min(p.0), min.1.min(p.1), min.2.min(p.2)),
+                Vec3(max.0.max(p.0), max.1.max(p.1), max.2.max(p.2)),
+            )
+        })
+}
+
 impl Hull {
+    #[inline]
+    fn overlaps(&self, lo: Vec3, hi: Vec3) -> bool {
+        hi.0 >= self.min.0
+            && hi.1 >= self.min.1
+            && hi.2 >= self.min.2
+            && lo.0 <= self.max.0
+            && lo.1 <= self.max.1
+            && lo.2 <= self.max.2
+    }
+
+    pub(crate) fn transformed(
+        &self,
+        point: impl Fn(Vec3) -> Vec3,
+        normal: impl Fn(Vec3) -> Vec3,
+    ) -> Self {
+        let (min, max) = bounds(
+            [self.min.0, self.max.0]
+                .into_iter()
+                .flat_map(|x| {
+                    [self.min.1, self.max.1].into_iter().flat_map(move |y| {
+                        [self.min.2, self.max.2]
+                            .into_iter()
+                            .map(move |z| Vec3(x, y, z))
+                    })
+                })
+                .map(&point),
+        );
+        let planes = self
+            .planes
+            .iter()
+            .filter_map(|plane| {
+                let length = plane.normal.dot(plane.normal);
+                (length > f32::EPSILON).then(|| {
+                    let surface = point(plane.normal * (plane.distance / length));
+                    let normal = normal(plane.normal);
+                    Plane {
+                        normal,
+                        distance: normal.dot(surface),
+                    }
+                })
+            })
+            .collect();
+        Self {
+            min,
+            max,
+            planes,
+            parts: Vec::new(),
+        }
+    }
+
+    fn contains_player(&self, point: Vec3) -> bool {
+        let min = self.min - PLAYER;
+        let max = self.max + PLAYER;
+        if point.0 <= min.0
+            || point.0 >= max.0
+            || point.1 <= min.1
+            || point.1 >= max.1
+            || point.2 <= min.2
+            || point.2 >= max.2
+        {
+            return false;
+        }
+        if !self.parts.is_empty() {
+            return self.parts.iter().any(|part| part.contains_player(point));
+        }
+        self.planes.iter().all(|plane| {
+            let n = plane.normal;
+            let support = Vec3(n.0.abs(), n.1.abs(), n.2.abs()).dot(PLAYER);
+            n.dot(point) < plane.distance + support - SKIN
+        })
+    }
+
     fn sweep(&self, start: Vec3, delta: Vec3, extent: Vec3) -> Option<Hit> {
         let mut enter = f32::NEG_INFINITY;
         let mut exit: f32 = 1.0;

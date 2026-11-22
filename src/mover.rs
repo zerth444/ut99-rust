@@ -1,6 +1,6 @@
 use std::{io, path::Path};
 
-use crate::collision::{Collision, Plane, Walker};
+use crate::collision::{Collision, Hull, Plane, Walker};
 use crate::map::{Face, Vec3, brush_polys, material_color};
 use crate::package::{Export, Package, Reader, invalid};
 use crate::texture::load_materials;
@@ -40,6 +40,7 @@ pub struct Mover {
     home_rotation: Vec3,
     hull_vertices: Vec<Vec3>,
     hull_planes: Vec<Plane>,
+    hull_parts: Vec<Hull>,
     min: Vec3,
     max: Vec3,
     travel: Vec3,
@@ -148,6 +149,19 @@ impl Mover {
     }
 
     fn set_collision(&self, world: &mut Collision, id: usize, offset: Vec3, rotation: Vec3) {
+        if !self.hull_parts.is_empty() {
+            let [x, y, z] = AXES.map(|axis| self.rotate_from_home(axis, rotation));
+            let direction = |p: Vec3| x * p.0 + y * p.1 + z * p.2;
+            let point = |p| self.pivot + offset + direction(p - self.pivot);
+            world.set_compound_hull(
+                id,
+                self.hull_parts
+                    .iter()
+                    .map(|part| part.transformed(point, direction))
+                    .collect(),
+            );
+            return;
+        }
         let (min, max) = self.bounds_at(offset, rotation);
         if self.hull_planes.is_empty() {
             world.set_box(id, min, max);
@@ -247,7 +261,7 @@ impl Mover {
                 if brush.solid {
                     let hull = world.add_box(mover.min, mover.max);
                     mover.hull = Some(hull);
-                    if !mover.hull_planes.is_empty() {
+                    if !mover.hull_planes.is_empty() || !mover.hull_parts.is_empty() {
                         mover.set_collision(world, hull, mover.offset, mover.scene_rotation);
                     }
                 }
@@ -753,6 +767,28 @@ impl Brush {
         } else {
             Vec::new()
         };
+        let uses_scripted_motion = matches!(
+            activation,
+            Activation::Trigger | Activation::Control | Activation::Toggle
+        );
+        let hull_parts =
+            if solid && uses_scripted_motion && hull_planes.is_empty() && polys.len() > 6 {
+                let parts = crate::map::brush_collision(package, brush)?;
+                if parts.len() > 1 {
+                    parts
+                        .iter()
+                        .map(|part| {
+                            part.transformed(transform, |normal| {
+                                unit(rotate(product(normal, reciprocal), rotation))
+                            })
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
         Ok(Some(Self {
             solid,
             polys,
@@ -764,6 +800,7 @@ impl Brush {
                 home_rotation: rotation,
                 hull_vertices,
                 hull_planes,
+                hull_parts,
                 min,
                 max,
                 travel,

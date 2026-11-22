@@ -428,6 +428,32 @@ impl Navigation {
         to: Vec3,
         blocked: &[(Vec3, f32)],
     ) -> Option<(Step, f32)> {
+        self.route(world, from, to, blocked, None)
+    }
+
+    pub(super) fn continue_from_waypoint(
+        &self,
+        world: &Collision,
+        waypoint: Vec3,
+        destination: Vec3,
+        blocked: &[(Vec3, f32)],
+    ) -> Option<Step> {
+        let node = self
+            .points
+            .iter()
+            .position(|&point| distance_squared(point, waypoint) < 1.0)?;
+        self.route(world, waypoint, destination, blocked, Some(node))
+            .map(|(step, _)| step)
+    }
+
+    fn route(
+        &self,
+        world: &Collision,
+        from: Vec3,
+        to: Vec3,
+        blocked: &[(Vec3, f32)],
+        start_node: Option<usize>,
+    ) -> Option<(Step, f32)> {
         let allowed = |point| {
             blocked
                 .iter()
@@ -464,24 +490,30 @@ impl Navigation {
         let mut costs = vec![f32::INFINITY; self.points.len()];
         let mut queue = BinaryHeap::new();
         let mut first = vec![None; self.points.len()];
-        for (id, &point) in self.points.iter().enumerate() {
-            let distance = distance_squared(from, point);
-            if distance <= EDGE_LIMIT.powi(2)
-                && let Some(step) = self.approach_step(world, from, point)
-            {
-                if (from.2 - point.2).abs() > 48.0
-                    || (from.0 - point.0).hypot(from.1 - point.1) >= WAYPOINT_RADIUS
+        if let Some(id) = start_node {
+            // An authored node can sit above the ground where a walker arrives.
+            costs[id] = 0.0;
+            queue.push(RouteCandidate { id, cost: 0.0 });
+        } else {
+            for (id, &point) in self.points.iter().enumerate() {
+                let distance = distance_squared(from, point);
+                if distance <= EDGE_LIMIT.powi(2)
+                    && let Some(step) = self.approach_step(world, from, point)
                 {
-                    if !allowed(point) {
-                        continue;
+                    if (from.2 - point.2).abs() > 48.0
+                        || (from.0 - point.0).hypot(from.1 - point.1) >= WAYPOINT_RADIUS
+                    {
+                        if !allowed(point) {
+                            continue;
+                        }
+                        first[id] = Some(step);
                     }
-                    first[id] = Some(step);
+                    costs[id] = approach_cost(world, step, distance.sqrt());
+                    queue.push(RouteCandidate {
+                        id,
+                        cost: costs[id],
+                    });
                 }
-                costs[id] = approach_cost(world, step, distance.sqrt());
-                queue.push(RouteCandidate {
-                    id,
-                    cost: costs[id],
-                });
             }
         }
         let mut best = f32::INFINITY;

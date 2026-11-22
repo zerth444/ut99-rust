@@ -4822,8 +4822,18 @@ impl Match {
                 .min_by(|a, b| a.1.total_cmp(&b.1))
                 .map(|(ray, _)| ray)
         });
+        let approach_fort = assault.is_some_and(|(fort, attacking)| {
+            attacking
+                && !fort.touch
+                && distance_squared(fort.destination, fort.volume.position) > 1.0
+                && self
+                    .assault
+                    .as_ref()
+                    .is_some_and(|round| round.completed() > 0)
+        });
         let keep_route = carrying_flag
             || assault.is_some_and(|(fort, attacking)| attacking && fort.touch)
+            || approach_fort
             || (self.rules.mode == Mode::CaptureTheFlag
                 && fighter.bot.goal.and_then(Step::movement_goal).is_some()
                 && target.is_some_and(|(opponent, point, _, distance, _)| {
@@ -5131,8 +5141,25 @@ impl Match {
             } else {
                 objective
                     .and_then(|point| {
-                        self.navigation
-                            .next_step_avoiding(&map.collision, position, point, blocked)
+                        let continuation = if arrived && !objective_changed && approach_fort {
+                            self.navigation.continue_from_waypoint(
+                                &map.collision,
+                                movement_goal?,
+                                point,
+                                blocked,
+                            )
+                        } else {
+                            None
+                        };
+                        continuation
+                            .or_else(|| {
+                                self.navigation.next_step_avoiding(
+                                    &map.collision,
+                                    position,
+                                    point,
+                                    blocked,
+                                )
+                            })
                             .or_else(|| {
                                 if !carrying_flag {
                                     return None;
@@ -9937,7 +9964,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires local GOTY data"]
-    fn assault_bots_breach_the_overlord_beachhead_and_boiler_room() {
+    fn assault_bots_complete_overlord_attack_and_finish_the_match() {
         let path = std::path::Path::new("local/reference-client/Maps/AS-Overlord.unr");
         let bytes = std::fs::read(path).unwrap();
         let package = Package::read(&bytes).unwrap();
@@ -9971,8 +9998,20 @@ mod tests {
         game.fighters[0].protected_until = f32::INFINITY;
         let tick = 1.0 / 120.0;
         let mut reached_shore = [false; 2];
-        for frame in 0..120 * 100 {
+        let mut moved_to_boiler_spawns = false;
+        let mut first_attack = None;
+        for frame in 0..120 * 370 {
             game.step(&mut map, Command::default(), tick);
+            let round = game.assault.as_ref().unwrap();
+            if round.attack_team == 1 {
+                let time = first_attack.expect("first attack completed before switching sides");
+                assert_eq!(round.limit, time);
+                if game.finished {
+                    assert_eq!(game.team_scores().unwrap().into_iter().sum::<i16>(), 1);
+                    return;
+                }
+                continue;
+            }
             for (reached, attacker) in reached_shore
                 .iter_mut()
                 .zip(game.fighters[1..].iter().filter(|f| f.team == Some(0)))
@@ -9980,7 +10019,6 @@ mod tests {
                 // This line is north of both landing-craft doors.
                 *reached |= attacker.health > 0 && attacker.walker.position.1 < 1600.0;
             }
-            let round = game.assault.as_ref().unwrap();
             if frame == 120 * 20 {
                 assert!(reached_shore.into_iter().all(|reached| reached));
             }
@@ -9990,16 +10028,29 @@ mod tests {
                     "the attackers did not breach the beachhead"
                 );
             }
-            if !round.active(boiler) {
+            if !moved_to_boiler_spawns && !round.active(boiler) {
                 assert!(!round.active(beachhead));
                 assert!(initial_starts.iter().all(|&i| !map.starts[i].enabled));
                 let spawn = game.choose_spawn(&map, 2, None);
                 assert!(map.starts[spawn].enabled && map.start_teams[spawn] == Some(1));
                 assert!(!initial_starts.contains(&spawn));
-                return;
+                moved_to_boiler_spawns = true;
+            }
+            if let Some(time) = round.conquered_at() {
+                assert!(moved_to_boiler_spawns);
+                assert_eq!(round.completed(), map.assault.as_ref().unwrap().forts.len());
+                if first_attack.replace(time).is_none() {
+                    println!("Overlord attack completed in {time:.2} seconds");
+                }
+            }
+            if frame == 120 * 180 {
+                assert!(
+                    first_attack.is_some(),
+                    "the attackers did not destroy the final objective"
+                );
             }
         }
-        panic!("the attackers did not breach the boiler room");
+        panic!("the Overlord match did not finish");
     }
 
     #[test]
@@ -10108,6 +10159,7 @@ mod tests {
                             .any(|score| score > 0)
                 }
                 "AS-Frigate.unr" => game.finished && by_half == [3, 3],
+                "AS-OceanFloor.unr" => by_half.into_iter().any(|objectives| objectives >= 2),
                 "CTF-Niven.unr" => carried > 0,
                 "DOM-Sesmar.unr" => {
                     game.finished
