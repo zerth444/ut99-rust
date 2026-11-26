@@ -1,6 +1,6 @@
 use super::{GlyphAtlas, Hud, glyph_index};
 use crate::{
-    game::deathmatch::{AssaultStatus, Fighter, Match, Mode},
+    game::deathmatch::{AssaultStatus, Match, Mode},
     map::Map,
     render::Frame,
 };
@@ -11,11 +11,10 @@ const ACCENT: [f32; 3] = [1.0, 0.82, 0.45];
 const TEAM: [[f32; 3]; 2] = [[1.0, 0.55, 0.49], [0.49, 0.79, 1.0]];
 const LINE: [f32; 3] = [0.34, 0.42, 0.47];
 const HEAD: f32 = 90.0;
-const TEAM_HEAD: f32 = 47.0;
-const COLUMNS: f32 = 26.0;
-const ROW: f32 = 28.0;
+const TEAM_HEAD: f32 = 62.0;
+const ROW: f32 = 42.0;
 const INSET: f32 = 16.0;
-const GAP: f32 = 14.0;
+const GAP: f32 = 36.0;
 
 impl Hud {
     pub(super) fn draw_scoreboard(&self, frame: &mut Frame, game: &Match, map: &Map, help: &str) {
@@ -32,9 +31,9 @@ impl Hud {
             })
         });
         let aspect = frame.width as f32 / frame.height.max(1) as f32;
-        let stacked = teams.is_some() && (aspect < 1.25 || frame.width < 850);
+        let stacked = teams.is_some() && (aspect < 1.35 || frame.width < 720);
         let side = teams.is_none() && game.finished && aspect >= 1.5 && frame.width >= 760;
-        let pane_width = if teams.is_some() { 490.0 } else { 590.0 };
+        let pane_width = if teams.is_some() { 352.0 } else { 500.0 };
         let width = 2.0 * INSET
             + pane_width
                 * if teams.is_some() && !stacked {
@@ -47,7 +46,7 @@ impl Hud {
             } else {
                 0.0
             };
-        let table_height = |count: usize| COLUMNS + ROW * count.max(1) as f32;
+        let table_height = |count: usize| ROW * count.max(1) as f32;
         let tables = match &teams {
             Some([a, b]) if stacked => {
                 2.0 * TEAM_HEAD + table_height(a.len()) + table_height(b.len()) + GAP
@@ -173,12 +172,13 @@ impl Hud {
                         team as f32 * (pane_width + GAP)
                     };
                 let color = TEAM[team];
-                frame.solid(board.rect(x, y + TEAM_HEAD - 4.0, pane_width, 2.0), color);
+                frame.shade(board.rect(x, y, pane_width, TEAM_HEAD - 9.0), color, 0.13);
+                frame.solid(board.rect(x, y, pane_width, 2.0), color);
                 board.label(
                     frame,
-                    [x + 11.0, y + 2.0],
-                    pane_width - 110.0,
-                    1.10,
+                    [x + 11.0, y + 5.0],
+                    pane_width - 130.0,
+                    1.18,
                     game.team_label(team),
                     color,
                 );
@@ -194,7 +194,7 @@ impl Hud {
                     let total = assault_total(status, attacking, game.finished);
                     board.label(
                         frame,
-                        [x + 11.0, y + 24.0],
+                        [x + 11.0, y + 27.0],
                         pane_width - 110.0,
                         0.80,
                         description,
@@ -216,20 +216,43 @@ impl Hud {
                         &description,
                         MUTED,
                     );
-                    board.right(
+                    let right = x + pane_width - 13.0;
+                    if !map.hud.draw_score_number(
                         frame,
-                        [x + pane_width - 11.0, y + 3.0],
-                        1.46,
-                        &scores[team].to_string(),
+                        board.point(right, y + 6.0),
+                        board.scale * 0.62,
+                        scores[team],
                         TEXT,
-                    );
+                    ) {
+                        board.right(
+                            frame,
+                            [right, y + 6.0],
+                            1.48,
+                            &scores[team].to_string(),
+                            color,
+                        );
+                    }
                 }
+                board.right(
+                    frame,
+                    [x + pane_width - 12.0, y + 45.0],
+                    0.71,
+                    score_label(mode),
+                    MUTED,
+                );
                 scoreboard_rows(frame, game, &board, [x, y + TEAM_HEAD, pane_width], players);
                 if stacked {
                     y += TEAM_HEAD + table_height(players.len()) + GAP;
                 }
             }
         } else {
+            board.right(
+                frame,
+                [width - INSET - 12.0, 67.0],
+                0.73,
+                score_label(mode),
+                MUTED,
+            );
             scoreboard_rows(frame, game, &board, [INSET, HEAD, pane_width], &standings);
         }
 
@@ -274,6 +297,14 @@ impl Hud {
                 MUTED,
             );
         }
+    }
+}
+
+fn score_label(mode: Mode) -> &'static str {
+    match mode {
+        Mode::CaptureTheFlag | Mode::Domination => "PLAYER SCORE",
+        Mode::LastManStanding => "LIVES",
+        _ => "FRAGS",
     }
 }
 
@@ -329,44 +360,6 @@ fn result_title(game: &Match, team_scores: Option<[i16; 2]>, training: bool) -> 
     })
 }
 
-struct Column {
-    label: &'static str,
-    value: fn(&Match, usize, &Fighter) -> i32,
-}
-
-const SCORE: Column = Column {
-    label: "Score",
-    value: |_, _, f| i32::from(f.score),
-};
-const FRAGS: Column = Column {
-    label: "Frags",
-    value: |_, _, f| i32::from(f.score),
-};
-const KILLS: Column = Column {
-    label: "Kills",
-    value: |_, _, f| i32::from(f.stats.kills),
-};
-const DEATHS: Column = Column {
-    label: "Deaths",
-    value: |_, _, f| i32::from(f.deaths),
-};
-const LIVES: Column = Column {
-    label: "Lives",
-    value: |game, id, _| i32::from(game.lives_left(id).unwrap_or(0)),
-};
-const CAPS: Column = Column {
-    label: "Caps",
-    value: |_, _, f| i32::from(f.stats.captures),
-};
-const RETURNS: Column = Column {
-    label: "Returns",
-    value: |_, _, f| i32::from(f.stats.returns),
-};
-const TAKEN: Column = Column {
-    label: "Taken",
-    value: |_, _, f| i32::from(f.stats.points_taken),
-};
-
 fn scoreboard_rows(
     frame: &mut Frame,
     game: &Match,
@@ -375,91 +368,84 @@ fn scoreboard_rows(
     players: &[usize],
 ) {
     let [x, y, width] = pane;
-    let columns = match game.mode() {
-        Mode::CaptureTheFlag => &[SCORE, CAPS, RETURNS, KILLS, DEATHS][..],
-        Mode::Domination => &[SCORE, TAKEN, KILLS, DEATHS],
-        Mode::LastManStanding => &[LIVES, FRAGS, DEATHS],
-        _ => &[FRAGS, DEATHS],
-    };
-    let cell = if columns.len() >= 4 { 66.0 } else { 68.0 };
-    let column_x = |index: usize| x + width - 11.0 - (columns.len() - 1 - index) as f32 * cell;
-    let name_width = column_x(0) - cell - (x + 38.0);
-    frame.solid(board.rect(x, y + COLUMNS - 1.0, width, 1.0), LINE);
-    board.label(frame, [x + 10.0, y + 3.0], 25.0, 0.74, "#", MUTED);
-    board.label(
-        frame,
-        [x + 38.0, y + 3.0],
-        name_width,
-        0.74,
-        "PLAYER",
-        MUTED,
-    );
-    for (i, column) in columns.iter().enumerate() {
-        board.right(frame, [column_x(i), y + 3.0], 0.77, column.label, MUTED);
-    }
     if players.is_empty() {
         board.label(
             frame,
-            [x + 38.0, y + COLUMNS + 5.0],
-            name_width,
-            0.85,
+            [x + 11.0, y + 8.0],
+            width - 22.0,
+            0.94,
             "No players",
             MUTED,
         );
     }
-    for (rank, &id) in players.iter().enumerate() {
+
+    for (index, &id) in players.iter().enumerate() {
         let fighter = &game.fighters[id];
-        let top = y + COLUMNS + rank as f32 * ROW;
-        let color = if id == 0 { ACCENT } else { TEXT };
-        if id == 0 {
-            frame.shade(board.rect(x, top, width, ROW), ACCENT, 0.14);
-            frame.solid(board.rect(x, top, 2.0, ROW), ACCENT);
-        }
-        let status = if game.fighter_carries_flag(id) {
-            Some(("FLAG", TEAM[1 - fighter.team.unwrap_or(0)]))
-        } else if game.lives_left(id) == Some(0) {
-            Some(("OUT", MUTED))
-        } else if !game.finished && fighter.health == 0 {
-            Some(("DOWN", MUTED))
+        let top = y + index as f32 * ROW;
+        let lives = game.lives_left(id);
+        let eliminated = lives == Some(0);
+        let color = if id == 0 {
+            ACCENT
+        } else if eliminated {
+            MUTED
         } else {
-            None
+            TEXT
         };
-        board.label(
-            frame,
-            [x + 10.0, top + 4.0],
-            25.0,
-            0.82,
-            &(rank + 1).to_string(),
-            MUTED,
-        );
+        if id == 0 {
+            frame.shade(board.rect(x, top, width, ROW - 4.0), ACCENT, 0.11);
+            frame.solid(board.rect(x, top + 4.0, 2.0, ROW - 12.0), ACCENT);
+        }
+
         let name = if id == 0 {
             "You".to_owned()
         } else {
             game.fighter_label(id)
         };
-        let name_room =
-            name_width - status.map_or(0.0, |(text, _)| board.measure(text, 0.68) + 8.0);
-        board.label(frame, [x + 38.0, top + 3.0], name_room, 0.95, &name, color);
-        if let Some((text, tint)) = status {
-            let left = x + 38.0 + board.measure(&name, 0.95).min(name_room) + 7.0;
-            board.label(
-                frame,
-                [left, top + 6.0],
-                name_width - name_room,
-                0.68,
-                text,
-                tint,
-            );
+        board.label(
+            frame,
+            [x + 11.0, top],
+            width
+                - if game.fighter_carries_flag(id) {
+                    151.0
+                } else {
+                    116.0
+                },
+            1.12,
+            &name,
+            color,
+        );
+        let mut record = match game.mode() {
+            Mode::CaptureTheFlag => format!(
+                "{} caps  {} ret  {} kills  {} deaths",
+                fighter.stats.captures, fighter.stats.returns, fighter.stats.kills, fighter.deaths
+            ),
+            Mode::Domination => format!(
+                "{} taken  {} kills  {} deaths",
+                fighter.stats.points_taken, fighter.stats.kills, fighter.deaths
+            ),
+            Mode::LastManStanding => format!("{} frags   {} deaths", fighter.score, fighter.deaths),
+            _ => format!("{} deaths", fighter.deaths),
+        };
+        if eliminated {
+            record.push_str("   /   Eliminated");
+        } else if fighter.health == 0 && !game.finished {
+            record.push_str("   /   Respawning");
         }
-        for (i, column) in columns.iter().enumerate() {
-            let value = (column.value)(game, id, fighter);
-            board.right(
-                frame,
-                [column_x(i), top + 3.0],
-                0.94,
-                &value.to_string(),
-                if i == 0 { color } else { MUTED },
-            );
+        board.label(
+            frame,
+            [x + 11.0, top + 21.0],
+            width - 23.0,
+            0.76,
+            &record,
+            MUTED,
+        );
+
+        let right = x + width - 12.0;
+        let value = lives.map_or_else(|| fighter.score.to_string(), |lives| lives.to_string());
+        board.right(frame, [right, top - 2.0], 1.25, &value, color);
+        if game.fighter_carries_flag(id) {
+            let flag_tint = TEAM[1 - fighter.team.unwrap_or(0)];
+            board.right(frame, [right - 63.0, top + 4.0], 0.72, "FLAG", flag_tint);
         }
     }
 }
