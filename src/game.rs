@@ -6,6 +6,7 @@ use crate::render::Camera;
 use crate::sound::{CONTACT_SOUND_RADIUS, SoundEvents, Wave};
 
 pub mod ballistics;
+mod cheats;
 pub mod deathmatch;
 pub mod decals;
 mod liquid;
@@ -698,6 +699,8 @@ impl SniperZoom {
 }
 
 pub struct Practice {
+    cheats: cheats::Cheats,
+    cheat_ammo: [bool; Weapon::ALL.len()],
     pub health: u16,
     pub base_fov: f32,
     pub hud_scale: f32,
@@ -762,6 +765,8 @@ pub struct Practice {
 impl Practice {
     pub fn new(map: &Map) -> Self {
         let mut game = Self {
+            cheats: cheats::Cheats::default(),
+            cheat_ammo: [false; Weapon::ALL.len()],
             health: 100,
             base_fov: 90.0,
             hud_scale: 1.0,
@@ -827,6 +832,8 @@ impl Practice {
     }
 
     pub fn reset_player(&mut self, arsenal: &HashMap<Weapon, WeaponAssets>) {
+        self.cheats.flight = cheats::Flight::Walk;
+        self.cheat_ammo.fill(false);
         self.health = 100;
         self.armor.fill(0);
         self.weapon = Weapon::Enforcer;
@@ -872,6 +879,75 @@ impl Practice {
         self.pulse_last_contact = -1.0;
         self.pulse_contact = false;
         self.zoom = SniperZoom::default();
+    }
+
+    pub(crate) fn cheat_command(
+        &mut self,
+        map: &Map,
+        walker: &Walker,
+        command: &str,
+    ) -> &'static str {
+        use cheats::Action;
+        match self
+            .cheats
+            .command(command, map.collision.player_fits(walker.position))
+        {
+            Action::Message(message) => message,
+            _ if self.health == 0 => "Wait to respawn",
+            Action::Suicide => {
+                self.health = 0;
+                "Suicide"
+            }
+            Action::AllAmmo => {
+                for weapon in Weapon::ALL
+                    .into_iter()
+                    .filter(|weapon| weapon.uses_ammo() && self.owned[*weapon as usize])
+                {
+                    let pool = weapon.ammo_pool();
+                    self.cheat_ammo[pool] = true;
+                    self.ammo[pool] = cheats::AMMO;
+                }
+                "Ammo refilled"
+            }
+            Action::Loaded => {
+                for weapon in cheats::LOADED {
+                    self.owned[weapon as usize] = true;
+                }
+                for weapon in Weapon::ALL {
+                    if weapon.uses_ammo() && self.owned[weapon as usize] {
+                        self.ammo[weapon.ammo_pool()] = self.ammo_capacity(&map.arsenal, weapon);
+                    }
+                }
+                ArmorKind::Chest.pickup(&mut self.armor);
+                ArmorKind::Thigh.pickup(&mut self.armor);
+                "Weapons, ammo and armor granted"
+            }
+        }
+    }
+
+    pub(crate) fn cheat_flying(&self) -> bool {
+        self.cheats.flight != cheats::Flight::Walk
+    }
+
+    pub(crate) fn cheat_fly(
+        &self,
+        walker: &mut Walker,
+        map: &Map,
+        view: &Camera,
+        movement: [f32; 3],
+        dt: f32,
+    ) {
+        self.cheats
+            .flight
+            .advance(walker, &map.collision, view, movement, dt);
+    }
+
+    fn ammo_capacity(&self, arsenal: &HashMap<Weapon, WeaponAssets>, weapon: Weapon) -> u16 {
+        if self.cheat_ammo[weapon.ammo_pool()] {
+            cheats::AMMO
+        } else {
+            max_ammo(arsenal, weapon)
+        }
     }
 
     pub fn pose<'a>(&self, weapon: &'a WeaponAssets) -> Pose<'a> {
@@ -1108,7 +1184,8 @@ impl Practice {
         arsenal: &HashMap<Weapon, WeaponAssets>,
     ) -> Option<f32> {
         (weapon != Weapon::Hammer).then(|| {
-            f32::from(self.ammo[weapon.ammo_pool()]) / f32::from(max_ammo(arsenal, weapon).max(1))
+            f32::from(self.ammo[weapon.ammo_pool()])
+                / f32::from(self.ammo_capacity(arsenal, weapon).max(1))
         })
     }
 
@@ -1239,7 +1316,8 @@ impl Practice {
                 let was_empty = self.ammo[index] == 0;
                 let add = initial_ammo(arsenal, weapon);
                 self.owned[weapon as usize] = true;
-                self.ammo[index] = (self.ammo[index] + add).min(max_ammo(arsenal, weapon));
+                self.ammo[index] =
+                    (self.ammo[index] + add).min(self.ammo_capacity(arsenal, weapon));
                 if (!was_owned || was_empty)
                     && self.switch_priority(weapon) > self.switch_priority(self.pending_weapon())
                 {
@@ -1248,12 +1326,13 @@ impl Practice {
                 weapon.label().to_owned()
             }
             Item::Ammo(weapon, count) => {
+                let capacity = self.ammo_capacity(arsenal, weapon);
                 let ammo = &mut self.ammo[weapon.ammo_pool()];
-                if *ammo >= max_ammo(arsenal, weapon) {
+                if *ammo >= capacity {
                     return false;
                 }
                 let previous = *ammo;
-                *ammo = (*ammo + count).min(max_ammo(arsenal, weapon));
+                *ammo = ammo.saturating_add(count).min(capacity);
                 format!("{} AMMO +{}", weapon.label(), *ammo - previous)
             }
             Item::Health(amount, cap) => {
@@ -1961,6 +2040,9 @@ impl Practice {
     }
 
     fn splash_damage(&mut self, damage: u16) {
+        if self.cheats.protects() {
+            return;
+        }
         let (damage, shield) = absorb_damage(&mut self.armor, damage);
         if shield {
             self.shield_flash_until = self.time + 0.16;
@@ -1970,7 +2052,7 @@ impl Practice {
     }
 
     fn health_damage(&mut self, damage: u16) {
-        if damage > 0 {
+        if damage > 0 && !self.cheats.protects() {
             self.health = self.health.saturating_sub(damage);
             self.hit_taken = self.hit_taken.saturating_add(damage);
             self.hit_flash_until = self.time + 0.20;
@@ -2330,6 +2412,31 @@ mod tests {
             slot: None,
             cycle: 0,
         }
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY assets"]
+    fn practice_cheat_commands_survive_damage_and_reset_ammo_on_spawn() {
+        let path = std::path::Path::new("local/goty/Maps/DM-Deck16][.unr");
+        let bytes = std::fs::read(path).unwrap();
+        let map = Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap();
+        let walker = Walker::spawn(&map.collision, map.starts[0].position);
+        let mut game = Practice::new(&map);
+        game.cheat_command(&map, &walker, "iamtheone");
+        game.cheat_command(&map, &walker, "loaded");
+        game.cheat_command(&map, &walker, "allammo");
+        assert_eq!(game.ammo[Weapon::Rocket.ammo_pool()], 999);
+        game.cheat_command(&map, &walker, "god");
+        game.splash_damage(100);
+        game.health_damage(100);
+        assert_eq!(game.health, 100);
+        assert_eq!(game.armor.iter().sum::<u16>(), 150);
+        game.cheat_command(&map, &walker, "suicide");
+        assert_eq!(game.health, 0);
+        game.reset_player(&map.arsenal);
+        assert_eq!(game.health, 100);
+        assert_eq!(game.ammo[Weapon::Rocket.ammo_pool()], 0);
+        assert!(game.ammo_capacity(&map.arsenal, Weapon::Enforcer) < 999);
     }
 
     #[test]

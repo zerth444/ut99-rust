@@ -1,11 +1,11 @@
-use crate::game::{Weapon, WeaponAssets, initial_ammo, max_ammo, ordnance::Kind};
+use crate::game::{Weapon, WeaponAssets, cheats, initial_ammo, max_ammo, ordnance::Kind};
 use crate::map::Map;
 use std::collections::HashMap;
 
 pub(super) struct Inventory {
     owned: [bool; Weapon::ALL.len()],
     ammo: [u16; Weapon::ALL.len()],
-    training_capacity: [bool; Weapon::ALL.len()],
+    capacity_override: [Option<u16>; Weapon::ALL.len()],
 }
 
 impl Inventory {
@@ -13,7 +13,7 @@ impl Inventory {
         Self {
             owned: [false; Weapon::ALL.len()],
             ammo: [0; Weapon::ALL.len()],
-            training_capacity: [false; Weapon::ALL.len()],
+            capacity_override: [None; Weapon::ALL.len()],
         }
     }
 
@@ -28,8 +28,18 @@ impl Inventory {
         self.owned[weapon as usize] = true;
         if weapon.uses_ammo() {
             let pool = weapon.ammo_pool();
-            self.training_capacity[pool] = true;
+            self.capacity_override[pool] = Some(199);
             self.ammo[pool] = 199;
+        }
+    }
+
+    pub fn cheat_refill(&mut self) {
+        for weapon in Weapon::ALL {
+            if weapon.uses_ammo() && self.owns(weapon) {
+                let pool = weapon.ammo_pool();
+                self.capacity_override[pool] = Some(cheats::AMMO);
+                self.ammo[pool] = cheats::AMMO;
+            }
         }
     }
 
@@ -62,11 +72,7 @@ impl Inventory {
     }
 
     pub fn capacity(&self, art: &HashMap<Weapon, WeaponAssets>, weapon: Weapon) -> u16 {
-        if self.training_capacity[weapon.ammo_pool()] {
-            199
-        } else {
-            max_ammo(art, weapon)
-        }
+        self.capacity_override[weapon.ammo_pool()].unwrap_or_else(|| max_ammo(art, weapon))
     }
 
     pub fn pickup(&mut self, art: &HashMap<Weapon, WeaponAssets>, weapon: Weapon) -> bool {

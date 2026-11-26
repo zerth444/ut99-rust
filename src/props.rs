@@ -2828,6 +2828,7 @@ fn read_player(
             let field = match name {
                 "GroundSpeed" => &mut player.ground_speed,
                 "WaterSpeed" => &mut player.water_speed,
+                "CheatFlyingSpeed" => &mut player.cheat_flying_speed,
                 "AccelRate" => &mut player.acceleration,
                 "AirControl" => &mut player.air_control,
                 "JumpZ" => &mut player.jump_speed,

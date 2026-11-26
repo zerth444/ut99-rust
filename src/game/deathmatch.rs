@@ -15,7 +15,9 @@ pub(crate) mod translocation;
 mod turrets;
 
 use super::{
-    Item, Pose, Powerup, PulseBeam, RocketAnimations, Weapon, WeaponAssets, ballistics, decals,
+    ArmorKind, Item, Pose, Powerup, PulseBeam, RocketAnimations, Weapon, WeaponAssets, ballistics,
+    cheats::{self, Cheats, Flight},
+    decals,
     liquid::{Impact, LiquidState},
     ordnance,
     shock::{self, cylinder_hit},
@@ -63,6 +65,7 @@ impl Default for Rules {
 #[derive(Default, Clone, Copy)]
 pub struct Command {
     pub movement: [f32; 2],
+    pub descend: bool,
     pub walk: bool,
     pub dodge: Option<[f32; 2]>,
     pub jump: bool,
@@ -868,6 +871,7 @@ pub(crate) struct RatedRoster {
 }
 
 pub struct Match {
+    cheats: Cheats,
     rated_roster: Option<RatedRoster>,
     dm_training: Option<dm_training::Session>,
     ctf_training: Option<ctf_training::Session>,
@@ -944,6 +948,7 @@ impl Match {
             rules.frag_limit = 3;
         }
         let mut game = Self {
+            cheats: Cheats::default(),
             rules,
             rated_roster,
             dm_training,
@@ -1424,6 +1429,7 @@ impl Match {
     }
 
     fn reset_round(&mut self, map: &mut Map) {
+        self.cheats.flight = Flight::Walk;
         self.time = 0.0;
         self.finished = false;
         self.overtime = false;
@@ -1968,6 +1974,55 @@ impl Match {
             })
     }
 
+    pub(crate) fn cheat_command(
+        &mut self,
+        map: &Map,
+        command: &str,
+    ) -> (&'static str, SoundEvents) {
+        use cheats::Action;
+        let mut sounds = SoundEvents::default();
+        let player = &mut self.fighters[0];
+        let message = match self
+            .cheats
+            .command(command, map.collision.player_fits(player.walker.position))
+        {
+            Action::Message(message) => message,
+            _ if self.finished || player.health == 0 => "No active player",
+            Action::AllAmmo => {
+                player.inventory.cheat_refill();
+                "Ammo refilled"
+            }
+            Action::Loaded => {
+                for weapon in cheats::LOADED {
+                    player.inventory.pickup(&map.arsenal, weapon);
+                }
+                for weapon in Weapon::ALL {
+                    if weapon.uses_ammo() && player.inventory.owns(weapon) {
+                        player.inventory.grant_ammo(&map.arsenal, weapon, u16::MAX);
+                    }
+                }
+                ArmorKind::Chest.pickup(&mut player.armor);
+                ArmorKind::Thigh.pickup(&mut player.armor);
+                "Weapons, ammo and armor granted"
+            }
+            Action::Suicide => {
+                self.apply_hit(
+                    map,
+                    Hit {
+                        victim: 0,
+                        owner: Some(0),
+                        damage: u16::MAX,
+                        bypass_armor: true,
+                        impulse: Vec3::default(),
+                    },
+                    &mut sounds,
+                );
+                "Suicide"
+            }
+        };
+        (message, sounds)
+    }
+
     pub fn step(&mut self, map: &mut Map, command: Command, dt: f32) -> SoundEvents {
         let mut sounds = SoundEvents::default();
         if self.finished {
@@ -2097,6 +2152,9 @@ impl Match {
                         respawned.weapon = self.fighters[id].weapon;
                     }
                     self.fighters[id] = respawned;
+                    if id == 0 {
+                        self.cheats.flight = Flight::Walk;
+                    }
                 }
                 continue;
             }
@@ -2125,6 +2183,21 @@ impl Match {
             fighter.pitch = (fighter.pitch + input.look[1]).clamp(-1.48, 1.48);
             let aim = fighter.camera(map);
             let [forward, strafe] = input.movement;
+            if id == 0 && self.cheats.flight != Flight::Walk {
+                self.cheats.flight.advance(
+                    &mut fighter.walker,
+                    &map.collision,
+                    &aim,
+                    [
+                        forward,
+                        strafe,
+                        f32::from(input.jump) - f32::from(input.descend),
+                    ],
+                    dt,
+                );
+                fighter.airborne_since = None;
+                continue;
+            }
             let walk = aim.forward() * forward + aim.right() * strafe;
             let profile = map.collision.profile;
             let speed = profile.ground_speed * if input.walk { 0.3 } else { 1.0 };
@@ -2562,7 +2635,7 @@ impl Match {
     }
 
     fn separate_fighters(&mut self, map: &Map) {
-        for first in 0..self.fighters.len() {
+        for first in usize::from(self.cheats.flight == Flight::Ghost)..self.fighters.len() {
             let (before, after) = self.fighters.split_at_mut(first + 1);
             let a = &mut before[first];
             if a.health == 0 {
@@ -4369,6 +4442,9 @@ impl Match {
     }
 
     fn apply_hit_from(&mut self, map: &Map, hit: Hit, sounds: &mut SoundEvents, cannon: bool) {
+        if hit.victim == 0 && hit.damage != u16::MAX && self.cheats.protects() {
+            return;
+        }
         if (self.training_assault() || self.training_deathmatch() || self.training_ctf())
             && hit.victim == 0
             && hit.damage != u16::MAX
@@ -5930,6 +6006,81 @@ mod tests {
             .grant_ammo(&map.arsenal, Weapon::Redeemer, 1);
         player.weapon = Weapon::Redeemer;
         (map, game)
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY assets"]
+    fn cheat_commands_change_only_the_local_player() {
+        let mut map = arena();
+        let mut game = Match::new(
+            &map,
+            0,
+            Rules {
+                bots: 1,
+                ..Rules::default()
+            },
+        );
+        game.time = 2.0;
+        let hit = |victim| Hit {
+            victim,
+            owner: Some(1 - victim),
+            damage: 20,
+            bypass_armor: false,
+            impulse: Vec3::default(),
+        };
+        assert_eq!(game.cheat_command(&map, "god").0, "Enter iamtheone first");
+        assert_eq!(game.cheat_command(&map, " IAmTheOne ").0, "Cheats enabled");
+        assert_eq!(game.cheat_command(&map, "GOD").0, "God mode on");
+        game.cheat_command(&map, "allammo");
+        assert!(!game.fighters[0].inventory.owns(Weapon::Rocket));
+        game.cheat_command(&map, "loaded");
+        assert!(!game.fighters[0].inventory.owns(Weapon::Redeemer));
+        assert!(game.fighters[0].inventory.owns(Weapon::Rocket));
+        game.cheat_command(&map, "allammo");
+        assert_eq!(game.fighters[0].inventory.ammo(Weapon::Rocket), 999);
+        assert!(!game.fighters[1].inventory.owns(Weapon::Rocket));
+        let mut sounds = SoundEvents::default();
+        game.apply_hit(&map, hit(0), &mut sounds);
+        game.apply_hit(&map, hit(1), &mut sounds);
+        assert_eq!(game.fighters[0].health, 100);
+        assert_eq!(game.fighters[0].armor.iter().sum::<u16>(), 150);
+        assert_eq!(game.fighters[1].health, 80);
+        assert_eq!(game.cheat_command(&map, "god").0, "God mode off");
+        game.apply_hit(&map, hit(0), &mut sounds);
+        assert!(game.fighters[0].armor.iter().sum::<u16>() < 150);
+        game.cheat_command(&map, "god");
+        game.cheat_command(&map, "suicide");
+        assert_eq!(game.fighters[0].health, 0);
+        assert_eq!(game.fighters[0].deaths, 1);
+        game.time += RESPAWN_DELAY;
+        game.step(&mut map, Command::default(), 1.0 / 120.0);
+        assert_eq!(game.fighters[0].health, 100);
+        assert!(!game.fighters[0].inventory.owns(Weapon::Rocket));
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY assets"]
+    fn cheat_flight_respects_wall_collision_until_ghost() {
+        let (mut map, mut game) = flight_fixture();
+        map.collision
+            .add_box(Vec3(50.0, -500.0, 0.0), Vec3(52.0, 500.0, 200.0));
+        game.cheat_command(&map, "iamtheone");
+        game.cheat_command(&map, "fly");
+        let forward = Command {
+            movement: [1.0, 0.0],
+            ..Command::default()
+        };
+        game.step(&mut map, forward, 0.125);
+        assert!(game.fighters[0].walker.position.0 < 50.0);
+        game.cheat_command(&map, "ghost");
+        game.step(&mut map, forward, 0.02);
+        assert_eq!(
+            game.cheat_command(&map, "walk").0,
+            "Move out of solid geometry first"
+        );
+        game.step(&mut map, forward, 0.2);
+        assert!(game.fighters[0].walker.position.0 > 52.0);
+        assert_eq!(game.cheat_command(&map, "walk").0, "Walking");
     }
 
     #[test]

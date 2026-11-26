@@ -26,6 +26,8 @@ use crate::render::{Camera, Frame};
 use crate::settings::{RESOLUTIONS, Settings};
 use crate::sound::device::Audio;
 
+mod console;
+
 pub fn show(
     map: &mut Map,
     start: usize,
@@ -222,6 +224,7 @@ unsafe fn message_loop(
     let mut ladder_error = false;
     let mut training_bindings = None;
     let mut scoreboard_held = false;
+    let mut console = console::Console::default();
 
     unsafe {
         loop {
@@ -230,6 +233,66 @@ unsafe fn message_loop(
             while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
                 if message.message == WM_QUIT {
                     return Ok(());
+                }
+                if message.hwnd == window {
+                    if message.message == WM_KEYDOWN && message.wParam as u16 == VK_OEM_3 {
+                        if message.lParam & (1 << 30) == 0 {
+                            console.open = !console.open;
+                            scoreboard_held = false;
+                            primary = false;
+                            alternate = false;
+                            slot = None;
+                            cycle = 0;
+                            jump = false;
+                            dodge = None;
+                            last_direction = None;
+                            raw = (0, 0);
+                            match_clock.clear();
+                        }
+                        continue;
+                    }
+                    if console.open {
+                        match message.message {
+                            WM_CHAR => {
+                                console.character(message.wParam);
+                                continue;
+                            }
+                            WM_KEYDOWN => {
+                                match message.wParam as u16 {
+                                    VK_ESCAPE => console.open = false,
+                                    VK_UP => console.recall(),
+                                    VK_RETURN if message.lParam & (1 << 30) == 0 => {
+                                        console.submit(|line| {
+                                            if let Some(game) = &mut deathmatch {
+                                                let (answer, events) =
+                                                    game.cheat_command(map, line);
+                                                if let Some(audio) = &mut audio {
+                                                    audio.play_events(events);
+                                                }
+                                                answer
+                                            } else {
+                                                let answer = game.cheat_command(map, &walker, line);
+                                                if game.cheat_flying() {
+                                                    fly = false;
+                                                }
+                                                answer
+                                            }
+                                        });
+                                    }
+                                    _ => {
+                                        TranslateMessage(&message);
+                                    }
+                                }
+                                continue;
+                            }
+                            WM_KEYUP | WM_INPUT | WM_LBUTTONDOWN | WM_RBUTTONDOWN
+                            | WM_MBUTTONDOWN | WM_XBUTTONDOWN | WM_MOUSEWHEEL => {
+                                DispatchMessageW(&message);
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 if deathmatch.is_some() && message.hwnd == window {
                     if mouse.captured
@@ -602,7 +665,7 @@ unsafe fn message_loop(
                             settings.fullscreen = windowed.is_some();
                             save_settings(settings, settings_path);
                         }
-                        VK_F2 if game.death.is_none() => {
+                        VK_F2 if game.death.is_none() && !game.cheat_flying() => {
                             fly = !fly;
                             if !fly {
                                 occupied_portal = None;
@@ -709,6 +772,7 @@ unsafe fn message_loop(
                             }
                         }),
                         jump: key(jump_key),
+                        descend: key(VK_CONTROL),
                         primary: (mouse.captured || fire > 6) && key(fire),
                         alternate: (mouse.captured || alt_fire > 6) && key(alt_fire),
                         restart,
@@ -721,7 +785,8 @@ unsafe fn message_loop(
                         ],
                         ..deathmatch::Command::default()
                     };
-                    let controls = briefing_page.is_none()
+                    let controls = !console.open
+                        && briefing_page.is_none()
                         && (game.finished || game.assault_end_camera(map).is_none());
                     let events = match_clock.advance(
                         game,
@@ -786,6 +851,7 @@ unsafe fn message_loop(
                     game.hud_scale = settings.hud_scale as f32 / 100.0;
                     game.show_decals = settings.show_decals;
                     let scoreboard = active
+                        && !console.open
                         && briefing_page.is_none()
                         && (scoreboard_held || game.tutorial_forces_scoreboard());
                     frame.draw_deathmatch(
@@ -839,6 +905,7 @@ unsafe fn message_loop(
                         let label = stats.label(window, size, presenter.software);
                         hud.text(&mut frame, 12, 8, 0.8, &label, [0.72, 0.95, 0.78]);
                     }
+                    console.draw(&mut frame, &hud);
                     if presenter
                         .draw(
                             size,
@@ -867,12 +934,13 @@ unsafe fn message_loop(
             let mut movement_audio = MotionEvents::default();
             let mut boot_jump = false;
             let focused = GetForegroundWindow() == window;
+            let controls = focused && !console.open;
             let guiding = game.ordnance.guided_view().is_some();
             if guiding && pilot_view.is_none() {
                 pilot_view = Some((camera.yaw, camera.pitch));
             }
             if let Some(death) = &mut game.death {
-                if focused && primary && game.time - death.started >= 1.0 {
+                if controls && primary && game.time - death.started >= 1.0 {
                     game.reset_player(&map.arsenal);
                     camera = Camera::from_start(map.starts[start]);
                     walker = Walker::spawn(&map.collision, map.starts[start].position);
@@ -882,7 +950,7 @@ unsafe fn message_loop(
                     death.position = walker.position;
                 }
                 primary = false;
-            } else if focused {
+            } else if controls {
                 if mouse.captured {
                     let (x, y) = mouse.motion(raw);
                     let sensitivity =
@@ -899,6 +967,18 @@ unsafe fn message_loop(
                     if !fly {
                         walker.advance(&map.collision, Vec3::default(), None, dt);
                     }
+                } else if game.cheat_flying() && !fly {
+                    game.cheat_fly(
+                        &mut walker,
+                        map,
+                        &camera,
+                        [
+                            axis(forward, back),
+                            axis(right, left),
+                            axis(jump_key, VK_CONTROL),
+                        ],
+                        dt,
+                    );
                 } else if fly {
                     let movement = movement + Vec3(0.0, 0.0, axis(jump_key, VK_CONTROL));
                     let speed = if key(walk) { 950.0 } else { 340.0 };
@@ -948,7 +1028,7 @@ unsafe fn message_loop(
                         walker = Walker::spawn(&map.collision, map.starts[start].position);
                     }
                 }
-            } else {
+            } else if !focused {
                 mouse.release();
             }
 
@@ -967,8 +1047,8 @@ unsafe fn message_loop(
                 &camera,
                 dt,
                 Input {
-                    primary: focused && (primary || ((mouse.captured || fire > 6) && key(fire))),
-                    alternate: focused
+                    primary: controls && (primary || ((mouse.captured || fire > 6) && key(fire))),
+                    alternate: controls
                         && (alternate || ((mouse.captured || alt_fire > 6) && key(alt_fire))),
                     slot: slot.take(),
                     cycle: std::mem::take(&mut cycle),
@@ -1110,6 +1190,7 @@ unsafe fn message_loop(
                     track,
                     label.as_deref(),
                 );
+                console.draw(&mut frame, &hud);
                 let presented = presenter
                     .draw(
                         size,

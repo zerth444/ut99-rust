@@ -11,6 +11,7 @@ use crate::{
 pub struct Profile {
     pub ground_speed: f32,
     pub water_speed: f32,
+    pub cheat_flying_speed: f32,
     pub acceleration: f32,
     pub air_control: f32,
     pub jump_speed: f32,
@@ -28,6 +29,7 @@ impl Default for Profile {
         Self {
             ground_speed: 400.0,
             water_speed: 200.0,
+            cheat_flying_speed: 400.0,
             acceleration: 2048.0,
             air_control: 0.35,
             jump_speed: 325.0,
