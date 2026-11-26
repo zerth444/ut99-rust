@@ -10409,7 +10409,8 @@ mod tests {
             assert_ne!(frame.pixels[center], scene[center]);
             let corner = [16, 8, 0].into_iter().fold(0, |pixel, shift| {
                 let channel = (scene[0] >> shift) & 255;
-                pixel | ((channel as f32 * (1.0 - 0.55)) as u32) << shift
+                pixel
+                    | ((channel as f32 * (1.0 - crate::hud::SCOREBOARD_SCENE_DIM)) as u32) << shift
             });
             assert_eq!(frame.pixels[0], corner, "live standings dim the scene");
         }

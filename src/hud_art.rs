@@ -78,33 +78,6 @@ impl Art {
         self.elements.is_some() && self.weapons.is_some()
     }
 
-    #[cfg(windows)]
-    pub(crate) fn draw_score_number(
-        &self,
-        frame: &mut Frame,
-        [right, top]: [f32; 2],
-        scale: f32,
-        value: i16,
-        color: [f32; 3],
-    ) -> bool {
-        if value.unsigned_abs() > 9999 {
-            return false;
-        }
-        let Some(elements) = &self.elements else {
-            return false;
-        };
-        number(
-            frame,
-            elements.image(0.0),
-            i32::from(value),
-            right - 80.0 * scale,
-            top,
-            scale,
-            color,
-        );
-        true
-    }
-
     pub fn draw_ctf_info(
         &self,
         frame: &mut Frame,

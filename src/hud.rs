@@ -1,4 +1,6 @@
 mod scoreboard;
+#[cfg(test)]
+pub(crate) use scoreboard::SCENE_DIM as SCOREBOARD_SCENE_DIM;
 
 use std::ptr::null_mut;
 use windows_sys::Win32::{
@@ -32,7 +34,7 @@ impl Hud {
     pub fn new() -> Self {
         Self {
             glyphs: glyph_atlas("Segoe UI", FW_SEMIBOLD),
-            scoreboard_glyphs: glyph_atlas("Tahoma", FW_BOLD),
+            scoreboard_glyphs: glyph_atlas("Arial", FW_NORMAL),
         }
     }
 
