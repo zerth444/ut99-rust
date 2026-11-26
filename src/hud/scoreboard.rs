@@ -1,20 +1,27 @@
-use super::{Hud, glyph_index};
+use super::{GlyphAtlas, Hud, glyph_index};
 use crate::{
-    game::deathmatch::{Match, Mode},
+    game::deathmatch::{AssaultStatus, Fighter, Match, Mode},
     map::Map,
     render::Frame,
 };
 
-const TEXT: [f32; 3] = [0.96, 0.97, 0.98];
-const MUTED: [f32; 3] = [0.70, 0.75, 0.81];
-const GOLD: [f32; 3] = [1.0, 0.72, 0.33];
-const TEAM_COLORS: [[f32; 3]; 2] = [[1.0, 0.52, 0.45], [0.48, 0.76, 1.0]];
-const PANEL: [f32; 3] = [0.055, 0.071, 0.094];
+const TEXT: [f32; 3] = [0.96, 0.95, 0.91];
+const MUTED: [f32; 3] = [0.76, 0.81, 0.84];
+const ACCENT: [f32; 3] = [1.0, 0.82, 0.45];
+const TEAM: [[f32; 3]; 2] = [[1.0, 0.55, 0.49], [0.49, 0.79, 1.0]];
+const LINE: [f32; 3] = [0.34, 0.42, 0.47];
+const HEAD: f32 = 90.0;
+const TEAM_HEAD: f32 = 47.0;
+const COLUMNS: f32 = 26.0;
+const ROW: f32 = 28.0;
+const INSET: f32 = 16.0;
+const GAP: f32 = 14.0;
 
 impl Hud {
     pub(super) fn draw_scoreboard(&self, frame: &mut Frame, game: &Match, map: &Map, help: &str) {
-        let standings = game.standings();
+        let mode = game.mode();
         let team_scores = game.team_scores();
+        let standings = game.standings();
         let teams = team_scores.map(|_| {
             [0, 1].map(|team| {
                 standings
@@ -24,374 +31,441 @@ impl Hud {
                     .collect::<Vec<_>>()
             })
         });
-        let rows = teams
-            .as_ref()
-            .map_or(standings.len(), |[a, b]| a.len().max(b.len()).max(1));
-        let table_top = 108.0;
-        let rows_top = table_top + if teams.is_some() { 79.0 } else { 32.0 };
-        let footer = rows_top + 32.0 * rows as f32 + 12.0;
-        let leave_camera_visible = game.finished
-            && teams.is_none()
-            && frame.width >= 760
-            && frame.width as f32 / frame.height.max(1) as f32 >= 1.5;
-        let width = if teams.is_some() {
-            860.0
-        } else if leave_camera_visible {
-            440.0
-        } else {
-            580.0
+        let aspect = frame.width as f32 / frame.height.max(1) as f32;
+        let stacked = teams.is_some() && (aspect < 1.25 || frame.width < 850);
+        let side = teams.is_none() && game.finished && aspect >= 1.5 && frame.width >= 760;
+        let pane_width = if teams.is_some() { 490.0 } else { 590.0 };
+        let width = 2.0 * INSET
+            + pane_width
+                * if teams.is_some() && !stacked {
+                    2.0
+                } else {
+                    1.0
+                }
+            + if teams.is_some() && !stacked {
+                GAP
+            } else {
+                0.0
+            };
+        let table_height = |count: usize| COLUMNS + ROW * count.max(1) as f32;
+        let tables = match &teams {
+            Some([a, b]) if stacked => {
+                2.0 * TEAM_HEAD + table_height(a.len()) + table_height(b.len()) + GAP
+            }
+            Some([a, b]) => TEAM_HEAD + table_height(a.len().max(b.len())),
+            None => table_height(standings.len()),
         };
-        let height = footer + 34.0;
-        let available_width = if leave_camera_visible {
-            frame.width as f32 * 0.46
-        } else {
-            frame.width as f32 - 24.0
-        };
+        let point_strip = mode == Mode::Domination && !map.control_points.is_empty();
+        let footer = HEAD + tables + if point_strip { 47.0 } else { 12.0 };
+        let height = footer + 32.0;
+        let available_width = frame.width as f32 * if side { 0.46 } else { 1.0 } - 24.0;
         let scale = (available_width / width)
             .min((frame.height as f32 - 28.0) / height)
-            .min(1.4)
-            .max(0.1);
+            .clamp(0.1, 1.35);
         let board = Board {
-            hud: self,
-            scale,
+            glyphs: self.scoreboard_glyphs.as_ref().or(self.glyphs.as_ref()),
             origin: [
-                if leave_camera_visible {
+                if side {
                     14.0
                 } else {
                     (frame.width as f32 - width * scale) * 0.5
                 },
-                (frame.height as f32 - height * scale) * 0.5,
+                (frame.height as f32 - height * scale) * if side { 0.5 } else { 0.31 },
             ],
+            scale,
         };
         let assault = game.assault_status(map);
-        let mode = game.mode();
-        let (limit, seconds) = game.limits();
-        frame.shade(board.rect(0.0, 0.0, width, height), PANEL, 0.94);
-        frame.solid(board.rect(0.0, 0.0, width, 3.0), GOLD);
+
+        let shade = if side {
+            board.rect(0.0, 0.0, width, height)
+        } else {
+            [0, 0, frame.width as i32, frame.height as i32]
+        };
+        frame.shade(shade, [0.0; 3], 0.55);
         frame.solid(
-            board.rect(18.0, 98.0, width - 36.0, 1.0),
-            [0.28, 0.34, 0.41],
+            board.rect(INSET, HEAD - 5.0, width - 2.0 * INSET, 1.0),
+            LINE,
         );
-
-        let mode_label =
-            if game.training_assault() || game.training_ctf() || game.training_deathmatch() {
-                format!("{} training", mode.label())
-            } else {
-                mode.label().to_owned()
-            };
-        if let Some(font) = &map.score_font
-            && font.width(&mode_label, 0.88) <= width - 160.0
-        {
-            let [x, y] = board.point(19.0, 12.0);
-            font.draw_glyphs(frame, x, y, 0.88 * scale, &mode_label, Some(GOLD));
+        let training = game.training_assault() || game.training_ctf() || game.training_deathmatch();
+        let mode_name = if training {
+            format!("{} TRAINING", mode.label().to_ascii_uppercase())
         } else {
-            board.label(frame, [19.0, 10.0], width - 160.0, 0.82, &mode_label, GOLD);
-        }
-        let title = if game.finished {
-            if game.training_assault() || game.training_ctf() || game.training_deathmatch() {
-                if game.player_won_rated_match() {
-                    "Training complete"
-                } else {
-                    "Training failed"
-                }
-                .to_owned()
-            } else if let Some([red, blue]) = team_scores {
-                match red.cmp(&blue) {
-                    std::cmp::Ordering::Equal => "Match drawn".to_owned(),
-                    outcome => format!("{} wins", game.team_label(usize::from(outcome.is_lt()))),
-                }
+            mode.label().to_ascii_uppercase()
+        };
+        board.label(frame, [INSET, 8.0], width - 148.0, 0.76, &mode_name, ACCENT);
+        let title = result_title(game, team_scores, training).unwrap_or_else(|| {
+            if map.title.is_empty() {
+                "Standings".to_owned()
             } else {
-                match game.winner() {
-                    Some(0) => "You won".to_owned(),
-                    Some(winner) => format!("{} wins", game.fighter_label(winner)),
-                    None => "Match drawn".to_owned(),
-                }
+                map.title.clone()
             }
-        } else if map.title.is_empty() {
-            "Standings".to_owned()
-        } else {
-            map.title.clone()
-        };
-        board.label(frame, [19.0, 32.0], width - 160.0, 1.62, &title, TEXT);
-
-        let (clock, clock_label) = if game.finished {
-            (
-                game.time as u32,
-                if assault.is_some() {
-                    "Round elapsed"
-                } else {
-                    "Elapsed"
-                },
-            )
-        } else if assault.is_some() || seconds > 0 {
-            (
-                u32::from(game.remaining()),
-                if assault.is_some() {
-                    "Round time"
-                } else {
-                    "Time left"
-                },
-            )
-        } else {
-            (game.time as u32, "Elapsed")
-        };
-        board.right(
-            frame,
-            [width - 20.0, 25.0],
-            1.42,
-            &format!("{:02}:{:02}", clock / 60, clock % 60),
-            TEXT,
-        );
-        board.right(frame, [width - 20.0, 56.0], 0.77, clock_label, MUTED);
-        let context = if let Some(status) = &assault {
-            let round = if status.tutorial {
+        });
+        board.label(frame, [INSET, 26.0], width - 148.0, 1.48, &title, TEXT);
+        let (limit, seconds) = game.limits();
+        let status_line = if let Some(state) = assault.as_ref() {
+            let round = if state.tutorial {
                 "Exercise".to_owned()
             } else {
-                format!("Round {} of 2", status.half)
+                format!("Round {}/2", state.half)
             };
             let progress = format!(
-                "{round}  /  {} of {} objectives",
-                status.completed, status.total
+                "{round}   |   {}/{} objectives",
+                state.completed, state.total
             );
-            match status.objective.filter(|_| !game.finished) {
-                Some(objective) => format!("{progress}  /  {objective}"),
-                None => progress,
-            }
-        } else if game.overtime {
-            if game.finished {
-                "Decided in sudden death"
+            if let Some(name) = state.objective.filter(|_| !game.finished) {
+                format!("{progress}   |   {name}")
+            } else if game.finished {
+                format!("{}   |   {progress}", map.title)
             } else {
-                "Sudden death"
+                progress
             }
-            .to_owned()
         } else if game.finished {
-            if seconds > 0 && game.remaining() == 0 {
-                "Time expired".to_owned()
-            } else if mode == Mode::LastManStanding {
-                "Elimination".to_owned()
+            if game.overtime {
+                format!("{}   |   Decided in sudden death", map.title)
             } else {
                 map.author.as_ref().map_or_else(
                     || map.title.clone(),
-                    |author| format!("{}  /  {author}", map.title),
+                    |author| format!("{}   |   {author}", map.title),
                 )
             }
+        } else if game.overtime {
+            "Sudden death".to_owned()
         } else if limit > 0 {
-            format!("{}  /  {limit}", mode.goal_label())
+            format!("{}  {}", mode.goal_label(), limit)
         } else {
-            "No score limit".to_owned()
+            "Unlimited score".to_owned()
         };
-        board.label(frame, [19.0, 75.0], width - 38.0, 0.85, &context, MUTED);
+        board.label(
+            frame,
+            [INSET, 63.0],
+            width - 148.0,
+            0.82,
+            &status_line,
+            MUTED,
+        );
+        let (time, clock_label) =
+            if let Some(time) = assault.as_ref().and_then(|state| state.attack_time) {
+                (time, "Attack time")
+            } else if game.finished {
+                (game.time, "Elapsed")
+            } else if assault.is_some() || seconds > 0 {
+                (
+                    f32::from(game.remaining()),
+                    if assault.is_some() {
+                        "Round left"
+                    } else {
+                        "Time left"
+                    },
+                )
+            } else {
+                (game.time, "Elapsed")
+            };
+        board.right(frame, [width - INSET, 16.0], 1.39, &clock(time), TEXT);
+        board.right(frame, [width - INSET, 47.0], 0.78, clock_label, MUTED);
 
         if let Some((teams, scores)) = teams.zip(team_scores) {
-            let flags = game.flag_status();
-            let controlled = (mode == Mode::Domination).then(|| {
-                let mut count = [0; 2];
-                for owner in game.control_owners().flatten() {
-                    count[owner] += 1;
-                }
-                count
-            });
+            let mut y = HEAD;
             for (team, players) in teams.iter().enumerate() {
-                let x = 18.0 + team as f32 * 418.0;
-                let pane_width = 406.0;
-                let tint = TEAM_COLORS[team];
-                frame.shade(board.rect(x, table_top, pane_width, 47.0), tint, 0.16);
-                frame.solid(board.rect(x, table_top, 3.0, 47.0), tint);
+                let x = INSET
+                    + if stacked {
+                        0.0
+                    } else {
+                        team as f32 * (pane_width + GAP)
+                    };
+                let color = TEAM[team];
+                frame.solid(board.rect(x, y + TEAM_HEAD - 4.0, pane_width, 2.0), color);
                 board.label(
                     frame,
-                    [x + 13.0, table_top + 2.0],
-                    pane_width - 83.0,
-                    1.12,
+                    [x + 11.0, y + 2.0],
+                    pane_width - 110.0,
+                    1.10,
                     game.team_label(team),
-                    tint,
+                    color,
                 );
-                let status = if let Some(status) = &assault {
-                    let attack_team = status.half - 1;
-                    match (team == attack_team, game.finished) {
+
+                if let Some(status) = assault.as_ref() {
+                    let attacking = team + 1 == status.half;
+                    let description = match (attacking, game.finished) {
                         (true, false) => "Attacking",
                         (false, false) => "Defending",
                         (true, true) => "Attacked",
                         (false, true) => "Defended",
-                    }
-                    .to_owned()
-                } else if let Some(flags) = flags {
-                    format!("Flag  /  {}", flags[team])
-                } else if let Some(held) = controlled {
-                    format!("Control points  /  {}", held[team])
+                    };
+                    let total = assault_total(status, attacking, game.finished);
+                    board.label(
+                        frame,
+                        [x + 11.0, y + 24.0],
+                        pane_width - 110.0,
+                        0.80,
+                        description,
+                        MUTED,
+                    );
+                    board.right(frame, [x + pane_width - 11.0, y + 8.0], 1.05, &total, TEXT);
                 } else {
-                    format!("{} players", players.len())
-                };
-                board.label(
-                    frame,
-                    [x + 13.0, table_top + 24.0],
-                    pane_width - 82.0,
-                    0.82,
-                    &status,
-                    TEXT,
-                );
-                if mode == Mode::Assault {
-                    if game.finished {
-                        let outcome = match scores[team].cmp(&scores[1 - team]) {
-                            std::cmp::Ordering::Greater => "Win",
-                            std::cmp::Ordering::Less => "Loss",
-                            std::cmp::Ordering::Equal => "Draw",
-                        };
-                        board.right(
-                            frame,
-                            [x + pane_width - 13.0, table_top + 8.0],
-                            1.16,
-                            outcome,
-                            TEXT,
-                        );
-                    }
-                } else {
+                    let description = match game.flag_status().map(|flags| flags[team]) {
+                        Some("You have it") => "Flag carried by you".to_owned(),
+                        Some(flag) => format!("Flag {}", flag.to_ascii_lowercase()),
+                        None if mode == Mode::Domination => "Control points".to_owned(),
+                        None => "Team frags".to_owned(),
+                    };
+                    board.label(
+                        frame,
+                        [x + 11.0, y + 24.0],
+                        pane_width - 110.0,
+                        0.80,
+                        &description,
+                        MUTED,
+                    );
                     board.right(
                         frame,
-                        [x + pane_width - 13.0, table_top + 1.0],
-                        1.32,
+                        [x + pane_width - 11.0, y + 3.0],
+                        1.46,
                         &scores[team].to_string(),
                         TEXT,
                     );
-                    let team_total = match mode {
-                        Mode::CaptureTheFlag => "Captures",
-                        Mode::Domination => "Points",
-                        _ => "Frags",
-                    };
-                    board.right(
-                        frame,
-                        [x + pane_width - 13.0, table_top + 27.0],
-                        0.72,
-                        team_total,
-                        MUTED,
-                    );
                 }
-                self.scoreboard_rows(frame, game, &board, [x, rows_top, pane_width], players);
+                scoreboard_rows(frame, game, &board, [x, y + TEAM_HEAD, pane_width], players);
+                if stacked {
+                    y += TEAM_HEAD + table_height(players.len()) + GAP;
+                }
             }
         } else {
-            self.scoreboard_rows(
-                frame,
-                game,
-                &board,
-                [18.0, rows_top, width - 36.0],
-                &standings,
-            );
+            scoreboard_rows(frame, game, &board, [INSET, HEAD, pane_width], &standings);
         }
-        frame.solid(
-            board.rect(18.0, footer, width - 36.0, 1.0),
-            [0.28, 0.34, 0.41],
-        );
-        let footer_label = if game.finished {
-            help
-        } else if game.tutorial_forces_scoreboard() {
-            ""
-        } else {
-            "Release Tab to close"
-        };
-        board.label(
-            frame,
-            [19.0, footer + 7.0],
-            width - 38.0,
-            0.84,
-            footer_label,
-            MUTED,
-        );
-    }
 
-    fn scoreboard_rows(
-        &self,
-        frame: &mut Frame,
-        game: &Match,
-        board: &Board<'_>,
-        pane: [f32; 3],
-        players: &[usize],
-    ) {
-        let [x, y, width] = pane;
-        let lms = game.mode() == Mode::LastManStanding;
-        let score = if matches!(game.mode(), Mode::CaptureTheFlag | Mode::Domination) {
-            "Score"
-        } else {
-            "Frags"
-        };
-        let third = if lms { "Lives" } else { "Deaths" };
-        let numeric = [x + width - 80.0, x + width - 13.0];
-        let header = y - 32.0;
-        frame.shade(board.rect(x, header, width, 32.0), [0.30, 0.36, 0.43], 0.48);
-        board.label(
-            frame,
-            [x + 13.0, header + 6.0],
-            width - 145.0,
-            0.84,
-            "Player",
-            MUTED,
-        );
-        board.right(frame, [numeric[0], header + 6.0], 0.84, score, MUTED);
-        board.right(frame, [numeric[1], header + 6.0], 0.84, third, MUTED);
-
-        if players.is_empty() {
+        if point_strip {
+            let slot = (width - INSET * 2.0) / map.control_points.len() as f32;
+            for (i, (point, owner)) in map
+                .control_points
+                .iter()
+                .zip(game.control_owners())
+                .enumerate()
+            {
+                let x = INSET + i as f32 * slot;
+                let tint = owner.map_or(MUTED, |team| TEAM[team]);
+                frame.solid(board.rect(x, footer - 27.0, slot - 8.0, 2.0), tint);
+                board.label(
+                    frame,
+                    [x, footer - 24.0],
+                    slot - 8.0,
+                    0.79,
+                    &point.name,
+                    tint,
+                );
+            }
+        }
+        frame.solid(board.rect(INSET, footer, width - 2.0 * INSET, 1.0), LINE);
+        if game.finished {
             board.label(
                 frame,
-                [x + 13.0, y + 5.0],
-                width - 25.0,
-                0.89,
-                "No players",
+                [INSET, footer + 5.0],
+                width - 2.0 * INSET,
+                0.84,
+                help,
+                MUTED,
+            );
+        } else if !game.tutorial_forces_scoreboard() {
+            board.label(
+                frame,
+                [INSET, footer + 5.0],
+                width - 2.0 * INSET,
+                0.84,
+                "Release Tab to return to the match",
                 MUTED,
             );
         }
-        for (row, &id) in players.iter().enumerate() {
-            let top = y + row as f32 * 32.0;
-            let fighter = &game.fighters[id];
-            let flag = game.fighter_carries_flag(id);
-            let tint = if id == 0 { GOLD } else { TEXT };
-            if id == 0 {
-                frame.shade(board.rect(x, top, width, 31.0), GOLD, 0.18);
-                frame.solid(board.rect(x, top, 3.0, 31.0), GOLD);
-            } else if row % 2 == 0 {
-                frame.shade(board.rect(x, top, width, 31.0), [0.22, 0.30, 0.40], 0.36);
-            }
+    }
+}
+
+fn clock(seconds: f32) -> String {
+    let seconds = seconds as u32;
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
+}
+
+fn attack_result(time: Option<f32>) -> String {
+    time.map_or_else(
+        || "Time expired".to_owned(),
+        |time| format!("Captured in {}", clock(time)),
+    )
+}
+
+fn assault_total(status: &AssaultStatus<'_>, attacking: bool, finished: bool) -> String {
+    if attacking {
+        if finished || status.attack_time.is_some() {
+            attack_result(status.attack_time)
+        } else {
+            format!("{}/{}", status.completed, status.total)
+        }
+    } else if let Some(time) = status.first_attack {
+        attack_result(time)
+    } else {
+        format!("{} left", status.total.saturating_sub(status.completed))
+    }
+}
+
+fn result_title(game: &Match, team_scores: Option<[i16; 2]>, training: bool) -> Option<String> {
+    if !game.finished {
+        return None;
+    }
+    Some(if training {
+        if game.player_won_rated_match() {
+            "Training complete"
+        } else {
+            "Training failed"
+        }
+        .to_owned()
+    } else if let Some([red, blue]) = team_scores {
+        if red == blue {
+            "Match drawn".to_owned()
+        } else {
+            format!("{} wins", game.team_label(usize::from(blue > red)))
+        }
+    } else {
+        match game.winner() {
+            Some(0) => "You won".to_owned(),
+            Some(id) => format!("{} wins", game.fighter_label(id)),
+            None => "Match drawn".to_owned(),
+        }
+    })
+}
+
+struct Column {
+    label: &'static str,
+    value: fn(&Match, usize, &Fighter) -> i32,
+}
+
+const SCORE: Column = Column {
+    label: "Score",
+    value: |_, _, f| i32::from(f.score),
+};
+const FRAGS: Column = Column {
+    label: "Frags",
+    value: |_, _, f| i32::from(f.score),
+};
+const KILLS: Column = Column {
+    label: "Kills",
+    value: |_, _, f| i32::from(f.stats.kills),
+};
+const DEATHS: Column = Column {
+    label: "Deaths",
+    value: |_, _, f| i32::from(f.deaths),
+};
+const LIVES: Column = Column {
+    label: "Lives",
+    value: |game, id, _| i32::from(game.lives_left(id).unwrap_or(0)),
+};
+const CAPS: Column = Column {
+    label: "Caps",
+    value: |_, _, f| i32::from(f.stats.captures),
+};
+const RETURNS: Column = Column {
+    label: "Returns",
+    value: |_, _, f| i32::from(f.stats.returns),
+};
+const TAKEN: Column = Column {
+    label: "Taken",
+    value: |_, _, f| i32::from(f.stats.points_taken),
+};
+
+fn scoreboard_rows(
+    frame: &mut Frame,
+    game: &Match,
+    board: &Board<'_>,
+    pane: [f32; 3],
+    players: &[usize],
+) {
+    let [x, y, width] = pane;
+    let columns = match game.mode() {
+        Mode::CaptureTheFlag => &[SCORE, CAPS, RETURNS, KILLS, DEATHS][..],
+        Mode::Domination => &[SCORE, TAKEN, KILLS, DEATHS],
+        Mode::LastManStanding => &[LIVES, FRAGS, DEATHS],
+        _ => &[FRAGS, DEATHS],
+    };
+    let cell = if columns.len() >= 4 { 66.0 } else { 68.0 };
+    let column_x = |index: usize| x + width - 11.0 - (columns.len() - 1 - index) as f32 * cell;
+    let name_width = column_x(0) - cell - (x + 38.0);
+    frame.solid(board.rect(x, y + COLUMNS - 1.0, width, 1.0), LINE);
+    board.label(frame, [x + 10.0, y + 3.0], 25.0, 0.74, "#", MUTED);
+    board.label(
+        frame,
+        [x + 38.0, y + 3.0],
+        name_width,
+        0.74,
+        "PLAYER",
+        MUTED,
+    );
+    for (i, column) in columns.iter().enumerate() {
+        board.right(frame, [column_x(i), y + 3.0], 0.77, column.label, MUTED);
+    }
+    if players.is_empty() {
+        board.label(
+            frame,
+            [x + 38.0, y + COLUMNS + 5.0],
+            name_width,
+            0.85,
+            "No players",
+            MUTED,
+        );
+    }
+    for (rank, &id) in players.iter().enumerate() {
+        let fighter = &game.fighters[id];
+        let top = y + COLUMNS + rank as f32 * ROW;
+        let color = if id == 0 { ACCENT } else { TEXT };
+        if id == 0 {
+            frame.shade(board.rect(x, top, width, ROW), ACCENT, 0.14);
+            frame.solid(board.rect(x, top, 2.0, ROW), ACCENT);
+        }
+        let status = if game.fighter_carries_flag(id) {
+            Some(("FLAG", TEAM[1 - fighter.team.unwrap_or(0)]))
+        } else if game.lives_left(id) == Some(0) {
+            Some(("OUT", MUTED))
+        } else if !game.finished && fighter.health == 0 {
+            Some(("DOWN", MUTED))
+        } else {
+            None
+        };
+        board.label(
+            frame,
+            [x + 10.0, top + 4.0],
+            25.0,
+            0.82,
+            &(rank + 1).to_string(),
+            MUTED,
+        );
+        let name = if id == 0 {
+            "You".to_owned()
+        } else {
+            game.fighter_label(id)
+        };
+        let name_room =
+            name_width - status.map_or(0.0, |(text, _)| board.measure(text, 0.68) + 8.0);
+        board.label(frame, [x + 38.0, top + 3.0], name_room, 0.95, &name, color);
+        if let Some((text, tint)) = status {
+            let left = x + 38.0 + board.measure(&name, 0.95).min(name_room) + 7.0;
             board.label(
                 frame,
-                [x + 13.0, top + 4.0],
-                width - if flag { 192.0 } else { 145.0 },
-                1.0,
-                &game.fighter_label(id),
+                [left, top + 6.0],
+                name_width - name_room,
+                0.68,
+                text,
                 tint,
             );
-            if flag {
-                let flag_color = TEAM_COLORS[1 - fighter.team.unwrap_or(0)];
-                board.right(
-                    frame,
-                    [x + width - 144.0, top + 6.0],
-                    0.78,
-                    "FLAG",
-                    flag_color,
-                );
-            }
+        }
+        for (i, column) in columns.iter().enumerate() {
+            let value = (column.value)(game, id, fighter);
             board.right(
                 frame,
-                [numeric[0], top + 4.0],
-                1.0,
-                &fighter.score.to_string(),
-                tint,
-            );
-            let deaths_or_lives = game.lives_left(id).unwrap_or(fighter.deaths);
-            let color = if lms && deaths_or_lives == 0 {
-                MUTED
-            } else {
-                tint
-            };
-            board.right(
-                frame,
-                [numeric[1], top + 4.0],
-                1.0,
-                &deaths_or_lives.to_string(),
-                color,
+                [column_x(i), top + 3.0],
+                0.94,
+                &value.to_string(),
+                if i == 0 { color } else { MUTED },
             );
         }
     }
 }
 
 struct Board<'a> {
-    hud: &'a Hud,
+    glyphs: Option<&'a GlyphAtlas>,
     origin: [f32; 2],
     scale: f32,
 }
@@ -413,7 +487,7 @@ impl Board<'_> {
     }
 
     fn measure(&self, text: &str, size: f32) -> f32 {
-        self.hud.glyphs.as_ref().map_or(0.0, |atlas| {
+        self.glyphs.map_or(0.0, |atlas| {
             text.chars()
                 .map(|ch| atlas.advance[glyph_index(ch)])
                 .sum::<i32>() as f32
@@ -447,14 +521,10 @@ impl Board<'_> {
             &fitted
         };
         let [x, y] = self.point(x, y);
-        self.hud.text(
-            frame,
-            x.round() as i32,
-            y.round() as i32,
-            size * self.scale,
-            text,
-            tint,
-        );
+        if let Some(glyphs) = self.glyphs {
+            let (x, y) = (x.round() as i32, y.round() as i32);
+            glyphs.draw(frame, x, y, size * self.scale, text, tint);
+        }
     }
 
     fn right(

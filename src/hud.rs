@@ -20,6 +20,7 @@ const ROWS: usize = 6;
 
 pub struct Hud {
     glyphs: Option<GlyphAtlas>,
+    scoreboard_glyphs: Option<GlyphAtlas>,
 }
 
 struct GlyphAtlas {
@@ -30,7 +31,8 @@ struct GlyphAtlas {
 impl Hud {
     pub fn new() -> Self {
         Self {
-            glyphs: glyph_atlas(),
+            glyphs: glyph_atlas("Segoe UI", FW_SEMIBOLD),
+            scoreboard_glyphs: glyph_atlas("Tahoma", FW_BOLD),
         }
     }
 
@@ -587,17 +589,23 @@ impl Hud {
         let Some(glyphs) = &self.glyphs else {
             return;
         };
+        glyphs.draw(frame, x, y, scale, text, color);
+    }
+}
+
+impl GlyphAtlas {
+    fn draw(&self, frame: &mut Frame, x: i32, y: i32, scale: f32, text: &str, color: [f32; 3]) {
         let scale = scale * 0.5;
         let mut advance = 0;
         for ch in text.chars() {
             let index = glyph_index(ch);
             let left = x + (advance as f32 * scale).round() as i32;
-            advance += glyphs.advance[index];
+            advance += self.advance[index];
             if ch == ' ' {
                 continue;
             }
             frame.translucent_tile(
-                &glyphs.image,
+                &self.image,
                 [
                     left,
                     y,
@@ -624,7 +632,7 @@ fn glyph_index(ch: char) -> usize {
     }
 }
 
-fn glyph_atlas() -> Option<GlyphAtlas> {
+fn glyph_atlas(typeface: &str, weight: u32) -> Option<GlyphAtlas> {
     let (width, height) = (CELL_W * COLUMNS, CELL_H * ROWS);
     let bitmap = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
@@ -650,13 +658,13 @@ fn glyph_atlas() -> Option<GlyphAtlas> {
             return None;
         }
         let previous_bitmap = SelectObject(dc, dib);
-        let face: Vec<_> = "Segoe UI\0".encode_utf16().collect();
+        let face: Vec<_> = typeface.encode_utf16().chain(std::iter::once(0)).collect();
         let font = CreateFontW(
             -36,
             0,
             0,
             0,
-            FW_SEMIBOLD as i32,
+            weight as i32,
             0,
             0,
             0,

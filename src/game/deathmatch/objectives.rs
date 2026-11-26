@@ -283,12 +283,15 @@ impl Objectives {
                             .total_cmp(&distance_squared(b.walker.position, position))
                     })
                 {
-                    flag.state = if fighter.team == Some(team) {
+                    let returned = fighter.team == Some(team);
+                    flag.state = if returned {
                         FlagState::Home
                     } else {
                         FlagState::Held(id)
                     };
-                    notice = Some(if fighter.team == Some(team) {
+                    notice = Some(if returned {
+                        let stats = &mut fighters[id].stats;
+                        stats.returns = stats.returns.saturating_add(1);
                         FlagNotice::Returned
                     } else {
                         FlagNotice::Taken
@@ -304,6 +307,8 @@ impl Objectives {
                     self.scores[team] = self.scores[team].saturating_add(1);
                     self.player_captured |= owner == 0;
                     fighters[owner].score = fighters[owner].score.saturating_add(7);
+                    let stats = &mut fighters[owner].stats;
+                    stats.captures = stats.captures.saturating_add(1);
                     notice = Some(FlagNotice::Captured(team));
                 }
             }
@@ -337,6 +342,8 @@ impl Objectives {
                 if changed_team {
                     zone.score_at = time + 2.0;
                     notice = Some(FlagNotice::PointTaken(team, index));
+                    let stats = &mut fighters[controller].stats;
+                    stats.points_taken = stats.points_taken.saturating_add(1);
                 }
             }
         }

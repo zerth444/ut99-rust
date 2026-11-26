@@ -221,12 +221,6 @@ mod tests {
             let data = std::fs::read(&path).unwrap();
             let package = Package::read(&data).unwrap();
             let map = Map::load(&package, Some(&path)).unwrap();
-            #[cfg(windows)]
-            assert!(
-                map.score_font
-                    .as_ref()
-                    .is_some_and(|font| font.width("Capture the Flag", 1.0) > 12.0)
-            );
             for animations in [&map.objective_art.base, &map.objective_art.flag] {
                 let textures = animations.each_ref().map(|motion| {
                     assert!(motion.frames.len() > 1, "{name}");

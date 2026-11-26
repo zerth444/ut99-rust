@@ -91,8 +91,6 @@ pub struct Map {
     pub(crate) flag_bases: [Option<Vec3>; 2],
     pub(crate) flag_yaws: [f32; 2],
     pub(crate) objective_art: crate::props::ObjectiveArt,
-    #[cfg(windows)]
-    pub(crate) score_font: Option<crate::frontend::font::MenuFont>,
     pub(crate) control_points: Vec<ControlPoint>,
     pub(crate) assault: Option<crate::assault::AssaultMap>,
     pub(crate) dm_training: Option<crate::game::deathmatch::dm_training::Data>,
@@ -383,8 +381,6 @@ impl Map {
             missing_mesh_materials,
             flag_yaws,
             objective_art,
-            #[cfg(windows)]
-            score_font: path.and_then(crate::frontend::font::MenuFont::load_scoreboard),
             control_points,
             assault,
             dm_training,

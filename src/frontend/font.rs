@@ -18,14 +18,6 @@ struct Page {
 }
 
 impl MenuFont {
-    pub fn load_scoreboard(path: &Path) -> Option<Self> {
-        let root = path.parent()?.parent()?;
-        let relative = Path::new("Textures/LadderFonts.utx");
-        let bytes = fs::read(root.join(relative))
-            .or_else(|_| fs::read(root.join("../reference-client").join(relative)))
-            .ok()?;
-        Self::load(&Package::read(&bytes).ok()?, "UTLadder16").ok()
-    }
     pub fn load_sizes(path: &Path) -> [Option<Self>; FONT_SIZES.len()] {
         let Ok(bytes) = fs::read(path) else {
             return Default::default();
@@ -78,12 +70,6 @@ impl MenuFont {
             }
             None
         })
-    }
-
-    pub fn width(&self, label: &str, scale: f32) -> f32 {
-        self.glyphs(label)
-            .map(|(_, [_, _, w, _])| (w.max(3) as f32 + 1.0) * scale)
-            .sum()
     }
 
     pub fn draw(&self, frame: &mut Frame, x: f32, y: f32, scale: f32, label: &str) {

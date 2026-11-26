@@ -77,6 +77,14 @@ pub struct Command {
     pub release_charge: bool,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct PlayerStats {
+    pub kills: u16,
+    pub captures: u16,
+    pub returns: u16,
+    pub points_taken: u16,
+}
+
 pub struct Fighter {
     pub team: Option<usize>,
     pub walker: Walker,
@@ -111,6 +119,7 @@ pub struct Fighter {
     wait_for_fire_release: bool,
     pub score: i16,
     pub deaths: u16,
+    pub(crate) stats: PlayerStats,
     pub fired_at: f32,
     pub(crate) fired_count: u32,
     fired_units: u8,
@@ -180,6 +189,7 @@ impl Fighter {
             wait_for_fire_release: false,
             score: 0,
             deaths: 0,
+            stats: PlayerStats::default(),
             fired_at: f32::NEG_INFINITY,
             fired_count: 0,
             fired_units: 0,
@@ -904,6 +914,8 @@ pub struct AssaultStatus<'a> {
     pub objective: Option<&'a str>,
     pub notice: Option<(&'a str, &'a str)>,
     pub tutorial: bool,
+    pub first_attack: Option<Option<f32>>,
+    pub attack_time: Option<f32>,
 }
 
 impl Match {
@@ -1539,6 +1551,8 @@ impl Match {
             objective,
             notice,
             tutorial: round.tutorial.is_some(),
+            first_attack: round.first_attack,
+            attack_time: round.conquered_at(),
         })
     }
 
@@ -2069,6 +2083,7 @@ impl Match {
                     let mut respawned = self.spawn_at(map, spawn);
                     respawned.score = self.fighters[id].score;
                     respawned.deaths = self.fighters[id].deaths;
+                    respawned.stats = self.fighters[id].stats;
                     respawned.team = self.team_for(id);
                     self.configure_dm_training_spawn(id, &mut respawned);
                     if id == 0
@@ -4462,8 +4477,12 @@ impl Match {
                 .map(|(owner, _)| owner)
         });
         if let Some(owner) = owner.filter(|&owner| owner != hit.victim) {
-            let carrier_bonus = self.objectives.carries_flag(hit.victim)
-                && !allied(self.fighters[owner].team, self.fighters[hit.victim].team);
+            let enemy = !allied(self.fighters[owner].team, self.fighters[hit.victim].team);
+            let carrier_bonus = enemy && self.objectives.carries_flag(hit.victim);
+            if enemy {
+                let stats = &mut self.fighters[owner].stats;
+                stats.kills = stats.kills.saturating_add(1);
+            }
             self.fighters[owner].score = self.fighters[owner]
                 .score
                 .saturating_add(if carrier_bonus { 5 } else { 1 });
@@ -7260,6 +7279,7 @@ mod tests {
         game.apply_hit(&map, hit(2), &mut sounds);
         assert_eq!(game.fighters[2].health, 100);
         game.apply_hit(&map, hit(1), &mut sounds);
+        assert_eq!(game.fighters[0].stats.kills, 1);
         assert_eq!(game.team_scores(), Some([1, 0]));
         game.step(&mut map, Command::default(), 1.0 / 120.0);
         assert!(game.finished);
@@ -7290,8 +7310,10 @@ mod tests {
         game.fighters[0].walker.position = red;
         game.objectives.tick(&map, &mut game.fighters, 1.1);
         assert_eq!(game.team_scores(), Some([1, 0]));
+        assert_eq!(game.fighters[0].stats.captures, 1);
         game.restart(&mut map);
         assert_eq!(game.team_scores(), Some([0, 0]));
+        assert_eq!(game.fighters[0].stats.captures, 0);
         game.fighters[0].walker.position = blue;
         game.objectives.tick(&map, &mut game.fighters, 1.0);
         game.fighters[0].walker.position = Vec3(160.0, 0.0, 39.2);
@@ -7326,6 +7348,8 @@ mod tests {
         game.objectives.tick(&map, &mut game.fighters, 14.0);
         assert_eq!(game.team_scores(), Some([1, 1]));
         assert_eq!((game.fighters[0].score, game.fighters[1].score), (1, 1));
+        assert_eq!(game.fighters[0].stats.points_taken, 1);
+        assert_eq!(game.fighters[1].stats.points_taken, 1);
     }
 
     #[test]
@@ -9446,6 +9470,7 @@ mod tests {
         bot.health = 0;
         bot.score = 3;
         bot.deaths = 1;
+        bot.stats.kills = 4;
         bot.fell_at = Some(0.0);
         game.time = 1.0;
         game.step(&mut map, Command::default(), 1.0 / 120.0);
@@ -9455,6 +9480,7 @@ mod tests {
         let bot = &game.fighters[1];
         assert_eq!(bot.spawn, 1);
         assert_eq!((bot.score, bot.deaths, bot.health), (3, 1, 100));
+        assert_eq!(bot.stats.kills, 4);
         assert!(bot.walker.grounded && bot.protected_until > game.time);
         let (before, yaw_before) = bot.body_transform(0.0);
         let (after, yaw_after) = bot.body_transform(1.0);
@@ -9570,8 +9596,11 @@ mod tests {
                 game.objectives.scores = [2, 1];
             }
 
-            let draw = |game: &Match, show| {
+            let draw = |game: &Match, show, [width, height]: [usize; 2]| {
                 let mut frame = Frame::new();
+                frame.width = width;
+                frame.height = height;
+                frame.pixels.resize(width * height, 0);
                 hud.draw_deathmatch(
                     &mut frame,
                     game,
@@ -9582,16 +9611,39 @@ mod tests {
                 );
                 frame
             };
-            let live = draw(&game, true);
-            assert_ne!(draw(&game, false).pixels, live.pixels, "{mode:?}");
+            let size = [1280, 720];
+            let live = draw(&game, true, size);
+            assert_ne!(draw(&game, false, size).pixels, live.pixels, "{mode:?}");
+            for size in [size, [640, 480], [540, 800]] {
+                let frame = draw(&game, true, size);
+                let rows = frame.pixels.chunks_exact(size[0]);
+                assert!(rows.clone().all(|row| row[0] == 0 && row[size[0] - 1] == 0));
+                assert!(rows.take(6).flatten().all(|&p| p == 0));
+                assert!(frame.pixels.iter().any(|&p| p != 0));
+            }
+            let mut hardware = Frame::hardware(&map);
+            (hardware.width, hardware.height) = (size[0], size[1]);
+            hud.draw_deathmatch(&mut hardware, &game, &map, true, true, "");
+            let hud_pass = &hardware.commands.as_ref().unwrap().passes[4];
+            use crate::render::commands::Mode as DrawMode;
+            assert!(
+                hud_pass
+                    .batches()
+                    .any(|(material, _)| material.mode == DrawMode::Flash)
+            );
+            assert!(
+                hud_pass
+                    .batches()
+                    .any(|(material, _)| material.mode == DrawMode::Screen)
+            );
             game.fighters[0].health = 0;
             game.fighters[0].deaths += 1;
-            let dead = draw(&game, true);
+            let dead = draw(&game, true, size);
             assert_ne!(dead.pixels, live.pixels, "{mode:?}");
             game.finished = true;
-            let result = draw(&game, false);
+            let result = draw(&game, false, size);
             assert_ne!(result.pixels, dead.pixels, "{mode:?}");
-            assert_eq!(result.pixels, draw(&game, true).pixels, "{mode:?}");
+            assert_eq!(result.pixels, draw(&game, true, size).pixels, "{mode:?}");
         }
     }
 
@@ -9907,6 +9959,7 @@ mod tests {
         game.fighters[0].walker.position = Vec3(position.0, position.1, 39.2);
         game.objectives.tick(&map, &mut game.fighters, 3.25);
         assert_eq!(game.flag_icon_states(), Some([0, 1]));
+        assert_eq!(game.fighters[0].stats.returns, 1);
         game.fighters[0].walker.position = red;
         game.objectives.tick(&map, &mut game.fighters, 3.5);
         assert_eq!(game.team_scores(), Some([1, 0]));
@@ -10354,7 +10407,11 @@ mod tests {
             crate::hud::Hud::new().draw_deathmatch(&mut frame, &game, &map, true, true, "");
             let center = frame.width * (frame.height / 2) + frame.width / 2;
             assert_ne!(frame.pixels[center], scene[center]);
-            assert_eq!(frame.pixels[0], scene[0]);
+            let corner = [16, 8, 0].into_iter().fold(0, |pixel, shift| {
+                let channel = (scene[0] >> shift) & 255;
+                pixel | ((channel as f32 * (1.0 - 0.55)) as u32) << shift
+            });
+            assert_eq!(frame.pixels[0], corner, "live standings dim the scene");
         }
         assert!(
             game.fighters

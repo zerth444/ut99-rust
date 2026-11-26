@@ -1536,9 +1536,9 @@ impl Frame {
             );
             return;
         }
-        for py in y.max(0)..(y + h).min(HEIGHT as i32) {
-            for px in x.max(0)..(x + w).min(WIDTH as i32) {
-                let index = py as usize * WIDTH + px as usize;
+        for py in y.max(0)..(y + h).min(self.height as i32) {
+            for px in x.max(0)..(x + w).min(self.width as i32) {
+                let index = py as usize * self.width + px as usize;
                 if inverse_depth.is_some_and(|depth| depth <= self.depth[index]) {
                     continue;
                 }
