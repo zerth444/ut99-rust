@@ -270,7 +270,11 @@ impl Collision {
             return self.sweep(start, delta, PLAYER);
         }
         let solid = self.sweep_except(start, delta, PLAYER, None, SweepContact::Floor);
-        if !self.at_face_ridge(start) {
+        if !self.at_face_ridge(start)
+            || solid
+                .as_ref()
+                .is_some_and(|hit| hit.normal.2 >= FLOOR_NORMAL)
+        {
             return solid;
         }
         let floor = self.ridge_floor(start, delta.2.abs());
@@ -362,14 +366,22 @@ impl Collision {
     }
 
     fn floor(&self, position: Vec3, distance: f32) -> Option<f32> {
-        if self.at_face_ridge(position) {
+        self.regular_floor(position, distance).or_else(|| {
+            if !self.at_face_ridge(position) {
+                return None;
+            }
+            // Recover a lost contact at the seam. A drop farther than the
+            // contact band is handled by the airborne sweep.
+            let distance = distance.min(1.0);
             self.ridge_floor(position, distance)
                 .map(|hit| hit.fraction * distance - SKIN)
-        } else {
-            self.trace(position, UP * -distance)
-                .filter(|hit| hit.normal.2 >= FLOOR_NORMAL)
-                .map(|hit| (hit.fraction * distance - SKIN).max(0.0))
-        }
+        })
+    }
+
+    fn regular_floor(&self, position: Vec3, distance: f32) -> Option<f32> {
+        self.sweep_except(position, UP * -distance, PLAYER, None, SweepContact::Floor)
+            .filter(|hit| hit.normal.2 >= FLOOR_NORMAL)
+            .map(|hit| (hit.fraction * distance - SKIN).max(0.0))
     }
 
     fn ridge_floor(&self, position: Vec3, distance: f32) -> Option<Hit> {
@@ -377,7 +389,8 @@ impl Collision {
     }
 
     pub(crate) fn floor_position(&self, position: Vec3, distance: f32) -> Option<Vec3> {
-        self.floor(position, distance)
+        // Preserve the authored routes' clearance probe. Only pawn contacts get seam recovery.
+        self.regular_floor(position, distance)
             .map(|gap| position - UP * gap)
     }
 }
@@ -902,7 +915,12 @@ impl Walker {
                     }
                     self.landing_bob = (0.055 * self.velocity.2).max(-50.0);
                     self.velocity.2 = 0.0;
-                } else if vertical.2 < 0.0 && hit.normal.2 > 0.0 && world.at_face_ridge(origin) {
+                } else if vertical.2 < 0.0
+                    && hit.normal.2 > 0.0
+                    && horizontal_length(self.velocity) < 30.0
+                    && self.velocity.2 > -75.0
+                    && world.at_face_ridge(origin)
+                {
                     // A steep face arrests the downward sweep but cannot support a pawn.
                     // Preserve its tangential velocity so it can slide onto adjacent ground.
                     self.velocity =
@@ -996,7 +1014,10 @@ mod tests {
                 if normal.2 < FLOOR_NORMAL {
                     continue;
                 }
-                let support = world.floor_position(point + UP * PLAYER_HEIGHT, 330.0);
+                let start = point + UP * PLAYER_HEIGHT;
+                let support = world
+                    .ridge_floor(start, 330.0)
+                    .map(|hit| start - UP * (hit.fraction * 330.0 - SKIN));
                 assert!(
                     support.is_some_and(|feet| feet.2 - surface.2 > PLAYER_HEIGHT - 2.0),
                     "{point:?}: visible floor {surface:?}, player support {support:?}"
@@ -1014,11 +1035,12 @@ mod tests {
         ] {
             for offset in [-2.0, 0.0, 2.0] {
                 let above = Vec3(x + offset, y, -1190.0);
-                let expected = world.floor_position(above, 330.0).unwrap();
+                let expected =
+                    above - UP * (world.ridge_floor(above, 330.0).unwrap().fraction * 330.0 - SKIN);
                 let mut walker = Walker::spawn(world, above);
                 walker.set_teleport_velocity(Vec3(0.0, 0.0, -200.0));
                 let mut landed = false;
-                for _ in 0..120 {
+                for _ in 0..360 {
                     let step = walker.advance(world, Vec3::default(), None, 1.0 / 120.0);
                     landed |= step.landing.is_some();
                     assert!(

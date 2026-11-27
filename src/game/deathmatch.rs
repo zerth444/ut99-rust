@@ -11111,6 +11111,16 @@ mod tests {
     #[test]
     #[ignore = "requires local GOTY data"]
     fn audit_objective_bots() {
+        assert!(audit_objective_maps(None) >= 36);
+    }
+
+    #[test]
+    #[ignore = "requires the local reference-client maps"]
+    fn facing_worlds_bots_complete_a_capture_after_crossing_the_ridge() {
+        assert_eq!(audit_objective_maps(Some("CTF-Face.unr")), 1);
+    }
+
+    fn audit_objective_maps(only: Option<&str>) -> usize {
         let mut arenas: Vec<_> = std::fs::read_dir("local/reference-client/Maps")
             .unwrap()
             .map(|entry| entry.unwrap().path())
@@ -11124,6 +11134,9 @@ mod tests {
         let mut stalled_regressions = Vec::new();
         for path in arenas {
             let name = path.file_name().and_then(|name| name.to_str()).unwrap();
+            if only.is_some_and(|map| map != name) {
+                continue;
+            }
             let mode = match name.split_once('-') {
                 Some((_, "Tutorial.unr")) => continue,
                 Some(("CTF", _)) => Mode::CaptureTheFlag,
@@ -11230,8 +11243,8 @@ mod tests {
                 stalled_regressions.push(name.to_owned());
             }
         }
-        assert!(checked >= 36, "only {checked} objective maps found");
         assert!(stalled_regressions.is_empty(), "{stalled_regressions:?}");
+        checked
     }
 
     #[test]
