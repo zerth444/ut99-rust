@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use super::{Motion, Pose, TrainingTarget, shock::Blast};
+use super::{Motion, Pose, TrainingTarget, Weapon, shock::Blast};
 use crate::{
     map::{Face, Map, Vec3},
     mover::unit,
@@ -56,6 +56,18 @@ impl Kind {
             Self::Warhead => "WarShell",
             Self::GuidedWarhead => "GuidedWarShell",
         }
+    }
+
+    pub(crate) fn launch_weapon(self) -> Option<Weapon> {
+        Some(match self {
+            Self::Pulse => Weapon::Pulse,
+            Self::Rocket | Self::Grenade => Weapon::Rocket,
+            Self::Gel | Self::Glob => Weapon::Bio,
+            Self::Chunk | Self::FlakShell => Weapon::Flak,
+            Self::Razor | Self::RazorAlt => Weapon::Ripper,
+            Self::Warhead | Self::GuidedWarhead => Weapon::Redeemer,
+            Self::Splash => return None,
+        })
     }
 
     pub(super) fn launch_offset(self, camera: &Camera, side: f32, variation: f32) -> Vec3 {
@@ -1229,7 +1241,13 @@ impl Shots {
         self.projectiles.extend(fragments);
     }
 
-    pub fn visuals<'a>(&self, assets: &'a Arsenal, time: f32, mut draw: impl FnMut(Visual<'a>)) {
+    pub fn visuals<'a>(
+        &self,
+        assets: &'a Arsenal,
+        time: f32,
+        launch: impl Fn(Kind, Vec3, f32) -> Vec3,
+        mut draw: impl FnMut(Visual<'a>),
+    ) {
         self.rocket_trails.visuals(assets, time, &mut draw);
         self.warhead_smoke.visuals(assets, time, &mut draw);
         for ripple in &self.ripples {
@@ -1258,7 +1276,7 @@ impl Shots {
             } else {
                 art.flight_visual(
                     shot.kind,
-                    shot.position,
+                    launch(shot.kind, shot.position, time - shot.born),
                     shot.direction,
                     time - shot.born,
                     shot.scale,
@@ -2307,11 +2325,16 @@ mod tests {
             assert_eq!(shots.marks.len(), 1);
             assert!(blasts.is_empty());
             let mut rendered = false;
-            shots.visuals(&map.ordnance, 0.75, |visual| {
-                if let Visual::Mesh(_, _, pose, _, _) = visual {
-                    rendered = !pose.current.is_empty();
-                }
-            });
+            shots.visuals(
+                &map.ordnance,
+                0.75,
+                |_, point, _| point,
+                |visual| {
+                    if let Visual::Mesh(_, _, pose, _, _) = visual {
+                        rendered = !pose.current.is_empty();
+                    }
+                },
+            );
             assert!(rendered);
             shots.damage_target(&map.ordnance, 0, 17, 0.75, &mut sounds);
             assert!((0.85..=1.05).contains(&shots.projectiles[0].expires));
@@ -2559,11 +2582,16 @@ mod tests {
                 .is_none()
         );
         let mut sprites = Vec::new();
-        shots.visuals(&map.ordnance, born + 0.75, |visual| {
-            if let Visual::Sprite(_, _, scale, _) = visual {
-                sprites.push(scale);
-            }
-        });
+        shots.visuals(
+            &map.ordnance,
+            born + 0.75,
+            |_, point, _| point,
+            |visual| {
+                if let Visual::Sprite(_, _, scale, _) = visual {
+                    sprites.push(scale);
+                }
+            },
+        );
         assert!(sprites.contains(&2.8) && sprites.contains(&3.2));
     }
 

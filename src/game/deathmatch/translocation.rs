@@ -331,24 +331,29 @@ impl Match {
     pub(crate) fn translocator_modules<'a>(
         &'a self,
         map: &'a Map,
-    ) -> impl Iterator<Item = (Vec3, Vec3, Pose<'a>)> + 'a {
+    ) -> impl Iterator<Item = (Vec3, Vec3, Pose<'a>, Option<f32>)> + 'a {
         let art = equipment(map);
-        self.fighters.iter().filter_map(move |fighter| {
-            let art = art?;
-            let module = fighter.translocator.as_ref()?;
-            let pose = if let Some(landed) = module.landed {
-                art.module.hold_pose(self.time - landed)?
-            } else {
-                art.module.sample(0.0)?
-            };
-            let orientation = Vec3(module.velocity.0, module.velocity.1, 0.0);
-            let direction = if orientation.dot(orientation) > 0.1 {
-                super::unit(orientation)
-            } else {
-                Vec3(1.0, 0.0, 0.0)
-            };
-            Some((module.point, direction, pose))
-        })
+        self.fighters
+            .iter()
+            .enumerate()
+            .filter_map(move |(id, fighter)| {
+                let art = art?;
+                let module = fighter.translocator.as_ref()?;
+                let pose = if let Some(landed) = module.landed {
+                    art.module.hold_pose(self.time - landed)?
+                } else {
+                    art.module.sample(0.0)?
+                };
+                let orientation = Vec3(module.velocity.0, module.velocity.1, 0.0);
+                let direction = if orientation.dot(orientation) > 0.1 {
+                    super::unit(orientation)
+                } else {
+                    Vec3(1.0, 0.0, 0.0)
+                };
+                let launch =
+                    (id == 0 && module.landed.is_none()).then_some(self.time - module.born);
+                Some((module.point, direction, pose, launch))
+            })
     }
 }
 

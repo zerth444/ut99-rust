@@ -90,6 +90,7 @@ pub struct Map {
     pub(crate) start_teams: Vec<Option<usize>>,
     pub(crate) flag_bases: [Option<Vec3>; 2],
     pub(crate) flag_yaws: [f32; 2],
+    pub(crate) ctf_defense: [Vec<(Vec3, u8)>; 2],
     pub(crate) objective_art: crate::props::ObjectiveArt,
     pub(crate) control_points: Vec<ControlPoint>,
     pub(crate) assault: Option<crate::assault::AssaultMap>,
@@ -121,6 +122,10 @@ pub struct Map {
 }
 
 impl Map {
+    pub(crate) fn is_facing_worlds(&self) -> bool {
+        self.title.eq_ignore_ascii_case("Facing Worlds")
+    }
+
     pub(crate) fn clear_player_start(&self, preferred: usize) -> usize {
         (0..self.starts.len())
             .map(|offset| (preferred + offset) % self.starts.len())
@@ -229,11 +234,32 @@ impl Map {
         let mut start_teams = Vec::new();
         let mut flag_bases = [None; 2];
         let mut flag_yaws = [0.0; 2];
+        let mut ctf_defense = [Vec::new(), Vec::new()];
         let mut control_points = Vec::new();
         let mut navigation_points = Vec::new();
         let mut lift_exits = Vec::new();
         for actor in actors {
             let class = package.object_name(actor.class);
+            if class == Some("DefensePoint") {
+                let mut properties = package.properties(actor)?;
+                let mut position = None;
+                let mut team = 0;
+                let mut priority = 0;
+                while let Some((name, mut value)) = properties.next()? {
+                    if name == "Location" {
+                        position = Some(Vec3::read(&mut value)?);
+                    } else if name.eq_ignore_ascii_case("Team") {
+                        team = usize::from(value.byte()?);
+                    } else if name.eq_ignore_ascii_case("Priority") {
+                        priority = value.byte()?;
+                    }
+                }
+                if let Some(position) = position
+                    && let Some(points) = ctf_defense.get_mut(team)
+                {
+                    points.push((position, priority));
+                }
+            }
             if matches!(class, Some("FlagBase" | "ControlPoint")) {
                 let mut properties = package.properties(actor)?;
                 let mut position = Vec3::default();
@@ -393,6 +419,7 @@ impl Map {
             missing_bsp_materials,
             missing_mesh_materials,
             flag_yaws,
+            ctf_defense,
             objective_art,
             control_points,
             assault,

@@ -162,6 +162,7 @@ pub struct WeaponAssets {
     pub select_sound: Option<Arc<Wave>>,
     pub flash: Option<Flash>,
     pub muzzle_triangle: Option<usize>,
+    pub muzzle_faces: &'static [usize],
     pub case_triangle: Option<usize>,
     pub fire: Option<Arc<Wave>>,
     pub alternate: Option<Arc<Wave>>,
@@ -264,7 +265,21 @@ impl WeaponAssets {
         }
     }
     pub fn muzzle_position(&self, pose: Pose<'_>) -> Option<Vec3> {
-        pose.edge_center(self.muzzle_triangle?)
+        if let Some(point) = self
+            .muzzle_triangle
+            .and_then(|triangle| pose.edge_center(triangle))
+        {
+            return Some(point);
+        }
+        let mut sum = Vec3::default();
+        let mut count = 0;
+        for point in self.muzzle_faces.iter().filter_map(|&triangle| {
+            pose.triangle_point(triangle, |[a, b, c]| (a + b + c) * (1.0 / 3.0))
+        }) {
+            sum = sum + point;
+            count += 1;
+        }
+        (count > 0).then(|| sum * (count as f32).recip())
     }
 
     fn fire_motion(&self, weapon: Weapon, alternate: bool) -> &Motion {
@@ -322,13 +337,17 @@ impl WeaponAssets {
 
 impl Pose<'_> {
     fn edge_center(self, triangle: usize) -> Option<Vec3> {
+        self.triangle_point(triangle, |[a, _, c]| (a + c) * 0.5)
+    }
+
+    fn triangle_point(self, triangle: usize, point: impl Fn([Vec3; 3]) -> Vec3) -> Option<Vec3> {
         let triangle = Some(triangle);
         let center = |faces: &[Face]| {
             let index = faces
                 .binary_search_by_key(&triangle, |face| face.mesh_triangle)
                 .ok()?;
             let vertices = &faces[index].vertices;
-            Some((vertices[0] + vertices[2]) * 0.5)
+            Some(point([vertices[0], vertices[1], vertices[2]]))
         };
         let current = center(self.current)?;
         let next = center(self.next).unwrap_or(current);
@@ -576,7 +595,9 @@ pub struct Input {
     pub cycle: i8,
 }
 
+#[derive(Clone, Copy)]
 pub struct PulseBeam {
+    pub(crate) local: bool,
     pub start: Vec3,
     pub end: Vec3,
     pub started: f32,
@@ -606,6 +627,7 @@ impl PulseBeam {
             .then(|| map.collision.ray_surface(start, delta))
             .flatten();
         Self {
+            local: true,
             start,
             end: if blocked {
                 start

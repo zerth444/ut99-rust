@@ -389,14 +389,13 @@ impl Navigation {
         Self {
             points,
             edges,
-            check_steep_approaches: map.assault.is_some(),
+            check_steep_approaches: map.assault.is_some() || map.is_facing_worlds(),
         }
     }
 
     fn approach_step(&self, world: &Collision, from: Vec3, to: Vec3) -> Option<Step> {
         let step = approach_step(world, from, to)?;
-        // Assault goals can occupy a ramp above another reachable floor.
-        // Other modes retain their established approach and jump routes.
+        // Objective markers can occupy a ramp above another reachable floor.
         if self.check_steep_approaches
             && matches!(step, Step::Walk(_))
             && !walk_between_floors(world, from, to)

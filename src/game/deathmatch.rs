@@ -597,6 +597,8 @@ struct Bot {
     navigation_objective: Option<Vec3>,
     retreat: Option<Retreat>,
     retreat_retry_at: f32,
+    gear_pickup: Option<usize>,
+    gear_check_at: f32,
     jump: JumpProgress,
     jump_until: Option<f32>,
     route_jump_again_at: f32,
@@ -1805,6 +1807,7 @@ impl Match {
                     return None;
                 }
                 let mut beam = PulseBeam::trace(map, &fighter.camera(map), started);
+                beam.local = id == 0;
                 let delta = beam.end - beam.start;
                 if !beam.blocked
                     && let Some((_, fraction)) =
@@ -1957,7 +1960,17 @@ impl Match {
 
     pub(crate) fn bolts(
         &self,
-    ) -> impl Iterator<Item = (super::ordnance::Kind, Vec3, Vec3, f32, f32, Option<f32>)> + '_ {
+    ) -> impl Iterator<
+        Item = (
+            super::ordnance::Kind,
+            Vec3,
+            Vec3,
+            f32,
+            f32,
+            Option<f32>,
+            bool,
+        ),
+    > + '_ {
         let camera = self.pilot_index();
         self.bolts
             .iter()
@@ -1973,6 +1986,7 @@ impl Match {
                     self.time - bolt.born,
                     bolt.payload.scale,
                     bolt.gel.as_ref().map(|surface| self.time - surface.landed),
+                    bolt.owner == 0,
                 )
             })
     }
@@ -4759,7 +4773,7 @@ impl Match {
                     .destination(data, fighter.walker.position)
                     .map(|index| (&data.forts[index], fighter.team == Some(round.attack_team)))
             });
-        let objective = assault
+        let mut objective = assault
             .map(|(fort, attacking)| {
                 if attacking && fort.touch {
                     fort.volume.position
@@ -4783,6 +4797,60 @@ impl Match {
                 }
             });
         let carrying_flag = self.objectives.carries_flag(id);
+        let face_tactics = self.rules.mode == Mode::CaptureTheFlag && map.is_facing_worlds();
+        let defending = face_tactics
+            && self.objectives.flags_home()
+            && fighter.team.is_some_and(|team| {
+                let members = self
+                    .fighters
+                    .iter()
+                    .skip(1)
+                    .filter(|other| other.team == Some(team))
+                    .count();
+                members >= 3
+                    && self
+                        .fighters
+                        .iter()
+                        .enumerate()
+                        .skip(1)
+                        .find(|(_, other)| other.team == Some(team))
+                        .is_some_and(|(index, _)| index == id)
+            });
+        if defending
+            && let Some(team) = fighter.team
+            && let Some(base) = map.flag_bases[team]
+        {
+            objective = Some(
+                map.ctf_defense[team]
+                    .iter()
+                    .copied()
+                    .min_by(|(a, ap), (b, bp)| {
+                        bp.cmp(ap).then_with(|| {
+                            distance_squared(*a, base).total_cmp(&distance_squared(*b, base))
+                        })
+                    })
+                    .map_or(base, |(point, _)| point),
+            );
+        }
+        let fighter = &mut self.fighters[id];
+        let mut equipping = false;
+        if face_tactics
+            && !carrying_flag
+            && self.objectives.flags_home()
+            && !Weapon::ALL.into_iter().any(|weapon| {
+                weapon.switch_priority() > Weapon::Enforcer.switch_priority()
+                    && fighter.inventory.usable(weapon)
+            })
+        {
+            equipping = ctf_weapon_destination(&self.navigation, map, fighter, self.time)
+                .is_some_and(|point| {
+                    objective = Some(point);
+                    true
+                });
+        } else {
+            fighter.bot.gear_pickup = None;
+        }
+        let fighter = &self.fighters[id];
         if let Some((fort, true)) = assault
             && !fort.touch
         {
@@ -4932,6 +5000,11 @@ impl Match {
         let keep_route = carrying_flag
             || assault.is_some_and(|(fort, attacking)| attacking && fort.touch)
             || approach_fort
+            || (face_tactics
+                && !defending
+                && fighter.bot.goal.and_then(Step::movement_goal).is_some()
+                && target.is_some_and(|(_, _, _, range, _)| range > 580.0_f32.powi(2)))
+            || (equipping && target.is_some_and(|(_, _, _, range, _)| range > 300.0_f32.powi(2)))
             || (self.rules.mode == Mode::CaptureTheFlag
                 && fighter.bot.goal.and_then(Step::movement_goal).is_some()
                 && target.is_some_and(|(opponent, point, _, distance, _)| {
@@ -4951,13 +5024,19 @@ impl Match {
                 }));
         let fighter = &mut self.fighters[id];
         let regroup = assault.is_some_and(|(_, attacking)| attacking) && target.is_none();
+        let seek_health = if face_tactics {
+            target.is_some_and(|(_, _, _, range, _)| range > 325.0_f32.powi(2))
+        } else {
+            target.is_some() || regroup
+        };
         if (!keep_route || regroup)
             && let Some(command) = try_retreat(
                 &self.navigation,
                 map,
                 fighter,
                 &skill,
-                target.is_some() || regroup,
+                seek_health,
+                face_tactics,
                 self.time,
                 dt,
             )
@@ -5154,6 +5233,28 @@ impl Match {
             bot.rethink_at = self.time;
             bot.hidden_since = None;
         }
+        if defending
+            && !equipping
+            && target.is_none()
+            && objective.is_some_and(|point| {
+                distance_squared(point, fighter.walker.position) < 78.0_f32.powi(2)
+            })
+        {
+            bot.goal = None;
+            let yaw = fighter
+                .team
+                .and_then(|team| map.flag_bases[1 - team])
+                .map_or(0.0, |base| {
+                    aim_error(base - fighter.walker.position, fighter.yaw, fighter.pitch).0
+                });
+            return Command {
+                look: [
+                    yaw.clamp(-skill.turn * dt, skill.turn * dt),
+                    -fighter.pitch * dt,
+                ],
+                ..Command::default()
+            };
+        }
         bot.combat_move = Vec3::default();
         let position = fighter.walker.position;
         let check_progress = self.time >= bot.rethink_at;
@@ -5259,17 +5360,31 @@ impl Match {
                                 )
                             })
                             .or_else(|| {
-                                if !carrying_flag {
-                                    return None;
+                                if !face_tactics {
+                                    if !carrying_flag {
+                                        return None;
+                                    }
+                                    let floor =
+                                        self.objectives.flag_base_floor(fighter.team?, point)?;
+                                    return self.navigation.next_step_avoiding(
+                                        &map.collision,
+                                        position,
+                                        floor,
+                                        blocked,
+                                    );
                                 }
-                                let grounded =
-                                    self.objectives.flag_base_floor(fighter.team?, point)?;
-                                self.navigation.next_step_avoiding(
-                                    &map.collision,
-                                    position,
-                                    grounded,
-                                    blocked,
-                                )
+                                self.objectives
+                                    .flag_approaches(map, point)
+                                    .filter_map(|approach| {
+                                        self.navigation.route_avoiding(
+                                            &map.collision,
+                                            position,
+                                            approach,
+                                            blocked,
+                                        )
+                                    })
+                                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                                    .map(|(step, _)| step)
                             })
                     })
                     .or_else(|| {
@@ -5392,7 +5507,11 @@ impl Match {
             };
         }
         if let Some(goal) = fighter.bot.goal.and_then(Step::movement_goal) {
-            let route = steer(fighter, goal, dt);
+            let mut route = steer(fighter, goal, dt);
+            if face_tactics && carrying_flag && distance_squared(position, goal) > 160.0_f32.powi(2)
+            {
+                route.movement = route.movement.map(|axis| axis * 1.25);
+            }
             if let Some(mut fire) = covering_fire {
                 let [forward, strafe] = route.movement;
                 let (sin, cos) = (fighter.yaw + route.look[0]).sin_cos();
@@ -5539,12 +5658,73 @@ impl Match {
     }
 }
 
+fn ctf_weapon_destination(
+    navigation: &Navigation,
+    map: &Map,
+    fighter: &mut Fighter,
+    time: f32,
+) -> Option<Vec3> {
+    let position = fighter.walker.position;
+    let bot = &mut fighter.bot;
+    if let Some(index) = bot.gear_pickup {
+        let prop = &map.props[index];
+        if prop.visible
+            && time < bot.gear_check_at
+            && !bot.blocked_waypoints.iter().any(|&(blocked, until)| {
+                time < until && distance_squared(blocked, prop.position) < 40.0_f32.powi(2)
+            })
+        {
+            return Some(prop.position);
+        }
+        bot.gear_pickup = None;
+        bot.gear_check_at = time;
+    }
+    if time < bot.gear_check_at {
+        return None;
+    }
+    bot.blocked_waypoints.retain(|&(_, until)| time < until);
+    let mut pickups = map
+        .props
+        .iter()
+        .enumerate()
+        .filter_map(|(index, prop)| {
+            let Some(Item::Gun(weapon)) = prop.item else {
+                return None;
+            };
+            let distance = distance_squared(prop.position, position);
+            (prop.visible
+                && weapon.switch_priority() > Weapon::Enforcer.switch_priority()
+                && !fighter.inventory.usable(weapon)
+                && distance < 1350.0_f32.powi(2))
+            .then_some((index, distance))
+        })
+        .collect::<Vec<_>>();
+    pickups.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let choice = pickups
+        .into_iter()
+        .take(5)
+        .filter_map(|(index, _)| {
+            let (_, cost) = navigation.route_avoiding(
+                &map.collision,
+                position,
+                map.props[index].position,
+                &bot.blocked_waypoints,
+            )?;
+            (cost < 1550.0).then_some((index, cost))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1));
+    bot.gear_pickup = choice.map(|(index, _)| index);
+    bot.gear_check_at = time + if choice.is_some() { 4.0 } else { 1.25 };
+    Some(map.props[bot.gear_pickup?].position)
+}
+
 fn try_retreat(
     navigation: &Navigation,
     map: &Map,
     fighter: &mut Fighter,
     skill: &ai::Combat,
     under_fire: bool,
+    local_detour: bool,
     time: f32,
     dt: f32,
 ) -> Option<Command> {
@@ -5557,6 +5737,7 @@ fn try_retreat(
         fighter.bot.retreat_retry_at = time + 1.0;
     }
     let position = fighter.walker.position;
+    let reach: f32 = if local_detour { 540.0 } else { 1750.0 };
     if fighter.bot.retreat.is_none()
         && under_fire
         && fighter.health <= skill.rush_health
@@ -5572,17 +5753,17 @@ fn try_retreat(
                     && matches!(prop.item, Some(Item::Health(_, cap)) if cap > fighter.health)
             })
             .map(|(id, prop)| (id, distance_squared(prop.position, position)))
-            .filter(|(_, distance)| *distance < 1750.0_f32.powi(2))
+            .filter(|(_, distance)| *distance < reach.powi(2))
             .collect();
         supplies.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
         if let Some((pickup, step)) = supplies.into_iter().take(3).find_map(|(id, _)| {
-            navigation
-                .next_step(&map.collision, position, map.props[id].position)
-                .map(|step| (id, step))
+            let (step, cost) =
+                navigation.route_avoiding(&map.collision, position, map.props[id].position, &[])?;
+            (!local_detour || cost < reach).then_some((id, step))
         }) {
             fighter.bot.retreat = Some(Retreat {
                 pickup,
-                until: time + 9.0,
+                until: time + if local_detour { 3.0 } else { 9.0 },
             });
             fighter.bot.rethink_at = time + 1.0;
             fighter.bot.goal = Some(step);
@@ -5970,6 +6151,103 @@ fn angle_delta(target: f32, current: f32) -> f32 {
 mod tests {
     use super::*;
     use crate::package::Package;
+
+    #[test]
+    #[ignore = "requires the reference-client game and map"]
+    fn facing_worlds_teams_arm_and_leave_base_while_guards_stay() {
+        let path = std::path::Path::new("local/reference-client/Maps/CTF-Face.unr");
+        let bytes = std::fs::read(path).unwrap();
+        let mut map = Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap();
+        let mut game = Match::new(
+            &map,
+            0,
+            Rules {
+                mode: Mode::CaptureTheFlag,
+                bots: 5,
+                ..Rules::default()
+            },
+        );
+        game.fighters[0].protected_until = f32::INFINITY;
+        let mut armed = [false; 6];
+        let mut advanced = [false; 6];
+        let mut armed_attack = [false; 6];
+        for _ in 0..120 * 60 {
+            game.step(&mut map, Command::default(), 1.0 / 120.0);
+            for (id, bot) in game.fighters.iter().enumerate().skip(1) {
+                let ready = Weapon::ALL.into_iter().any(|weapon| {
+                    weapon.switch_priority() > Weapon::Enforcer.switch_priority()
+                        && bot.inventory.usable(weapon)
+                });
+                armed[id] |= ready;
+                let team = bot.team.unwrap();
+                let home = map.flag_bases[team].unwrap();
+                let enemy = map.flag_bases[1 - team].unwrap();
+                let advance = (bot.walker.position - home).dot(unit(enemy - home));
+                advanced[id] |= advance > 2700.0 && bot.health > 0;
+                armed_attack[id] |= ready && advance > 2700.0 && bot.health > 0;
+            }
+        }
+        eprintln!("Facing Worlds armed: {armed:?}, left island: {advanced:?}");
+        assert!(armed[1..].iter().filter(|&&ready| ready).count() >= 4);
+        assert!(advanced[3] || advanced[5], "blue team stayed at base");
+        assert!(advanced[2] || advanced[4], "red team stayed at base");
+        assert!(
+            armed_attack[3] || armed_attack[5],
+            "blue raiders never left with a usable gun"
+        );
+        assert!(
+            armed_attack[2] || armed_attack[4],
+            "red raiders never left with a usable gun"
+        );
+        assert!(
+            armed[1] && !advanced[1],
+            "blue guard abandoned its side of the map"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the reference-client game and map"]
+    fn facing_worlds_draws_the_local_shock_beam() {
+        let path = std::path::Path::new("local/reference-client/Maps/CTF-Face.unr");
+        let bytes = std::fs::read(path).unwrap();
+        let map = Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap();
+        let mut game = Match::new(
+            &map,
+            0,
+            Rules {
+                mode: Mode::CaptureTheFlag,
+                bots: 0,
+                ..Rules::default()
+            },
+        );
+        game.time = 2.0;
+        let player = &mut game.fighters[0];
+        player.walker = Walker::spawn(&map.collision, Vec3(2540.0, 161.0, -1380.0));
+        player.yaw = 0.08;
+        player.pitch = 0.0;
+        player.inventory.pickup(&map.arsenal, Weapon::Shock);
+        player.weapon = Weapon::Shock;
+        let mut sounds = SoundEvents::default();
+        game.fire(
+            &map,
+            0,
+            Command {
+                primary: true,
+                ..Command::default()
+            },
+            &mut Vec::new(),
+            &mut sounds,
+        );
+        assert_eq!(game.fighters[0].fired_at, game.time);
+        game.time += 0.025;
+        let camera = game.player_view(&map);
+        let mut with_beam = crate::render::Frame::new();
+        with_beam.draw_deathmatch(&map, &camera, &game, 95.0, 1.0, false);
+        game.shock = shock::Shots::default();
+        let mut without_beam = crate::render::Frame::new();
+        without_beam.draw_deathmatch(&map, &camera, &game, 95.0, 1.0, false);
+        assert_ne!(with_beam.pixels, without_beam.pixels);
+    }
 
     fn arena() -> Map {
         let path = std::path::Path::new("local/goty/Maps/DM-Deck16][.unr");
@@ -8084,7 +8362,7 @@ mod tests {
         );
         let mut visuals = 0;
         game.shock
-            .visuals(assets, game.time + 0.05, |_| visuals += 1);
+            .visuals(assets, game.time + 0.05, |point, _| point, |_| visuals += 1);
         assert!(visuals > 1);
         for hit in hits {
             game.apply_hit(&map, hit, &mut sounds);
@@ -9849,6 +10127,7 @@ mod tests {
             &mut game.fighters[1],
             &Difficulty::Standard.combat(),
             true,
+            false,
             game.time,
             1.0 / 60.0,
         )

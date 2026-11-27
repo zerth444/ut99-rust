@@ -156,6 +156,7 @@ struct Bolt {
 }
 
 struct Beam {
+    owner: usize,
     start: Vec3,
     end: Vec3,
     born: f32,
@@ -459,6 +460,7 @@ impl Shots {
             (end, blob)
         };
         self.beams.push(Beam {
+            owner,
             start: start + direction * (x + 20.0),
             end: beam_end,
             born: now,
@@ -578,11 +580,21 @@ impl Shots {
         }
         blasts
     }
-    pub fn visuals<'a>(&self, assets: &'a Assets, now: f32, mut draw: impl FnMut(Visual<'a>)) {
+    pub fn visuals<'a>(
+        &self,
+        assets: &'a Assets,
+        now: f32,
+        local_muzzle: impl Fn(Vec3, Option<f32>) -> Vec3,
+        mut draw: impl FnMut(Visual<'a>),
+    ) {
         if let Some(texture) = &assets.bolt {
             for bolt in &self.bolts {
                 draw(Visual::Sprite {
-                    position: bolt.position,
+                    position: if bolt.owner == 0 {
+                        local_muzzle(bolt.position, Some(now - bolt.born))
+                    } else {
+                        bolt.position
+                    },
                     image: texture.image(now - bolt.born),
                     scale: assets.bolt_scale,
                     glow: 1.0,
@@ -591,7 +603,12 @@ impl Shots {
         }
         if let Some(art) = &assets.beam {
             for beam in &self.beams {
-                let delta = beam.end - beam.start;
+                let start = if beam.owner == 0 {
+                    local_muzzle(beam.start, None)
+                } else {
+                    beam.start
+                };
+                let delta = beam.end - start;
                 let forward = unit(delta);
                 let (right, up) = axes(forward);
                 let count = beam.count();
@@ -600,7 +617,7 @@ impl Shots {
                     if !(0.0..art.lifetime).contains(&age) {
                         continue;
                     }
-                    let center = beam.start + delta * (index as f32 / count as f32);
+                    let center = start + delta * (index as f32 / count as f32);
                     let (sin, cos) =
                         (age * (1_000_000.0 / 65_536.0) * std::f32::consts::TAU).sin_cos();
                     for &Vec3(x, y, z) in &art.points {

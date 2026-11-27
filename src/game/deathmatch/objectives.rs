@@ -396,6 +396,39 @@ impl Objectives {
         })
     }
 
+    pub(super) fn flag_approaches<'a>(
+        &'a self,
+        map: &'a Map,
+        target: Vec3,
+    ) -> impl Iterator<Item = Vec3> + 'a {
+        self.flags
+            .iter()
+            .flatten()
+            .find(move |flag| distance_squared(target, flag.base) < 1.0)
+            .into_iter()
+            .flat_map(move |flag| {
+                let size = map.objective_art.flag_collision;
+                let radius = size.radius + crate::collision::PLAYER_RADIUS;
+                let height = size.height + crate::collision::PLAYER_HEIGHT;
+                let offsets = (0..8).map(move |angle| {
+                    let (sin, cos) = (angle as f32 * std::f32::consts::TAU / 8.0).sin_cos();
+                    Vec3(cos, sin, 0.0) * (radius * 0.7)
+                });
+                std::iter::once(flag.approach)
+                    .chain(offsets.filter_map(move |offset| {
+                        let up = Vec3(0.0, 0.0, 25.0);
+                        map.collision
+                            .floor_position(flag.base + offset + up, height + 25.0)
+                    }))
+                    .filter(move |&point| {
+                        distance_squared(point, target) >= 1.0
+                            && (point.2 - flag.base.2).abs() < height
+                            && map.collision.player_fits(point)
+                            && map.collision.ray(flag.base, point - flag.base).is_none()
+                    })
+            })
+    }
+
     pub(super) fn flag_base_floor(&self, team: usize, target: Vec3) -> Option<Vec3> {
         let flag = self.flags.as_ref()?.get(team)?;
         (distance_squared(target, flag.base) < 1.0
@@ -462,6 +495,14 @@ impl Objectives {
         self.uncontrolled_points(team).min_by(|&a, &b| {
             distance_squared(fighter.walker.position, a)
                 .total_cmp(&distance_squared(fighter.walker.position, b))
+        })
+    }
+
+    pub(super) fn flags_home(&self) -> bool {
+        self.flags.as_ref().is_some_and(|flags| {
+            flags
+                .iter()
+                .all(|flag| matches!(flag.state, FlagState::Home))
         })
     }
 

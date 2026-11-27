@@ -1085,6 +1085,22 @@ pub fn load(
             });
             if let Some(mesh) = mesh {
                 let (package, export) = assets.object(object);
+                // Triangles around the exit of each stock first-person mesh. Their
+                // vertices animate with the same pose used to draw the weapon.
+                weapon_assets.muzzle_faces = match weapon {
+                    Weapon::Hammer => &[430, 431, 432, 436, 437, 440],
+                    Weapon::Bio => &[19, 21, 32, 33],
+                    Weapon::Shock => &[0, 48, 52, 53, 54, 60, 61],
+                    Weapon::Pulse => &[402, 403, 404, 405, 406, 407, 408, 409, 410, 411],
+                    Weapon::Ripper => &[274, 276, 301, 346],
+                    Weapon::Minigun => &[513, 517, 519, 522, 524, 529],
+                    Weapon::Flak => &[20, 269],
+                    Weapon::Rocket => &[268, 269, 293],
+                    Weapon::Sniper => &[24, 39, 45, 46, 47, 49],
+                    Weapon::Redeemer => &[31, 34, 38, 40, 45, 47],
+                    Weapon::Translocator => &[226, 308, 309, 310, 316, 321],
+                    Weapon::Enforcer => &[369, 370, 374, 375, 376],
+                };
                 if weapon == Weapon::Enforcer && package.name(export.name).ok() == Some("AutoML") {
                     // Opposite corners of the front barrel opening in the GOTY view mesh.
                     weapon_assets.muzzle_triangle = mesh

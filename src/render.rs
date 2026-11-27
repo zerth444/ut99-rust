@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use crate::game::{
+    Weapon,
     deathmatch::Marker,
     decals::MODULATED,
     shock::{self, Visual},
@@ -136,6 +137,40 @@ impl View {
             offset.dot(self.up),
             offset.dot(self.forward),
         )
+    }
+
+    fn attach_muzzle(
+        &self,
+        map: &Map,
+        muzzle: Option<(Weapon, Vec3)>,
+        weapon: Weapon,
+        point: Vec3,
+        zoom: f32,
+        age: Option<f32>,
+    ) -> Vec3 {
+        let Some((_, local)) = muzzle.filter(|&(held, local)| held == weapon && local.0 > NEAR)
+        else {
+            return point;
+        };
+        let weight = age.map_or(1.0, |age| (1.0 - age / 0.07).clamp(0.0, 1.0));
+        let depth = self.point(point).2;
+        if weight == 0.0 || !(NEAR..=160.0).contains(&depth) {
+            return point;
+        }
+        let anchor = self.muzzle_at(local, depth, zoom);
+        let corrected = point + (anchor - point) * weight;
+        if map.collision.ray(self.eye, corrected - self.eye).is_some() {
+            point
+        } else {
+            corrected
+        }
+    }
+
+    fn muzzle_at(&self, local: Vec3, depth: f32, zoom: f32) -> Vec3 {
+        // The first-person mesh is drawn at zoom 1. Keep its screen ray
+        // under the visible muzzle even when the world uses a different FOV.
+        let scale = depth / (local.0 * zoom);
+        self.eye + self.forward * depth + (self.right * local.1 + self.up * local.2) * scale
     }
 }
 
@@ -544,9 +579,26 @@ impl Frame {
         );
         self.layer(Layer::World);
         let view = self.camera_view(camera);
+        let zoom = self.zoom;
+        let gun = (!piloting
+            && !dead
+            && !game.finished
+            && end_camera.is_none()
+            && !player.zoomed()
+            && player.has_weapon())
+        .then(|| map.arsenal.get(&player.weapon))
+        .flatten()
+        .map(|art| (art, player.weapon_pose(art, game.time)));
+        let muzzle = gun
+            .and_then(|(art, pose)| art.muzzle_position(pose))
+            .map(|point| (player.weapon, point));
+        let attach = |weapon, point, age| view.attach_muzzle(map, muzzle, weapon, point, zoom, age);
         self.draw_flags(map, &view, game.time, game.flag_models(map, body_blend));
         self.draw_control_points(map, &view, game.time, game.control_owners());
-        for (position, direction, pose) in game.translocator_modules(map) {
+        for (position, direction, pose, launch) in game.translocator_modules(map) {
+            let position = launch.map_or(position, |age| {
+                attach(Weapon::Translocator, position, Some(age))
+            });
             let model = view.in_model(position, direction, 1.0);
             self.draw_lit_faces(
                 pose.current,
@@ -656,11 +708,16 @@ impl Frame {
             .visuals(&map.ordnance, game.time, |visual| {
                 self.draw_world_effect(&view, game.time, visual);
             });
-        self.draw_shock(map, &view, &game.shock, game.time);
+        self.draw_shock(map, &view, &game.shock, game.time, |point, age| {
+            attach(Weapon::Shock, point, age)
+        });
         for &effect in &game.hammer_effects {
             self.effect(camera, effect);
         }
-        for beam in game.pulse_beams(map, (!piloting && !dead).then_some(camera)) {
+        for mut beam in game.pulse_beams(map, (!piloting && !dead).then_some(camera)) {
+            if beam.local {
+                beam.start = attach(Weapon::Pulse, beam.start, None);
+            }
             self.draw_pulse_beam(map, &view, &beam, game.time);
         }
         if game.show_decals {
@@ -747,7 +804,13 @@ impl Frame {
                 },
             );
         }
-        for (kind, position, direction, age, scale, surface_age) in game.bolts() {
+        for (kind, mut position, direction, age, scale, surface_age, local) in game.bolts() {
+            if local
+                && surface_age.is_none()
+                && let Some(weapon) = kind.launch_weapon()
+            {
+                position = attach(weapon, position, Some(age));
+            }
             let art = &map.ordnance[kind as usize];
             let direction = if direction.dot(direction) > 0.01 {
                 direction
@@ -812,11 +875,7 @@ impl Frame {
         self.zoom = 1.0;
         self.roll = 0.0;
         if player.health > 0 && player.has_weapon() && !game.finished && end_camera.is_none() {
-            if !player.zoomed()
-                && !piloting
-                && let Some(weapon) = map.arsenal.get(&player.weapon)
-            {
-                let pose = player.weapon_pose(weapon, game.time);
+            if let Some((weapon, pose)) = gun {
                 let skin = if player.amp_left(game.time) > 0.0 {
                     map.powerups.amp_skin.as_deref()
                 } else if player.invis_left(game.time) > 0.0 {
@@ -963,6 +1022,15 @@ impl Frame {
         self.draw(map, camera, time);
         self.layer(Layer::Effects);
         let view = self.camera_view(camera);
+        let zoom = self.zoom;
+        let gun = (guided_camera.is_none() && game.death.is_none() && !game.scoped())
+            .then(|| map.arsenal.get(&game.weapon))
+            .flatten()
+            .map(|art| (art, game.pose(art)));
+        let muzzle = gun
+            .and_then(|(art, pose)| art.muzzle_position(pose))
+            .map(|point| (game.weapon, point));
+        let attach = |weapon, point, age| view.attach_muzzle(map, muzzle, weapon, point, zoom, age);
         if game.show_decals {
             for mark in game.decals.visible() {
                 self.draw_faces_in_view(mark, &view, time, false, None, None);
@@ -991,8 +1059,15 @@ impl Frame {
             }
         }
         let mut draw_effect = |visual| self.draw_world_effect(&view, time, visual);
-        game.ordnance
-            .visuals(&map.ordnance, game.time, &mut draw_effect);
+        game.ordnance.visuals(
+            &map.ordnance,
+            game.time,
+            |kind, point, age| {
+                kind.launch_weapon()
+                    .map_or(point, |weapon| attach(weapon, point, Some(age)))
+            },
+            &mut draw_effect,
+        );
         game.ballistics
             .visuals(&map.ballistics, game.time, &mut draw_effect);
         if let Some(death) = &game.death {
@@ -1010,17 +1085,17 @@ impl Frame {
         for effect in game.visible_effects() {
             self.effect(camera, effect);
         }
-        self.draw_shock(map, &view, &game.shock, time);
+        self.draw_shock(map, &view, &game.shock, time, |point, age| {
+            attach(Weapon::Shock, point, age)
+        });
         if let Some(beam) = &game.pulse_beam {
-            self.draw_pulse_beam(map, &view, beam, time);
+            let mut beam = *beam;
+            beam.start = attach(Weapon::Pulse, beam.start, None);
+            self.draw_pulse_beam(map, &view, &beam, time);
         }
         self.zoom = 1.0;
         self.roll = 0.0;
-        if guided_camera.is_none()
-            && game.death.is_none()
-            && !game.scoped()
-            && let Some(weapon) = map.arsenal.get(&game.weapon)
-        {
+        if let Some((weapon, pose)) = gun {
             let skin = if game.damage_amp_active() {
                 map.powerups.amp_skin.as_deref()
             } else if game.invisible() {
@@ -1030,7 +1105,7 @@ impl Frame {
             };
             self.draw_weapon_view(
                 weapon,
-                game.pose(weapon),
+                pose,
                 time,
                 (game.muzzle > game.time).then_some(game.shots as usize),
                 skin,
@@ -1064,9 +1139,16 @@ impl Frame {
         }
     }
 
-    fn draw_shock(&mut self, map: &Map, view: &View, shots: &shock::Shots, time: f32) {
+    fn draw_shock(
+        &mut self,
+        map: &Map,
+        view: &View,
+        shots: &shock::Shots,
+        time: f32,
+        attach: impl Fn(Vec3, Option<f32>) -> Vec3,
+    ) {
         if let Some(assets) = shock::assets(map) {
-            shots.visuals(assets, time, |visual| match visual {
+            shots.visuals(assets, time, attach, |visual| match visual {
                 Visual::Sprite {
                     position,
                     image,
@@ -2191,5 +2273,101 @@ fn project(vertex: Vertex, width: usize, height: usize, zoom: f32) -> Vertex {
         ),
         u: vertex.u * inverse_depth,
         v: vertex.v * inverse_depth,
+    }
+}
+
+#[cfg(test)]
+mod muzzle_tests {
+    use super::*;
+    use crate::game::deathmatch::{Match, Mode, Rules};
+    use crate::package::Package;
+
+    #[test]
+    #[ignore = "requires the reference-client game and maps"]
+    fn installed_modes_share_the_animated_muzzle_projection() {
+        let maps = Path::new("local/reference-client/Maps");
+        let mut paths = std::fs::read_dir(maps)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "unr"))
+            .collect::<Vec<_>>();
+        let reference = maps.join("CTF-Face.unr");
+        paths.sort_by_key(|path| {
+            let name = path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            (path != &reference, !name.starts_with("ctf-"), name)
+        });
+        let mut configurations = 0;
+        for path in paths {
+            let name = path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            let modes = Mode::ALL
+                .into_iter()
+                .filter(|mode| name.starts_with(mode.map_prefix()))
+                .collect::<Vec<_>>();
+            if modes.is_empty() {
+                continue;
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            let map = Map::load(&Package::read(&bytes).unwrap(), Some(&path)).unwrap();
+            let camera = Camera {
+                position: Vec3(0.0, 0.0, 25_000.0),
+                yaw: 1.4,
+                pitch: 0.3,
+            };
+            let view = View::camera(&camera);
+            for mode in modes {
+                let mut game = Match::new(
+                    &map,
+                    0,
+                    Rules {
+                        mode,
+                        bots: 0,
+                        ..Rules::default()
+                    },
+                );
+                for weapon in Weapon::ALL {
+                    let player = &mut game.fighters[0];
+                    player.weapon = weapon;
+                    let art = &map.arsenal[&weapon];
+                    let idle = player.weapon_pose(art, game.time);
+                    let poses = [
+                        Some(idle),
+                        art.primary_motion.sample(0.0),
+                        art.alternate_motion.sample(0.0),
+                    ];
+                    for pose in poses.into_iter().flatten() {
+                        let muzzle = art.muzzle_position(pose).unwrap_or_else(|| {
+                            panic!("{name} {mode:?} {weapon:?} has no animated muzzle")
+                        });
+                        let expected = Vec3(muzzle.1 / muzzle.0, muzzle.2 / muzzle.0, 0.0);
+                        for fov in [80.0_f32, 95.0, 110.0] {
+                            let zoom = (0.5 * fov.to_radians()).tan().recip();
+                            let visible = view.muzzle_at(muzzle, 20.0, zoom);
+                            let p = view.point(visible);
+                            assert!(
+                                (p.0 * zoom / p.2 - expected.0).abs() < 0.0002,
+                                "{name} {mode:?} {weapon:?} horizontal muzzle mismatch"
+                            );
+                            assert!(
+                                (p.1 * zoom / p.2 - expected.1).abs() < 0.0002,
+                                "{name} {mode:?} {weapon:?} vertical muzzle mismatch"
+                            );
+                        }
+                    }
+                }
+                configurations += 1;
+            }
+        }
+        assert!(configurations >= 141);
+        eprintln!(
+            "Verified all weapon muzzle projections in {configurations} map/mode combinations"
+        );
     }
 }
