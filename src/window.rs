@@ -1109,13 +1109,14 @@ unsafe fn message_loop(
                         audio.play(std::sync::Arc::clone(sound));
                     }
                 }
-                if !foot_zone.water
-                    && let Some(speed) = movement_audio.landing
-                    && let Some(sound) = &map.player_audio.land
-                {
-                    let intensity = (speed / map.collision.profile.jump_speed.max(1.0)).powi(2);
-                    if intensity > 0.1 {
-                        audio.play_with_gain(std::sync::Arc::clone(sound), intensity.min(1.0));
+                if let Some(speed) = movement_audio.landing {
+                    for (sound, gain) in map.player_audio.landing(
+                        &map.player_audio,
+                        speed,
+                        map.collision.profile.jump_speed,
+                        foot_zone.water,
+                    ) {
+                        audio.play_with_gain(sound, gain);
                     }
                 }
                 audio.play_events(sound_events);

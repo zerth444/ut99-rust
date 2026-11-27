@@ -743,7 +743,8 @@ impl Frame {
         for (id, fighter) in game.fighters.iter().enumerate().skip(usize::from(
             !piloting && !dead && game.result_camera(map).is_none(),
         )) {
-            if let Some(pose) = fighter.pose(map, id, game.time) {
+            let animation_lag = (1.0 - body_blend) / 120.0;
+            if let Some((pose, tween)) = fighter.rendered_pose(map, id, game.time, animation_lag) {
                 let cloak = fighter.health > 0
                     && fighter.invis_left(game.time) > 0.0
                     && game.time - fighter.fired_at > 0.42;
@@ -777,6 +778,7 @@ impl Frame {
                     skin,
                     palette,
                     None,
+                    tween,
                 );
             }
         }
@@ -1144,6 +1146,7 @@ impl Frame {
             skin,
             None,
             Some(&lighting),
+            None,
         );
         self.zoom = 1.0;
     }
@@ -1954,7 +1957,7 @@ impl Frame {
         skin: Option<&crate::texture::Texture>,
     ) {
         self.draw_model_faces(
-            faces, view, time, sky, pose, glow, lights, mover, skin, None, None,
+            faces, view, time, sky, pose, glow, lights, mover, skin, None, None, None,
         );
     }
 
@@ -1972,6 +1975,7 @@ impl Frame {
         skin: Option<&crate::texture::Texture>,
         palette: Option<(&[usize], &crate::props::characters::Skin)>,
         weapon_lighting: Option<&WeaponLighting<'_>>,
+        actor_tween: Option<(crate::game::Pose<'_>, f32)>,
     ) {
         let mut transformed = Vec::new();
         let mut clipped = Vec::new();
@@ -1997,19 +2001,21 @@ impl Frame {
             if flags & 1 != 0 || (sky && flags & 0x80 != 0) {
                 continue;
             }
-            let next = pose.filter(|pose| pose.fraction > 0.0).and_then(|pose| {
-                let id = face.mesh_triangle?;
-                let index = pose
-                    .next
-                    .binary_search_by_key(&Some(id), |face| face.mesh_triangle)
-                    .ok()?;
-                Some((&pose.next[index], pose.fraction))
+            let pose = pose
+                .filter(|pose| pose.fraction > 0.0)
+                .map(|pose| {
+                    pose_face(pose.next, face.mesh_triangle)
+                        .map_or((face, face, 0.0), |next| (face, next, pose.fraction))
+                })
+                .unwrap_or((face, face, 0.0));
+            let previous = actor_tween.and_then(|(previous, blend)| {
+                let current = pose_face(previous.current, face.mesh_triangle)?;
+                let next = pose_face(previous.next, face.mesh_triangle).unwrap_or(current);
+                Some(((current, next, previous.fraction), blend))
             });
             let position =
-                |i: usize, p: Vec3| next.map_or(p, |(face, t)| p + (face.vertices[i] - p) * t);
-            let normal = next.map_or(face.normal, |(next, t)| {
-                face.normal + (next.normal - face.normal) * t
-            });
+                |i: usize, _: Vec3| tween_face(pose, previous, |frame| frame.vertices[i]);
+            let normal = tween_face(pose, previous, |frame| frame.normal);
             if flags & 0x100 == 0 && (view.eye - position(0, face.vertices[0])).dot(normal) < 0.0 {
                 continue;
             }
@@ -2395,6 +2401,32 @@ fn clip_near(vertices: &[Vertex], clipped: &mut Vec<Vertex>) {
 
 fn focal_length(width: usize, height: usize) -> f32 {
     (width as f32).max(height as f32 * (16.0 / 9.0)) * 0.48
+}
+
+type FacePose<'a> = (&'a Face, &'a Face, f32);
+
+fn tween_face(
+    pose: FacePose<'_>,
+    previous: Option<(FacePose<'_>, f32)>,
+    sample: impl Fn(&Face) -> Vec3,
+) -> Vec3 {
+    let interpolate = |(a, b, fraction): FacePose<'_>| {
+        let start = sample(a);
+        start + (sample(b) - start) * fraction
+    };
+    let target = interpolate(pose);
+    previous.map_or(target, |(from, fraction)| {
+        let origin = interpolate(from);
+        origin + (target - origin) * fraction
+    })
+}
+
+fn pose_face(faces: &[Face], id: Option<usize>) -> Option<&Face> {
+    let id = id?;
+    let index = faces
+        .binary_search_by_key(&Some(id), |face| face.mesh_triangle)
+        .ok()?;
+    faces.get(index)
 }
 
 fn weapon_bob(weapon: &crate::game::WeaponAssets, walk: Vec3) -> Vec3 {

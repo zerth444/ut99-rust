@@ -143,8 +143,11 @@ pub struct Fighter {
     stride_time: f32,
     gait: Gait,
     previous_body: (Vec3, f32),
+    body_yaw: f32,
+    turn_velocity: f32,
+    animation_tween: Option<(BodyFrame, f32)>,
     previous_stair_offset: f32,
-    gait_transition: Option<(Gait, f32)>,
+    gait_transition: Option<f32>,
     protected_until: f32,
     ready_at: f32,
     liquid: LiquidState,
@@ -172,6 +175,9 @@ impl Fighter {
             character_name: None,
             spoken_at: f32::NEG_INFINITY,
             previous_body: (walker.position, start.yaw),
+            body_yaw: start.yaw,
+            turn_velocity: 0.0,
+            animation_tween: None,
             previous_stair_offset: 0.0,
             gait_transition: None,
             walker,
@@ -428,8 +434,31 @@ impl Fighter {
     }
 
     fn capture_body(&mut self) {
-        self.previous_body = (self.walker.position, self.yaw);
+        self.body_yaw = self.yaw;
+        self.turn_velocity = 0.0;
+        self.animation_tween = None;
+        self.snapshot_body();
+    }
+
+    fn snapshot_body(&mut self) {
+        self.previous_body = (self.walker.position, self.body_yaw);
         self.previous_stair_offset = self.walker.stair_offset();
+    }
+
+    fn turn_body(&mut self, local: bool, dt: f32) {
+        if local {
+            self.body_yaw = self.yaw;
+            return;
+        }
+        let remaining = angle_delta(self.yaw, self.body_yaw);
+        let desired = (remaining * 10.0).clamp(-4.8, 4.8);
+        self.turn_velocity += (desired - self.turn_velocity) * (1.0 - (-14.0 * dt).exp());
+        let step = self.turn_velocity * dt;
+        self.body_yaw = if step.signum() == remaining.signum() && step.abs() >= remaining.abs() {
+            self.yaw
+        } else {
+            (self.body_yaw + step).rem_euclid(std::f32::consts::TAU)
+        };
     }
 
     pub(crate) fn body_transform(&self, blend: f32) -> (Vec3, f32) {
@@ -438,7 +467,7 @@ impl Fighter {
             + (self.walker.stair_offset() - self.previous_stair_offset) * blend;
         (
             position + (self.walker.position - position) * blend + Vec3(0.0, 0.0, stairs * 0.4),
-            yaw + angle_delta(self.yaw, yaw) * blend,
+            yaw + angle_delta(self.body_yaw, yaw) * blend,
         )
     }
 
@@ -447,14 +476,14 @@ impl Fighter {
         let velocity = self.walker.velocity();
         let speed = velocity.0.hypot(velocity.1);
         self.stride_time += dt * (speed / 285.0).clamp(0.0, 2.0);
-        if let Some((_, age)) = &mut self.gait_transition {
+        if let Some(age) = &mut self.gait_transition {
             *age += dt;
             if *age < 0.1 {
                 return;
             }
             self.gait_transition = None;
         }
-        let (sin, cos) = self.yaw.sin_cos();
+        let (sin, cos) = self.body_yaw.sin_cos();
         let forward = velocity.dot(Vec3(cos, sin, 0.0));
         let side = velocity.dot(Vec3(-sin, cos, 0.0));
         let strafe = Gait::Strafe(usize::from(side > 0.0));
@@ -476,7 +505,7 @@ impl Fighter {
             Gait::Run
         };
         if self.gait != previous {
-            self.gait_transition = Some((previous, 0.0));
+            self.gait_transition = Some(0.0);
         }
     }
 
@@ -496,79 +525,138 @@ impl Fighter {
             .map_or(&map.player_audio, |(_, model)| &model.audio)
     }
 
-    pub(crate) fn pose<'a>(&self, map: &'a Map, id: usize, time: f32) -> Option<Pose<'a>> {
-        let (deaths, idle, clips) = self.character(map).map_or(
-            (&map.player_deaths, &map.player_idle, &map.player_clips),
-            |(_, model)| (&model.deaths, &model.idle, &model.clips),
-        );
-        if let Some(death) = self.fell_at {
+    fn body_frame(&self, map: &Map, id: usize, time: f32) -> Option<BodyFrame> {
+        use BodyClip::*;
+        let clips = self
+            .character(map)
+            .map_or(&map.player_clips, |(_, model)| &model.clips);
+        let (clip, age) = if let Some(at) = self.fell_at {
             if self.gibbed {
                 return None;
             }
-            let clip = (self.decapitated)
-                .then(|| self.character(map).map(|(_, model)| &model.decapitation))
-                .flatten()
-                .filter(|clip| !clip.frames.is_empty())
-                .unwrap_or(&deaths[id % deaths.len()]);
-            return clip
-                .sample((time - death).min((clip.duration() - 0.001).max(0.0)))
-                .or_else(|| idle.sample(0.0));
-        }
-        let firing = time - self.fired_at;
-        let hurt = time - self.hurt_at;
-        let landed = time - self.landed_at;
-        let (clip, age) = if map.collision.regions.at(self.walker.position).water {
-            (&clips.swim, time)
-        } else if hurt < 0.12 && clips.hurt.duration() > 0.0 {
-            return clips.hurt.sample(hurt.min(clips.hurt.duration() - 0.001));
+            (Death(id % 3), time - at)
+        } else if map.collision.regions.at(self.walker.position).water {
+            (Swim, time)
+        } else if time - self.hurt_at < 0.12 && !clips.hurt.frames.is_empty() {
+            (Hurt, time - self.hurt_at)
         } else if !self.walker.grounded {
-            let age = self.airborne_since.map_or(0.0, |started| time - started);
-            return clips
-                .air
-                .sample(age.min((clips.air.duration() - 0.001).max(0.0)))
-                .or_else(|| idle.sample(0.0));
-        } else if landed < 0.13 && clips.land.duration() > 0.0 {
-            return clips.land.sample(landed.min(clips.land.duration() - 0.001));
+            (
+                Air,
+                self.airborne_since.map_or(0.0, |started| time - started),
+            )
+        } else if time - self.landed_at < 0.13 && !clips.land.frames.is_empty() {
+            (Land, time - self.landed_at)
         } else {
             match self.gait {
-                Gait::Idle if firing < clips.fire.duration() => return clips.fire.sample(firing),
-                Gait::Walk | Gait::Run if firing < 0.27 && !clips.fire_run.frames.is_empty() => {
-                    (&clips.fire_run, self.stride_time)
+                Gait::Idle if time - self.fired_at < clips.fire.duration() => {
+                    (Fire, time - self.fired_at)
                 }
-                gait => {
-                    let current = self.gait_pose(map, gait, time)?;
-                    if let Some((from, age)) = self.gait_transition
-                        && let Some(previous) = self.gait_pose(map, from, time)
-                    {
-                        return Some(Pose {
-                            current: previous.current,
-                            next: current.current,
-                            fraction: (age / 0.1).clamp(0.0, 1.0),
-                        });
-                    }
-                    return Some(current);
+                Gait::Walk | Gait::Run
+                    if time - self.fired_at < 0.27 && !clips.fire_run.frames.is_empty() =>
+                {
+                    (FireRun, self.stride_time)
                 }
+                gait => (
+                    Move(gait),
+                    if gait == Gait::Idle {
+                        time
+                    } else {
+                        self.stride_time
+                    },
+                ),
             }
         };
-        clip.sample_loop(age).or_else(|| idle.sample(0.0))
+        Some(BodyFrame {
+            clip,
+            age: age.max(0.0),
+        })
     }
 
-    fn gait_pose<'a>(&self, map: &'a Map, gait: Gait, time: f32) -> Option<Pose<'a>> {
-        let (idle, clips) = self
-            .character(map)
-            .map_or((&map.player_idle, &map.player_clips), |(_, model)| {
-                (&model.idle, &model.clips)
-            });
-        let clip = match gait {
-            Gait::Idle => return idle.sample_loop(time),
-            Gait::Strafe(side) => &clips.strafe[side],
-            Gait::Backpedal => &clips.backpedal,
-            Gait::Walk => &clips.walk,
-            Gait::Run => &clips.run,
+    fn sample_body<'a>(&self, map: &'a Map, frame: BodyFrame) -> Option<Pose<'a>> {
+        use BodyClip::*;
+        let character = self.character(map);
+        let (deaths, idle, clips) = character.map_or(
+            (&map.player_deaths, &map.player_idle, &map.player_clips),
+            |(_, model)| (&model.deaths, &model.idle, &model.clips),
+        );
+        let (clip, looping) = match frame.clip {
+            Death(index) => {
+                let decapitation = character
+                    .filter(|(_, model)| self.decapitated && !model.decapitation.frames.is_empty())
+                    .map(|(_, model)| &model.decapitation);
+                (decapitation.unwrap_or(&deaths[index]), false)
+            }
+            Swim => (&clips.swim, true),
+            Hurt => (&clips.hurt, false),
+            Air => (&clips.air, false),
+            Land => (&clips.land, false),
+            Fire => (&clips.fire, false),
+            FireRun => (&clips.fire_run, true),
+            Move(gait) => (
+                match gait {
+                    Gait::Idle => idle,
+                    Gait::Strafe(side) => &clips.strafe[side],
+                    Gait::Backpedal => &clips.backpedal,
+                    Gait::Walk => &clips.walk,
+                    Gait::Run => &clips.run,
+                },
+                true,
+            ),
         };
-        clip.sample_loop(self.stride_time)
-            .or_else(|| idle.sample_loop(time))
+        let sampled = if looping {
+            clip.sample_loop(frame.age)
+        } else {
+            clip.sample(frame.age.min((clip.duration() - 0.001).max(0.0)))
+        };
+        sampled.or_else(|| idle.sample(0.0))
     }
+
+    fn update_animation(&mut self, map: &Map, id: usize, before: Option<BodyFrame>, time: f32) {
+        if let Some(before) = before
+            && let Some(after) = self.body_frame(map, id, time)
+            && before.clip != after.clip
+        {
+            self.animation_tween = Some((before, time));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pose<'a>(&self, map: &'a Map, id: usize, time: f32) -> Option<Pose<'a>> {
+        self.sample_body(map, self.body_frame(map, id, time)?)
+    }
+
+    pub(crate) fn rendered_pose<'a>(
+        &self,
+        map: &'a Map,
+        id: usize,
+        time: f32,
+        dt: f32,
+    ) -> Option<(Pose<'a>, Option<(Pose<'a>, f32)>)> {
+        let pose = self.sample_body(map, self.body_frame(map, id, time)?)?;
+        let previous = self.animation_tween.and_then(|(frame, started)| {
+            let age = (time - started - dt).max(0.0);
+            (age < 0.12).then_some((self.sample_body(map, frame)?, age / 0.12))
+        });
+        Some((pose, previous))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BodyClip {
+    Move(Gait),
+    Swim,
+    Hurt,
+    Air,
+    Land,
+    Fire,
+    FireRun,
+    Death(usize),
+}
+
+#[derive(Clone, Copy)]
+struct BodyFrame {
+    clip: BodyClip,
+    age: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2187,9 +2275,17 @@ impl Match {
                 self.add_fighter(map);
             }
         }
-        for fighter in &mut self.fighters {
-            fighter.capture_body();
-        }
+        let previous_animation: Vec<_> = self
+            .fighters
+            .iter_mut()
+            .enumerate()
+            .map(|(id, fighter)| {
+                fighter.snapshot_body();
+                fighter
+                    .body_frame(map, id, self.time - dt)
+                    .map(|frame| (fighter.deaths, frame))
+            })
+            .collect();
         self.traces.retain(|trace| trace.expires > self.time);
         self.hammer_effects
             .retain(|effect| effect.expires > self.time);
@@ -2332,6 +2428,7 @@ impl Match {
             }
             fighter.yaw = (fighter.yaw + input.look[0]).rem_euclid(std::f32::consts::TAU);
             fighter.pitch = (fighter.pitch + input.look[1]).clamp(-1.48, 1.48);
+            fighter.turn_body(id == 0, dt);
             let aim = fighter.camera(map);
             let [forward, strafe] = input.movement;
             if id == 0 && self.cheats.flight != Flight::Walk {
@@ -2423,19 +2520,14 @@ impl Match {
                         impulse: Vec3::default(),
                     });
                 }
-                let gain = (speed / map.collision.profile.jump_speed.max(1.0))
-                    .powi(2)
-                    .min(1.0);
-                sounds.extend_at(
-                    actor_audio
-                        .land
-                        .as_ref()
-                        .or(map.player_audio.land.as_ref())
-                        .cloned(),
-                    fighter.walker.position,
-                    620.0,
-                    gain,
-                );
+                let wet = map
+                    .collision
+                    .regions
+                    .at(fighter.walker.position - Vec3(0.0, 0.0, PLAYER_HEIGHT))
+                    .water;
+                for (wave, gain) in actor_audio.landing(&map.player_audio, speed, base_jump, wet) {
+                    sounds.extend_at(Some(wave), fighter.walker.position, 1000.0, gain);
+                }
             }
             if motion.landing.is_some() || swimming {
                 fighter.power.boosted_airborne = false;
@@ -2562,6 +2654,15 @@ impl Match {
         self.advance_warhead_waves(map, dt, &mut hits, &mut sounds);
         for hit in hits {
             self.apply_hit(map, hit, &mut sounds);
+        }
+        for (id, (fighter, before)) in self.fighters.iter_mut().zip(previous_animation).enumerate()
+        {
+            if let Some((deaths, frame)) = before
+                && (deaths == fighter.deaths || fighter.fell_at.is_some())
+                && (!matches!(frame.clip, BodyClip::Death(_)) || fighter.fell_at.is_some())
+            {
+                fighter.update_animation(map, id, Some(frame), self.time);
+            }
         }
         if let Some(event) = self.dm_training.as_mut().and_then(|training| {
             training.step(map, &self.fighters[0], command, self.time, dt, &mut sounds)
@@ -6612,6 +6713,56 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the local GOTY assets"]
+    fn walking_jump_plays_contact_only_on_touchdown() {
+        let (mut map, mut game) = flight_fixture();
+        game.fighters.truncate(1);
+        let audio = game.fighters[0].actor_audio(&map);
+        let jump = audio
+            .jump
+            .as_ref()
+            .or(map.player_audio.jump.as_ref())
+            .unwrap()
+            .clone();
+        let floor = audio
+            .land
+            .as_ref()
+            .or(map.player_audio.land.as_ref())
+            .unwrap()
+            .clone();
+        let launch = game.step(
+            &mut map,
+            Command {
+                jump: true,
+                ..Command::default()
+            },
+            1.0 / 120.0,
+        );
+        assert!(
+            launch
+                .waves()
+                .any(|wave| std::sync::Arc::ptr_eq(wave, &jump))
+        );
+        assert!(
+            !launch
+                .waves()
+                .any(|wave| std::sync::Arc::ptr_eq(wave, &floor))
+        );
+        for _ in 0..120 {
+            let sounds = game.step(&mut map, Command::default(), 1.0 / 120.0);
+            let contact = sounds
+                .waves()
+                .any(|wave| std::sync::Arc::ptr_eq(wave, &floor));
+            if contact {
+                assert!(game.fighters[0].walker.grounded);
+                return;
+            }
+            assert!(!game.fighters[0].walker.grounded);
+        }
+        panic!("jump did not play its ground contact");
+    }
+
+    #[test]
     #[ignore = "requires local GOTY assets"]
     fn shock_combo_gibs_and_stock_kill_announcements_apply_through_match_damage() {
         let (map, mut game) = flight_fixture();
@@ -10541,6 +10692,7 @@ mod tests {
             .unwrap();
         let mut pawn = Fighter::spawn(&map, start, 0.0);
         pawn.yaw = 0.0;
+        pawn.capture_body();
         let pose = |pawn: &Fighter, clip: &super::super::Motion, time| {
             assert!(std::ptr::eq(
                 pawn.pose(&map, 1, time).unwrap().current,
@@ -10556,12 +10708,12 @@ mod tests {
         pawn.update_gait(0.0);
         pose(&pawn, &map.player_clips.fire_run, 0.0);
         pawn.update_gait(0.05);
-        let transition = pawn.pose(&map, 1, 1.0).unwrap();
-        assert_eq!(transition.fraction, 0.5);
-        assert!(std::ptr::eq(
-            transition.next,
-            pawn.gait_pose(&map, Gait::Run, 1.0).unwrap().current
-        ));
+        let previous = pawn.body_frame(&map, 1, 0.0);
+        pawn.update_animation(&map, 1, previous, 1.0);
+        let (current, transition) = pawn.rendered_pose(&map, 1, 1.06, 0.0).unwrap();
+        let (previous, weight) = transition.unwrap();
+        assert!((weight - 0.5).abs() < 0.001);
+        assert!(!std::ptr::eq(previous.current, current.current));
         pawn.update_gait(0.05);
         assert!(pawn.gait_transition.is_none());
         pawn.hurt_at = 1.0;
@@ -10572,10 +10724,23 @@ mod tests {
         pawn.capture_body();
         let origin = pawn.walker.position;
         pawn.yaw = 0.04;
+        pawn.turn_body(true, 1.0 / 120.0);
         pawn.walker.position = origin + Vec3(12.0, 0.0, 0.0);
         let (midpoint, angle) = pawn.body_transform(0.5);
         assert_eq!(midpoint.0, origin.0 + 6.0);
         assert!(angle_delta(angle, 0.0).abs() < 0.001);
+
+        pawn.capture_body();
+        let start = pawn.body_yaw;
+        pawn.yaw += 2.8;
+        pawn.turn_body(false, 1.0 / 120.0);
+        assert!(angle_delta(pawn.body_yaw, start).abs() < 0.04);
+        for _ in 0..240 {
+            let before = pawn.body_yaw;
+            pawn.turn_body(false, 1.0 / 120.0);
+            assert!(angle_delta(pawn.body_yaw, before).abs() <= 0.041);
+        }
+        assert!(angle_delta(pawn.yaw, pawn.body_yaw).abs() < 0.01);
     }
 
     #[test]

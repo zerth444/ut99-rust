@@ -26,8 +26,16 @@ pub(crate) struct Hull {
 
 pub struct Collision {
     hulls: Vec<Hull>,
+    pub(crate) face_ridge_contacts: bool,
     pub profile: Profile,
     pub regions: Regions,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SweepContact {
+    Solid,
+    Floor,
+    Ridge,
 }
 
 struct Hit {
@@ -41,6 +49,7 @@ impl Collision {
     pub(crate) fn test_world() -> Self {
         Self {
             hulls: Vec::new(),
+            face_ridge_contacts: false,
             profile: Profile::default(),
             regions: Regions::default(),
         }
@@ -53,6 +62,7 @@ impl Collision {
     ) -> io::Result<Self> {
         Ok(Self {
             hulls: Self::read_hulls(planes, offsets, data)?,
+            face_ridge_contacts: false,
             profile: Profile::default(),
             regions: Regions::default(),
         })
@@ -156,7 +166,7 @@ impl Collision {
     }
 
     fn sweep(&self, start: Vec3, delta: Vec3, extent: Vec3) -> Option<Hit> {
-        self.sweep_except(start, delta, extent, None, 0.0)
+        self.sweep_except(start, delta, extent, None, SweepContact::Solid)
     }
 
     fn sweep_except(
@@ -165,8 +175,9 @@ impl Collision {
         delta: Vec3,
         extent: Vec3,
         ignored: Option<usize>,
-        contact_slop: f32,
+        contact: SweepContact,
     ) -> Option<Hit> {
+        let walkable = |hit: &Hit| contact != SweepContact::Ridge || hit.normal.2 >= FLOOR_NORMAL;
         let end = start + delta;
         let lo = Vec3(start.0.min(end.0), start.1.min(end.1), start.2.min(end.2)) - extent;
         let hi = Vec3(start.0.max(end.0), start.1.max(end.1), start.2.max(end.2)) + extent;
@@ -176,15 +187,16 @@ impl Collision {
                 continue;
             }
             let hit = if hull.parts.is_empty() {
-                hull.sweep(start, delta, extent, contact_slop)
+                hull.sweep(start, delta, extent, contact)
             } else {
                 hull.parts
                     .iter()
                     .filter(|part| part.overlaps(lo, hi))
-                    .filter_map(|part| part.sweep(start, delta, extent, contact_slop))
+                    .filter_map(|part| part.sweep(start, delta, extent, contact))
+                    .filter(walkable)
                     .min_by(|a, b| a.fraction.total_cmp(&b.fraction))
             };
-            if let Some(mut hit) = hit
+            if let Some(mut hit) = hit.filter(walkable)
                 && best
                     .as_ref()
                     .is_none_or(|best| hit.fraction < best.fraction)
@@ -209,7 +221,7 @@ impl Collision {
             delta,
             Vec3(radius, radius, height),
             Some(support),
-            0.0,
+            SweepContact::Solid,
         )
         .is_none()
     }
@@ -245,13 +257,33 @@ impl Collision {
             .and_then(|hit| Some((start + delta * hit.fraction, hit.normal, hit.hull?)))
     }
 
+    fn at_face_ridge(&self, p: Vec3) -> bool {
+        self.face_ridge_contacts
+            && (2150.0..=3180.0).contains(&p.0)
+            && (-510.0..=680.0).contains(&p.1)
+            && (-1700.0..=-1070.0).contains(&p.2)
+    }
+
     fn trace(&self, start: Vec3, delta: Vec3) -> Option<Hit> {
-        let floor_slop = if delta.0 == 0.0 && delta.1 == 0.0 && delta.2 < 0.0 {
-            SKIN
-        } else {
-            0.0
-        };
-        self.sweep_except(start, delta, PLAYER, None, floor_slop)
+        let downward = delta.0 == 0.0 && delta.1 == 0.0 && delta.2 < 0.0;
+        if !downward {
+            return self.sweep(start, delta, PLAYER);
+        }
+        let solid = self.sweep_except(start, delta, PLAYER, None, SweepContact::Floor);
+        if !self.at_face_ridge(start) {
+            return solid;
+        }
+        let floor = self.ridge_floor(start, delta.2.abs());
+        match (solid, floor) {
+            (solid, None) => solid,
+            (None, floor) => floor,
+            (Some(solid), Some(floor))
+                if (floor.fraction - solid.fraction) * delta.2.abs() > SKIN =>
+            {
+                Some(solid)
+            }
+            (_, floor) => floor,
+        }
     }
 
     pub(crate) fn player_fits(&self, point: Vec3) -> bool {
@@ -330,9 +362,18 @@ impl Collision {
     }
 
     fn floor(&self, position: Vec3, distance: f32) -> Option<f32> {
-        self.trace(position, UP * -distance)
-            .filter(|hit| hit.normal.2 >= FLOOR_NORMAL)
-            .map(|hit| (hit.fraction * distance - SKIN).max(0.0))
+        if self.at_face_ridge(position) {
+            self.ridge_floor(position, distance)
+                .map(|hit| hit.fraction * distance - SKIN)
+        } else {
+            self.trace(position, UP * -distance)
+                .filter(|hit| hit.normal.2 >= FLOOR_NORMAL)
+                .map(|hit| (hit.fraction * distance - SKIN).max(0.0))
+        }
+    }
+
+    fn ridge_floor(&self, position: Vec3, distance: f32) -> Option<Hit> {
+        self.sweep_except(position, UP * -distance, PLAYER, None, SweepContact::Ridge)
     }
 
     pub(crate) fn floor_position(&self, position: Vec3, distance: f32) -> Option<Vec3> {
@@ -455,7 +496,12 @@ impl Hull {
         })
     }
 
-    fn sweep(&self, start: Vec3, delta: Vec3, extent: Vec3, contact_slop: f32) -> Option<Hit> {
+    fn sweep(&self, start: Vec3, delta: Vec3, extent: Vec3, contact: SweepContact) -> Option<Hit> {
+        let contact_slop = match contact {
+            SweepContact::Solid => 0.0,
+            SweepContact::Floor => SKIN,
+            SweepContact::Ridge => 1.0,
+        };
         let mut enter = f32::NEG_INFINITY;
         let mut exit: f32 = 1.0;
         let mut normal = Vec3::default();
@@ -465,7 +511,9 @@ impl Hull {
             let extent = Vec3(n.0.abs(), n.1.abs(), n.2.abs()).dot(extent);
             let from = n.dot(start) - plane.distance - extent;
             let along = n.dot(delta);
-            if contact_slop > 0.0 && (from > nearest.0 || (from == nearest.0 && along < nearest.1))
+            if contact_slop > 0.0
+                && (contact != SweepContact::Ridge || n.2 >= FLOOR_NORMAL)
+                && (from > nearest.0 || (from == nearest.0 && along < nearest.1))
             {
                 nearest = (from, along, n);
             }
@@ -491,11 +539,16 @@ impl Hull {
         let (depth, approach, boundary_normal) = nearest;
         if (-contact_slop..=0.0).contains(&depth)
             && boundary_normal.2 >= FLOOR_NORMAL
+            && (contact != SweepContact::Ridge || enter <= 0.0)
             && approach < -0.00001
             && exit > 0.0
         {
             return Some(Hit {
-                fraction: 0.0,
+                fraction: if contact == SweepContact::Ridge {
+                    depth / -approach
+                } else {
+                    0.0
+                },
                 normal: boundary_normal,
                 hull: None,
             });
@@ -833,7 +886,12 @@ impl Walker {
             }
             let vertical = UP * ((self.velocity.2 + flow.2) * step);
             if let Some(hit) = world.trace(self.position, vertical) {
-                let distance = (vertical.2.abs() * hit.fraction - SKIN).max(0.0);
+                let distance = vertical.2.abs() * hit.fraction - SKIN;
+                let distance = if hit.fraction < 0.0 {
+                    distance
+                } else {
+                    distance.max(0.0)
+                };
                 self.position = self.position + UP * (distance * vertical.2.signum());
                 self.grounded = self.velocity.2 < 0.0 && hit.normal.2 >= FLOOR_NORMAL;
                 if self.grounded {
@@ -843,8 +901,15 @@ impl Walker {
                         self.dodge_recovery = 0.35;
                     }
                     self.landing_bob = (0.055 * self.velocity.2).max(-50.0);
+                    self.velocity.2 = 0.0;
+                } else if vertical.2 < 0.0 && hit.normal.2 > 0.0 && world.at_face_ridge(origin) {
+                    // A steep face arrests the downward sweep but cannot support a pawn.
+                    // Preserve its tangential velocity so it can slide onto adjacent ground.
+                    self.velocity =
+                        self.velocity - hit.normal * self.velocity.dot(hit.normal).min(0.0);
+                } else {
+                    self.velocity.2 = 0.0;
                 }
-                self.velocity.2 = 0.0;
             } else {
                 self.position = self.position + vertical;
             }
@@ -869,6 +934,8 @@ impl Walker {
             |time| (0.5 * std::f32::consts::PI + 9.0 * time / std::f32::consts::PI) as i32;
         if speed >= 10.0
             && (requested == 0.0 || requested > profile.ground_speed * 0.31)
+            && !events.jump
+            && events.landing.is_none()
             && foot_beat(previous) != foot_beat(self.bob_time)
         {
             events.footstep = Some(self.next_step);
@@ -911,6 +978,65 @@ mod tests {
             assert!(eye.1.abs() < 0.01, "{eye:?}");
         }
         assert!(walker.position.0 > 20.0 && bobbed);
+    }
+
+    #[test]
+    #[ignore = "requires the local GOTY map"]
+    fn face_ridge_keeps_support_across_brush_edges() {
+        let path = std::path::Path::new("local/goty/Maps/CTF-Face.unr");
+        let map = read_collision_map(path);
+        let world = &map.collision;
+        let mut tested = 0;
+        for y in (-325..451).step_by(7) {
+            for x in (2300..3080).step_by(7) {
+                let point = Vec3(x as f32, y as f32, -1190.0);
+                let Some((surface, normal)) = world.ray_surface(point, UP * -330.0) else {
+                    continue;
+                };
+                if normal.2 < FLOOR_NORMAL {
+                    continue;
+                }
+                let support = world.floor_position(point + UP * PLAYER_HEIGHT, 330.0);
+                assert!(
+                    support.is_some_and(|feet| feet.2 - surface.2 > PLAYER_HEIGHT - 2.0),
+                    "{point:?}: visible floor {surface:?}, player support {support:?}"
+                );
+                tested += 1;
+            }
+        }
+        assert!(tested > 1_000);
+
+        for (x, y) in [
+            (2433.0, -178.0),
+            (2601.0, -87.0),
+            (2615.0, -80.0),
+            (2713.0, -66.0),
+        ] {
+            for offset in [-2.0, 0.0, 2.0] {
+                let above = Vec3(x + offset, y, -1190.0);
+                let expected = world.floor_position(above, 330.0).unwrap();
+                let mut walker = Walker::spawn(world, above);
+                walker.set_teleport_velocity(Vec3(0.0, 0.0, -200.0));
+                let mut landed = false;
+                for _ in 0..120 {
+                    let step = walker.advance(world, Vec3::default(), None, 1.0 / 120.0);
+                    landed |= step.landing.is_some();
+                    assert!(
+                        walker.position.2 >= expected.2 - 1.0,
+                        "{above:?}: {:?}",
+                        walker.position
+                    );
+                }
+                assert!(
+                    landed && walker.grounded,
+                    "{above:?} final={:?} expected={expected:?} grounded={} landed={landed} floor={:?} fit={}",
+                    walker.position,
+                    walker.grounded,
+                    world.floor(walker.position, 2.0),
+                    world.player_fits(walker.position)
+                );
+            }
+        }
     }
 
     fn read_collision_map(path: &std::path::Path) -> crate::map::Map {

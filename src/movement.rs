@@ -48,10 +48,35 @@ pub struct PlayerAudio {
     pub steps: [Option<Arc<Wave>>; 3],
     pub jump: Option<Arc<Wave>>,
     pub land: Option<Arc<Wave>>,
+    pub land_grunt: Option<Arc<Wave>>,
     pub water_step: Option<Arc<Wave>>,
     pub gasp: [Option<Arc<Wave>>; 2],
     pub pain: [Option<Arc<Wave>>; 4],
     pub death: [Option<Arc<Wave>>; 3],
+}
+
+impl PlayerAudio {
+    pub fn landing(
+        &self,
+        defaults: &Self,
+        speed: f32,
+        jump_speed: f32,
+        wet: bool,
+    ) -> impl Iterator<Item = (Arc<Wave>, f32)> {
+        let impact = 0.1 * (speed / jump_speed.max(1.0)).powi(2);
+        let grunt = self
+            .land_grunt
+            .as_ref()
+            .filter(|_| impact > 0.17)
+            .map(|wave| (wave.clone(), (5.0 * impact).min(5.0)));
+        let step = self
+            .land
+            .as_ref()
+            .or(defaults.land.as_ref())
+            .filter(|_| !wet && impact > 0.01)
+            .map(|wave| (wave.clone(), (4.0 * impact).clamp(0.5, 5.0)));
+        grunt.into_iter().chain(step)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
