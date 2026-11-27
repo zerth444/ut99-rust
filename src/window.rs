@@ -935,6 +935,7 @@ unsafe fn message_loop(
             game.show_decals = settings.show_decals;
             let [forward, back, left, right, jump_key, walk, fire, alt_fire] = settings.bindings;
             let mut movement_audio = MotionEvents::default();
+            let mut sound_events = crate::sound::SoundEvents::default();
             let mut boot_jump = false;
             let focused = GetForegroundWindow() == window;
             let controls = focused && !console.open;
@@ -1023,7 +1024,7 @@ unsafe fn message_loop(
                         walker.position,
                         &mut occupied_portal,
                     ) {
-                        arrival.apply(&map.collision, &mut walker, &mut camera.yaw);
+                        arrival.apply(map, &mut walker, &mut camera.yaw, true, &mut sound_events);
                     }
                     if walker.position.2 < kill_z {
                         game.health = 0;
@@ -1045,7 +1046,7 @@ unsafe fn message_loop(
             if let Some(speed) = movement_audio.landing {
                 game.landed(speed, map.collision.profile.jump_speed);
             }
-            let sound_events = game.update(
+            sound_events.append(game.update(
                 map,
                 &camera,
                 dt,
@@ -1058,7 +1059,7 @@ unsafe fn message_loop(
                 },
                 focused && !fly,
                 (!fly && game.health > 0).then_some(&mut walker),
-            );
+            ));
             primary = false;
             alternate = false;
             if game.ordnance.guided_view().is_none()

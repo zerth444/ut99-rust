@@ -1,9 +1,10 @@
 use std::io;
 
-use crate::collision::{Collision, Walker};
-use crate::map::Vec3;
+use crate::collision::Walker;
+use crate::map::{Map, Vec3};
 use crate::mover::read_rotation;
 use crate::package::{Export, Package};
+use crate::sound::{CONTACT_SOUND_RADIUS, SoundEvents};
 
 pub struct Teleporter {
     pub position: Vec3,
@@ -25,7 +26,7 @@ pub fn load(package: &Package<'_>, actors: &[&Export]) -> io::Result<Vec<Telepor
     let mut portals = Vec::new();
     for actor in actors {
         let class = package.object_name(actor.class).unwrap_or_default();
-        if !matches!(class, "Teleporter" | "VisibleTeleporter" | "UTTeleporter") {
+        if !is_teleporter(class) {
             continue;
         }
         let mut portal = Teleporter {
@@ -77,6 +78,10 @@ pub fn load(package: &Package<'_>, actors: &[&Export]) -> io::Result<Vec<Telepor
     Ok(portals)
 }
 
+pub(crate) fn is_teleporter(class: &str) -> bool {
+    matches!(class, "Teleporter" | "VisibleTeleporter" | "UTTeleporter")
+}
+
 fn overlaps(portal: &Teleporter, position: Vec3) -> bool {
     let offset = portal.position - position;
     let radius = portal.radius + 17.0;
@@ -100,7 +105,15 @@ pub struct Arrival<'a> {
 }
 
 impl Arrival<'_> {
-    pub fn apply(self, world: &Collision, walker: &mut Walker, yaw: &mut f32) -> bool {
+    pub fn apply(
+        self,
+        map: &Map,
+        walker: &mut Walker,
+        yaw: &mut f32,
+        local: bool,
+        sounds: &mut SoundEvents,
+    ) -> bool {
+        let world = &map.collision;
         let destination = self.destination;
         let arrival = Walker::spawn(world, destination.position);
         if !world.player_fits(arrival.position) {
@@ -131,6 +144,12 @@ impl Arrival<'_> {
         }
         *walker = arrival;
         walker.set_teleport_velocity(velocity);
+        let sound = map.objective_art.teleport_sound.iter().cloned();
+        if local {
+            sounds.extend(sound);
+        } else {
+            sounds.extend_at(sound, walker.position, CONTACT_SOUND_RADIUS, 1.0);
+        }
         true
     }
 }
@@ -241,20 +260,97 @@ mod tests {
                             && motion.frames[0].iter().any(|face| face.texture.is_some()))
                 );
             }
-            for (position, destination) in links(&map.teleporters) {
+            let audio = map
+                .objective_art
+                .teleport_sound
+                .as_ref()
+                .expect("Botpack Resp2A");
+            for (index, (position, destination)) in links(&map.teleporters).enumerate() {
                 assert_eq!(map.collision.regions.at(position).gravity.2, -950.0);
                 let mut walker = Walker::spawn(&map.collision, position);
                 let mut yaw = 0.25;
                 let mut occupied = None;
                 let arrival =
                     touched(&map.teleporters, position, &mut occupied).expect("stock link");
+                let mut sounds = SoundEvents::default();
+                let local = index % 2 == 0;
                 assert!(
-                    arrival.apply(&map.collision, &mut walker, &mut yaw),
+                    arrival.apply(&map, &mut walker, &mut yaw, local, &mut sounds),
                     "{name} {position:?} -> {destination:?}"
                 );
                 let delta = walker.position - destination;
                 assert!(delta.dot(delta) < 28.0_f32.powi(2));
+                assert_eq!(sounds.len(), 1);
+                assert!(
+                    sounds
+                        .waves()
+                        .all(|wave| std::sync::Arc::ptr_eq(audio, wave))
+                );
+                if local {
+                    assert!(sounds.position_of(audio).is_none());
+                } else {
+                    let offset = sounds.position_of(audio).unwrap() - walker.position;
+                    assert!(offset.dot(offset) < 0.01);
+                }
+                assert!(touched(&map.teleporters, walker.position, &mut occupied).is_none());
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires stock CTF map packages"]
+    fn facing_worlds_draws_its_authored_portal_sprites() {
+        use crate::render::{Camera, Frame};
+        let path = std::path::Path::new("local/reference-client/Maps/CTF-Face.unr");
+        let data = std::fs::read(path).unwrap();
+        let package = Package::read(&data).unwrap();
+        let mut map = Map::load(&package, Some(path)).unwrap();
+        assert_eq!(map.objective_art.torch_sprites.len(), 12);
+        for (position, _) in links(&map.teleporters) {
+            assert!(
+                map.objective_art
+                    .torch_sprites
+                    .iter()
+                    .any(|&(sprite, _, _)| {
+                        let offset = sprite - position;
+                        offset.dot(offset) < 36.0_f32.powi(2)
+                    })
+            );
+        }
+        let (target, texture, _) = &map.objective_art.torch_sprites[0];
+        assert_ne!(texture.image(0.0).bgra(), texture.image(0.19).bgra());
+        let camera = [180.0, 125.0, 90.0]
+            .into_iter()
+            .find_map(|distance| {
+                (0..24).find_map(|direction| {
+                    let yaw = direction as f32 * std::f32::consts::TAU / 24.0;
+                    let position = *target - Vec3(yaw.cos() * distance, yaw.sin() * distance, -9.0);
+                    (map.collision.player_fits(position - Vec3(0.0, 0.0, 21.0))
+                        && map.collision.ray(position, *target - position).is_none())
+                    .then_some(Camera {
+                        position,
+                        yaw,
+                        pitch: (-9.0_f32).atan2(distance),
+                    })
+                })
+            })
+            .expect("visible approach to the portal");
+        let mut with_portal = Frame::new();
+        with_portal.draw(&map, &camera, 0.3);
+        let sprite_vertices = |map: &Map| {
+            let mut frame = Frame::hardware(map);
+            frame.draw(map, &camera, 0.3);
+            frame.commands.as_ref().unwrap().passes[2]
+                .batches()
+                .filter(|(material, _)| material.mode == crate::render::commands::Mode::ScreenDepth)
+                .map(|(_, vertices)| vertices.len())
+                .sum::<usize>()
+        };
+        let gpu_with = sprite_vertices(&map);
+        map.objective_art.torch_sprites.clear();
+        let mut without = Frame::new();
+        without.draw(&map, &camera, 0.3);
+        assert_ne!(with_portal.pixels, without.pixels);
+        assert!(gpu_with > sprite_vertices(&map));
     }
 }

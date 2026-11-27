@@ -167,8 +167,8 @@ impl View {
     }
 
     fn muzzle_at(&self, local: Vec3, depth: f32, zoom: f32) -> Vec3 {
-        // The first-person mesh is drawn at zoom 1. Keep its screen ray
-        // under the visible muzzle even when the world uses a different FOV.
+        // The local offset already includes the weapon projection. Keep its
+        // screen ray under the visible muzzle at the world camera's FOV.
         let scale = depth / (local.0 * zoom);
         self.eye + self.forward * depth + (self.right * local.1 + self.up * local.2) * scale
     }
@@ -442,6 +442,9 @@ impl Frame {
             }
         }
         self.layer(Layer::Effects);
+        for (position, texture, scale) in &map.objective_art.torch_sprites {
+            self.world_sprite(&view, *position, texture.image(time), *scale, 1.0);
+        }
         for (position, yaw) in crate::teleport::visuals(&map.teleporters) {
             let model = view.in_model(position, Vec3(yaw.cos(), yaw.sin(), 0.0), 1.0);
             for motion in &map.objective_art.portal {
@@ -591,7 +594,7 @@ impl Frame {
         .map(|art| (art, player.weapon_pose(art, game.time)));
         let muzzle = gun
             .and_then(|(art, pose)| art.muzzle_position(pose))
-            .map(|point| (player.weapon, point));
+            .map(|point| self.projected_muzzle(player.weapon, point));
         let attach = |weapon, point, age| view.attach_muzzle(map, muzzle, weapon, point, zoom, age);
         self.draw_flags(map, &view, game.time, game.flag_models(map, body_blend));
         self.draw_control_points(map, &view, game.time, game.control_owners());
@@ -888,7 +891,7 @@ impl Frame {
                     .as_ref()
                     .is_some_and(|flash| game.time - player.fired_at < flash.length)
                     .then_some(player.fired_count as usize);
-                self.draw_weapon_view(weapon, pose, game.time, muzzle, skin);
+                self.draw_weapon_view(player.weapon, weapon, pose, game.time, muzzle, skin);
             }
         }
         self.layer(Layer::Hud);
@@ -917,14 +920,21 @@ impl Frame {
         }
     }
 
+    fn projected_muzzle(&self, weapon: Weapon, Vec3(x, y, z): Vec3) -> (Weapon, Vec3) {
+        let zoom = weapon_view_zoom(weapon, self.width, self.height);
+        (weapon, Vec3(x, y * zoom, z * zoom))
+    }
+
     fn draw_weapon_view(
         &mut self,
+        kind: Weapon,
         weapon: &crate::game::WeaponAssets,
         pose: crate::game::Pose<'_>,
         time: f32,
         flash_index: Option<usize>,
         skin: Option<&crate::texture::Texture>,
     ) {
+        self.zoom = weapon_view_zoom(kind, self.width, self.height);
         let view = Camera {
             position: Vec3::default(),
             yaw: 0.0,
@@ -990,6 +1000,7 @@ impl Frame {
             None,
             skin,
         );
+        self.zoom = 1.0;
     }
 
     pub fn draw_practice(
@@ -1029,7 +1040,7 @@ impl Frame {
             .map(|art| (art, game.pose(art)));
         let muzzle = gun
             .and_then(|(art, pose)| art.muzzle_position(pose))
-            .map(|point| (game.weapon, point));
+            .map(|point| self.projected_muzzle(game.weapon, point));
         let attach = |weapon, point, age| view.attach_muzzle(map, muzzle, weapon, point, zoom, age);
         if game.show_decals {
             for mark in game.decals.visible() {
@@ -1104,6 +1115,7 @@ impl Frame {
                 None
             };
             self.draw_weapon_view(
+                game.weapon,
                 weapon,
                 pose,
                 time,
@@ -2175,6 +2187,15 @@ fn focal_length(width: usize, height: usize) -> f32 {
     (width as f32).max(height as f32 * (16.0 / 9.0)) * 0.48
 }
 
+fn weapon_view_zoom(weapon: Weapon, width: usize, height: usize) -> f32 {
+    if matches!(weapon, Weapon::Rocket | Weapon::Translocator) {
+        // Maintain the vertical framing of the 4:3, 90-degree weapon view.
+        (height as f32 * (2.0 / 3.0)) / focal_length(width, height)
+    } else {
+        1.0
+    }
+}
+
 fn ndc(p: Vec3, [w, h]: [usize; 2]) -> [f32; 3] {
     [p.0 * 2.0 / w as f32 - 1.0, 1.0 - p.1 * 2.0 / h as f32, p.2]
 }
@@ -2292,6 +2313,7 @@ mod muzzle_tests {
             .filter(|path| path.extension().is_some_and(|ext| ext == "unr"))
             .collect::<Vec<_>>();
         let reference = maps.join("CTF-Face.unr");
+        let mut frame = Frame::new();
         paths.sort_by_key(|path| {
             let name = path
                 .file_name()
@@ -2346,19 +2368,39 @@ mod muzzle_tests {
                         let muzzle = art.muzzle_position(pose).unwrap_or_else(|| {
                             panic!("{name} {mode:?} {weapon:?} has no animated muzzle")
                         });
-                        let expected = Vec3(muzzle.1 / muzzle.0, muzzle.2 / muzzle.0, 0.0);
-                        for fov in [80.0_f32, 95.0, 110.0] {
-                            let zoom = (0.5 * fov.to_radians()).tan().recip();
-                            let visible = view.muzzle_at(muzzle, 20.0, zoom);
-                            let p = view.point(visible);
-                            assert!(
-                                (p.0 * zoom / p.2 - expected.0).abs() < 0.0002,
-                                "{name} {mode:?} {weapon:?} horizontal muzzle mismatch"
-                            );
-                            assert!(
-                                (p.1 * zoom / p.2 - expected.1).abs() < 0.0002,
-                                "{name} {mode:?} {weapon:?} vertical muzzle mismatch"
-                            );
+                        for (width, height) in [(800, 600), (1920, 1080), (2560, 1080)] {
+                            (frame.width, frame.height) = (width, height);
+                            let (_, offset) = frame.projected_muzzle(weapon, muzzle);
+                            let local = project(
+                                Vertex {
+                                    position: Vec3(muzzle.1, muzzle.2, muzzle.0),
+                                    u: 0.0,
+                                    v: 0.0,
+                                },
+                                width,
+                                height,
+                                weapon_view_zoom(weapon, width, height),
+                            )
+                            .position;
+                            for fov in [80.0_f32, 95.0, 110.0] {
+                                let zoom = (0.5 * fov.to_radians()).tan().recip();
+                                let visible = view.muzzle_at(offset, 20.0, zoom);
+                                let p = project(
+                                    Vertex {
+                                        position: view.point(visible),
+                                        u: 0.0,
+                                        v: 0.0,
+                                    },
+                                    width,
+                                    height,
+                                    zoom,
+                                )
+                                .position;
+                                assert!(
+                                    (p.0 - local.0).abs() < 0.3 && (p.1 - local.1).abs() < 0.3,
+                                    "{name} {mode:?} {weapon:?} muzzle mismatch at {width}x{height}"
+                                );
+                            }
                         }
                     }
                 }

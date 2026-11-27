@@ -427,6 +427,8 @@ pub struct Scene {
 #[derive(Default)]
 pub struct ObjectiveArt {
     pub portal: [Motion; 2],
+    pub teleport_sound: Option<Arc<Wave>>,
+    pub torch_sprites: Vec<(Vec3, Arc<Texture>, f32)>,
     pub base: [Motion; 2],
     pub flag: [Motion; 2],
     pub(crate) flag_collision: FlagCollision,
@@ -637,9 +639,9 @@ pub fn load(
     let has_flags = actors
         .iter()
         .any(|actor| map.object_name(actor.class) == Some("FlagBase"));
-    let has_visible_portals = actors
-        .iter()
-        .any(|actor| map.object_name(actor.class) == Some("VisibleTeleporter"));
+    let has_portals = actors.iter().any(|actor| {
+        crate::teleport::is_teleporter(map.object_name(actor.class).unwrap_or_default())
+    });
     let mut objectives = ObjectiveArt::default();
     if actors
         .iter()
@@ -718,7 +720,17 @@ pub fn load(
             )
         });
     }
-    if has_visible_portals {
+    if has_portals {
+        objectives.teleport_sound = cached_wave(
+            &assets,
+            &mut waves,
+            find_export(&assets, "botpack", "Resp2A", "Sound"),
+        );
+    }
+    if actors
+        .iter()
+        .any(|actor| map.object_name(actor.class) == Some("VisibleTeleporter"))
+    {
         objectives.portal = ["VisibleTeleporter", "UTTeleEffect"].map(|class| {
             let mut motion = objective_motion(
                 &mut assets,
@@ -732,6 +744,7 @@ pub fn load(
             motion
         });
     }
+    let mut torch_references = Vec::new();
     for &actor in actors {
         if matches!(
             map.object_name(actor.class),
@@ -746,6 +759,15 @@ pub fn load(
         let defaults = appearance(&mut assets, &mut class_cache, class);
         let placement = VisualProperties::read(map.properties(actor)?)?;
         let visual = placement.apply(&mut assets, 0, defaults);
+        // Facing Worlds marks its plain Teleporter actors with animated TorchFlame sprites.
+        if map.object_name(actor.class) == Some("TorchFlame")
+            && visual.draw_type == 1
+            && !visual.hidden
+            && visual.scale > 0.0
+            && let Some(texture) = placement.texture
+        {
+            torch_references.push((placement.location, texture, visual.scale));
+        }
         if let Some(assault) = assault.as_deref_mut()
             && let Some(kind @ ("TeamCannon" | "MinigunCannon")) = map.object_name(actor.class)
             && let Some(class) = class
@@ -906,6 +928,20 @@ pub fn load(
                 }),
             });
         }
+    }
+    if !torch_references.is_empty() {
+        let materials = crate::texture::load_materials(
+            map,
+            path,
+            torch_references.iter().map(|&(_, reference, _)| reference),
+            false,
+        );
+        objectives.torch_sprites = torch_references
+            .into_iter()
+            .filter_map(|(position, reference, scale)| {
+                Some((position, Arc::clone(materials.get(&reference)?), scale))
+            })
+            .collect();
     }
     if let Some(assault) = assault {
         if !assault.turrets.is_empty() {
@@ -1078,7 +1114,15 @@ pub fn load(
                 });
             }
         }
-        if let Some(object) = visual.player_mesh {
+        let first_person_mesh = if weapon == Weapon::Translocator {
+            // Translocator.SetHand reverses the standard right-handed setting.
+            find_export(&assets, "botpack", "Transloc", "LodMesh")
+                .or_else(|| find_export(&assets, "botpack", "Transloc", "Mesh"))
+                .or(visual.player_mesh)
+        } else {
+            visual.player_mesh
+        };
+        if let Some(object) = first_person_mesh {
             let mesh = meshes.entry(object).or_insert_with(|| {
                 let (package, export) = assets.object(object);
                 Mesh::read(package, export).ok()
@@ -1116,7 +1160,15 @@ pub fn load(
                 let transform =
                     |point| rotate(product(point - mesh.origin, mesh.scale), mesh.rotation);
                 if let Some(Vec3(x, y, z)) = visual.player_offset {
-                    let offset = Vec3(x, if weapon == Weapon::Redeemer { y } else { -y }, z);
+                    let offset = Vec3(
+                        x,
+                        if matches!(weapon, Weapon::Redeemer | Weapon::Translocator) {
+                            y
+                        } else {
+                            -y
+                        },
+                        z,
+                    );
                     let scale = visual.player_scale.unwrap_or(1.0);
                     let rocket_names = if weapon == Weapon::Rocket {
                         let (package, export) = assets.object(class);

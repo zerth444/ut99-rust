@@ -2313,8 +2313,13 @@ impl Match {
                 &map.teleporters,
                 fighter.walker.position,
                 &mut fighter.portal,
-            ) && arrival.apply(&map.collision, &mut fighter.walker, &mut fighter.yaw)
-            {
+            ) && arrival.apply(
+                map,
+                &mut fighter.walker,
+                &mut fighter.yaw,
+                id == 0,
+                &mut sounds,
+            ) {
                 fighter.capture_body();
                 fighter.airborne_since = None;
                 fighter.power.boosted_airborne = false;
