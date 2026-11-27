@@ -944,7 +944,7 @@ pub struct Match {
     pub overtime: bool,
     pub(crate) guidance_lost_until: f32,
     pub hud_scale: f32,
-    pub(crate) view_bob: f32,
+    pub(crate) weapon_bob: f32,
     pub show_decals: bool,
     pub decals: decals::Marks,
     pub ballistics: ballistics::Effects,
@@ -1028,7 +1028,7 @@ impl Match {
             overtime: false,
             guidance_lost_until: 0.0,
             hud_scale: 1.0,
-            view_bob: map.collision.profile.bob,
+            weapon_bob: map.collision.profile.bob,
             show_decals: true,
             decals: decals::Marks::default(),
             ballistics: ballistics::Effects::default(),
@@ -1969,7 +1969,7 @@ impl Match {
         self.fighters[0].camera(map)
     }
 
-    pub(crate) fn render_view(&self, map: &Map, blend: f32, bob: f32) -> Camera {
+    pub(crate) fn render_view(&self, map: &Map, blend: f32) -> Camera {
         if self.finished || self.pilot_index().is_some() || self.assault_end_camera(map).is_some() {
             return self.player_view(map);
         }
@@ -1977,19 +1977,19 @@ impl Match {
             return camera;
         }
         let player = &self.fighters[0];
-        let mut camera = player.camera(map);
-        let mut profile = map.collision.profile;
-        profile.bob = bob;
-        let eye = player.walker.visual_eye(profile, camera.right());
+        let eye = player.walker.steady_eye(map.collision.profile);
         let (previous, _) = player.previous_body;
         let offset = player.previous_stair_offset
             + (player.walker.stair_offset() - player.previous_stair_offset) * blend;
         let delta = (previous - player.walker.position) * (1.0 - blend) + Vec3(0.0, 0.0, offset);
-        camera.position = map
-            .collision
-            .ray_surface(eye, delta)
-            .map_or(eye + delta, |(point, normal)| point + normal * 0.5);
-        camera
+        Camera {
+            position: map
+                .collision
+                .ray_surface(eye, delta)
+                .map_or(eye + delta, |(point, normal)| point + normal * 0.5),
+            yaw: player.yaw,
+            pitch: player.pitch,
+        }
     }
 
     fn death_camera(&self, map: &Map, blend: f32) -> Option<Camera> {
@@ -2640,7 +2640,7 @@ impl Match {
             .update(map, None, self.time, dt, &mut sounds);
         self.tick_defenses(map, dt, &mut sounds);
         let debris_view = (self.assault.is_some() || self.dm_training.is_some())
-            .then(|| self.render_view(map, 1.0, 0.0));
+            .then(|| self.render_view(map, 1.0));
         if let (Some(session), Some(data), Some(view)) =
             (&mut self.dm_training, &map.dm_training, &debris_view)
         {
@@ -6848,7 +6848,7 @@ mod tests {
             !map.starts[1].enabled,
             "the end camera's event must fire when the objective completes"
         );
-        let shot = game.render_view(&map, 1.0, 0.0);
+        let shot = game.render_view(&map, 1.0);
         assert!(distance_squared(shot.position, Vec3(128.0, 192.0, 120.0)) < 0.001);
         assert_eq!((shot.pitch, shot.yaw), (-0.4, 0.3));
         game.time = 4.4;
@@ -7245,7 +7245,7 @@ mod tests {
                 let effect_vertices = |game: &Match| {
                     use crate::render::{Frame, commands::Layer};
                     let mut frame = Frame::hardware(&map);
-                    let view = game.render_view(&map, 1.0, 0.0);
+                    let view = game.render_view(&map, 1.0);
                     frame.draw_deathmatch(&map, &view, game, 90.0, 1.0, false);
                     frame.commands.as_ref().unwrap().passes[Layer::Effects as usize]
                         .batches()
@@ -7789,7 +7789,7 @@ mod tests {
             let result_delay = data.result_delay();
             if let Some(expected) = &data.end_camera {
                 cameras += 1;
-                let actual = game.render_view(&map, 1.0, 0.0);
+                let actual = game.render_view(&map, 1.0);
                 assert!(distance_squared(actual.position, expected.position) < 0.001);
                 assert!((actual.yaw - expected.rotation.1).abs() < 0.001);
                 assert!((actual.pitch - expected.rotation.0).abs() < 0.001);
@@ -11134,7 +11134,7 @@ mod tests {
             &mut SoundEvents::default(),
         );
         let body = game.fighters[0].walker.position;
-        let view = game.render_view(&map, 1.0, 0.0);
+        let view = game.render_view(&map, 1.0);
         let delta = body - view.position;
         assert!(delta.dot(delta) > 80.0_f32.powi(2));
         assert!(unit(delta).dot(view.look_direction()) > 0.99);

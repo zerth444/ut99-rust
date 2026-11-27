@@ -634,21 +634,17 @@ impl Walker {
             0.0
         };
         let lateral = 0.4 * profile.bob * stride * (8.0 * self.bob_time).sin();
-        let vertical = self.applied_bob + 0.3 * profile.bob * stride * (16.0 * self.bob_time).sin();
-        self.eye_offset(profile, right, Vec3(0.0, lateral, vertical))
+        let vertical = 0.3 * profile.bob * stride * (16.0 * self.bob_time).sin();
+        self.steady_eye(profile) + UP * vertical + right * lateral
     }
 
-    pub(crate) fn visual_eye(&self, profile: Profile, right: Vec3) -> Vec3 {
-        self.eye_offset(profile, right, self.walk_bob(profile.bob))
-    }
-
-    fn eye_offset(&self, profile: Profile, right: Vec3, bob: Vec3) -> Vec3 {
+    pub(crate) fn steady_eye(&self, profile: Profile) -> Vec3 {
         let height = if self.grounded {
             profile.eye_height
         } else {
             profile.eye_height * 0.7
         };
-        self.position + UP * (height + bob.2) + right * bob.1
+        self.position + UP * (height + self.applied_bob)
     }
 
     pub(crate) fn walk_bob(&self, amount: f32) -> Vec3 {
@@ -898,6 +894,24 @@ fn limit(velocity: Vec3, maximum: f32) -> Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn walking_moves_the_weapon_mount_while_the_eye_stays_level() {
+        let mut world = Collision::test_world();
+        world.add_box(Vec3(-1000.0, -500.0, -90.0), Vec3(1000.0, 500.0, 0.0));
+        let mut walker = Walker::spawn(&world, Vec3(0.0, 0.0, 39.2));
+        let eye_height = walker.steady_eye(world.profile).2;
+        let mut bobbed = false;
+        for _ in 0..60 {
+            walker.advance(&world, Vec3(300.0, 0.0, 0.0), None, 1.0 / 120.0);
+            let eye = walker.steady_eye(world.profile);
+            let bob = walker.walk_bob(0.016);
+            bobbed |= bob.1.abs() > 0.2 && bob.2.abs() > 0.2;
+            assert!((eye.2 - eye_height).abs() < 0.01, "{eye:?}");
+            assert!(eye.1.abs() < 0.01, "{eye:?}");
+        }
+        assert!(walker.position.0 > 20.0 && bobbed);
+    }
 
     fn read_collision_map(path: &std::path::Path) -> crate::map::Map {
         let bytes = std::fs::read(path).unwrap();

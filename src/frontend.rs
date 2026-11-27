@@ -638,7 +638,7 @@ const HUD: [&str; 2] = ["HUD Scale", "Context Help"];
 const GAME: [&str; 7] = [
     "Dodging",
     "Game Speed",
-    "View Bob",
+    "Weapon Bob",
     "Bot Difficulty",
     "Bot Count",
     "Frag Limit",

@@ -615,7 +615,7 @@ impl Frame {
         .then(|| map.arsenal.get(&player.weapon))
         .flatten()
         .map(|art| (art, player.weapon_pose(art, game.time)));
-        let walk_bob = player.walker.walk_bob(game.view_bob);
+        let walk_bob = player.walker.walk_bob(game.weapon_bob);
         let muzzle = gun.and_then(|(art, pose)| {
             Some(self.projected_muzzle(
                 player.weapon,
@@ -2399,8 +2399,8 @@ fn focal_length(width: usize, height: usize) -> f32 {
 
 fn weapon_bob(weapon: &crate::game::WeaponAssets, walk: Vec3) -> Vec3 {
     let damping = weapon.bob_damping.unwrap_or(0.96);
-    // Weapon.uc positions the mesh relative to the same WalkBob used for the camera.
-    // First-person meshes are stored in the renderer at 64 times their UE1 scale.
+    // Preserve the relative Weapon.uc animation on the viewmodel once the
+    // world camera's WalkBob is disabled. The viewmodel uses 64x UE1 units.
     Vec3(
         0.0,
         (damping - 1.0) * walk.1,
@@ -2526,6 +2526,55 @@ mod muzzle_tests {
     use super::*;
     use crate::game::deathmatch::{Match, Mode, Rules};
     use crate::package::Package;
+
+    #[test]
+    fn weapon_sway_keeps_world_muzzle_on_the_drawn_barrel() {
+        let frame = Frame::new();
+        let art = crate::game::WeaponAssets {
+            bob_damping: Some(0.975),
+            ..Default::default()
+        };
+        let camera = Camera {
+            position: Vec3(20.0, -16.0, 70.0),
+            yaw: 1.0,
+            pitch: 0.3,
+        };
+        let world = View::camera(&camera);
+        let muzzle = Vec3(225.0, 36.0, -24.0);
+        let walk = Vec3(0.0, 3.5, -4.0);
+        let offset = weapon_bob(&art, walk);
+        assert!(offset.1 != 0.0 && offset.2 != 0.0);
+        let kind = Weapon::Shock;
+        let world_zoom = 0.92;
+        let (_, projected) = frame.projected_muzzle(kind, muzzle + offset);
+        let weapon = View::camera(&Camera {
+            position: offset * -1.0,
+            yaw: 0.0,
+            pitch: 0.0,
+        });
+        let on_screen = |point, zoom| {
+            project(
+                Vertex {
+                    position: point,
+                    u: 0.0,
+                    v: 0.0,
+                },
+                frame.width,
+                frame.height,
+                zoom,
+            )
+            .position
+        };
+        let model = on_screen(
+            weapon.point(muzzle),
+            weapon_view_zoom(kind, frame.width, frame.height),
+        );
+        let effect = on_screen(
+            world.point(world.muzzle_at(projected, 64.0, world_zoom)),
+            world_zoom,
+        );
+        assert!((model.0 - effect.0).abs() < 0.01 && (model.1 - effect.1).abs() < 0.01);
+    }
 
     #[test]
     #[ignore = "requires the reference-client installation"]

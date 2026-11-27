@@ -821,7 +821,7 @@ unsafe fn message_loop(
                 } else {
                     1.0
                 };
-                let view = game.render_view(map, blend, 0.004 * settings.view_bob as f32);
+                let view = game.render_view(map, blend);
                 if let Some(audio) = &mut audio {
                     audio.keep_bio_charges(|owner| game.bio_charging(owner));
                     audio.set_weapon_loop(game.weapon_loop(map));
@@ -853,7 +853,7 @@ unsafe fn message_loop(
                     (frame.width, frame.height) = (size.0 as usize, size.1 as usize);
                     game.hud_scale = settings.hud_scale as f32 / 100.0;
                     game.show_decals = settings.show_decals;
-                    game.view_bob = 0.004 * settings.view_bob as f32;
+                    game.weapon_bob = 0.004 * settings.view_bob as f32;
                     let scoreboard = active
                         && !console.open
                         && briefing_page.is_none()
@@ -1048,9 +1048,7 @@ unsafe fn message_loop(
             jump = false;
             dodge = None;
             if !fly {
-                let mut profile = map.collision.profile;
-                profile.bob = 0.004 * settings.view_bob as f32;
-                camera.position = walker.eye(profile, camera.right());
+                camera.position = walker.steady_eye(map.collision.profile);
             }
             if let Some(speed) = movement_audio.landing {
                 game.landed(speed, map.collision.profile.jump_speed);
@@ -1175,9 +1173,7 @@ unsafe fn message_loop(
                 let mut visual_camera = Camera { ..camera };
                 if !fly {
                     let delta = Vec3(0.0, 0.0, walker.stair_offset());
-                    let mut profile = map.collision.profile;
-                    profile.bob = 0.004 * settings.view_bob as f32;
-                    let eye = walker.visual_eye(profile, camera.right());
+                    let eye = camera.position;
                     visual_camera.position = map
                         .collision
                         .ray_surface(eye, delta)

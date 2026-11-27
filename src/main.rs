@@ -292,7 +292,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut camera = render::Camera::from_start(spawn);
             if command == "capture-practice" {
                 let walker = collision::Walker::spawn(&map.collision, spawn.position);
-                camera.position = walker.eye(map.collision.profile, camera.right());
+                camera.position = walker.steady_eye(map.collision.profile);
                 let mut practice = game::Practice::new(&map);
                 practice.update(
                     &mut map,
