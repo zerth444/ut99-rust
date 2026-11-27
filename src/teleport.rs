@@ -99,6 +99,25 @@ pub(crate) fn clear_radius(
     (delta.dot(delta) < 1.0).then_some(portal.radius + crate::collision::PLAYER_RADIUS)
 }
 
+pub(crate) const BURST_TIME: f32 = 0.5;
+
+#[derive(Default)]
+pub(crate) struct Bursts(Vec<(Vec3, f32, f32)>);
+
+impl Bursts {
+    pub fn record(&mut self, out: (Vec3, f32), arrival: (Vec3, f32), time: f32) {
+        self.0.retain(|&(_, _, at)| time < at + BURST_TIME);
+        self.0
+            .extend([(out.0, out.1, time), (arrival.0, arrival.1, time)]);
+    }
+
+    pub fn visible(&self, time: f32) -> impl Iterator<Item = (Vec3, f32, f32)> + '_ {
+        self.0.iter().filter_map(move |&(position, yaw, at)| {
+            (at <= time && time < at + BURST_TIME).then_some((position, yaw, time - at))
+        })
+    }
+}
+
 pub struct Arrival<'a> {
     source: &'a Teleporter,
     destination: &'a Teleporter,
@@ -142,13 +161,15 @@ impl Arrival<'_> {
                 velocity.2 * reverse[2],
             );
         }
+        let origin = walker.position;
         *walker = arrival;
         walker.set_teleport_velocity(velocity);
         let sound = map.objective_art.teleport_sound.iter().cloned();
         if local {
             sounds.extend(sound);
         } else {
-            sounds.extend_at(sound, walker.position, CONTACT_SOUND_RADIUS, 1.0);
+            sounds.extend_at(sound.clone(), walker.position, CONTACT_SOUND_RADIUS, 1.0);
+            sounds.extend_at(sound, origin, CONTACT_SOUND_RADIUS, 1.0);
         }
         true
     }
@@ -251,13 +272,12 @@ mod tests {
                 assert!(!std::sync::Arc::ptr_eq(textures[0], textures[1]), "{name}");
             }
             assert_eq!(visuals(&map.teleporters).count(), visual_count);
-            if visual_count > 0 {
+            assert!(map.objective_art.teleport_burst.frames.len() > 1, "{name}");
+            for motion in &map.objective_art.portal {
                 assert!(
-                    map.objective_art
-                        .portal
-                        .iter()
-                        .any(|motion| motion.frames.len() > 1
-                            && motion.frames[0].iter().any(|face| face.texture.is_some()))
+                    motion.frames.len() > 1
+                        && motion.frames[0].iter().any(|face| face.texture.is_some()),
+                    "{name}"
                 );
             }
             let audio = map
@@ -280,7 +300,7 @@ mod tests {
                 );
                 let delta = walker.position - destination;
                 assert!(delta.dot(delta) < 28.0_f32.powi(2));
-                assert_eq!(sounds.len(), 1);
+                assert_eq!(sounds.len(), if local { 1 } else { 2 });
                 assert!(
                     sounds
                         .waves()

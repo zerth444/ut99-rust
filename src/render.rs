@@ -447,11 +447,13 @@ impl Frame {
         }
         for (position, yaw) in crate::teleport::visuals(&map.teleporters) {
             let model = view.in_model(position, Vec3(yaw.cos(), yaw.sin(), 0.0), 1.0);
-            for motion in &map.objective_art.portal {
+            for (layer, motion) in map.objective_art.portal.iter().enumerate() {
                 if let Some(pose) = motion.sample_loop(time) {
+                    let effect = view.in_model(position, Vec3(1.0, 0.0, 0.0), 1.0);
+                    let model = if layer == 0 { &model } else { &effect };
                     self.draw_faces_in_view(
                         pose.current,
-                        &model,
+                        model,
                         time,
                         false,
                         Some(pose),
@@ -583,6 +585,7 @@ impl Frame {
         self.layer(Layer::World);
         let view = self.camera_view(camera);
         let zoom = self.zoom;
+        self.draw_teleport_bursts(map, &view, &game.teleports, game.time);
         let gun = (!piloting
             && !dead
             && !game.finished
@@ -751,7 +754,13 @@ impl Frame {
                 };
                 let (position, yaw) = fighter.body_transform(body_blend);
                 let model = view.in_model(position, Vec3(yaw.cos(), yaw.sin(), 0.0), 1.0);
-                self.draw_lit_faces(
+                let palette = fighter.character(map).map(|(character, model)| {
+                    (
+                        model.slots.as_slice(),
+                        &character.skins[fighter.team.unwrap_or(2)],
+                    )
+                });
+                self.draw_model_faces(
                     pose.current,
                     &model,
                     game.time,
@@ -761,6 +770,7 @@ impl Frame {
                     &[],
                     None,
                     skin,
+                    palette,
                 );
             }
         }
@@ -863,17 +873,6 @@ impl Frame {
                 }
                 self.match_marker(map, &view, position + Vec3(0.0, 0.0, 34.0), team, marker);
             }
-            for fighter in &game.fighters[1..] {
-                if fighter.health > 0 && fighter.invis_left(game.time) <= 0.0 {
-                    self.match_marker(
-                        map,
-                        &view,
-                        fighter.walker.position + Vec3(0.0, 0.0, 42.0),
-                        fighter.team,
-                        Marker::Fighter,
-                    );
-                }
-            }
         }
         self.zoom = 1.0;
         self.roll = 0.0;
@@ -917,6 +916,43 @@ impl Frame {
             self.draw_scope(map, player.weapon);
         } else if (hud.crosshair_visible && map.hud.crosshair.is_none()) || piloting {
             self.draw_crosshair();
+        }
+    }
+
+    fn draw_teleport_bursts(
+        &mut self,
+        map: &Map,
+        view: &View,
+        bursts: &crate::teleport::Bursts,
+        time: f32,
+    ) {
+        self.layer(Layer::Effects);
+        let burst = &map.objective_art.teleport_burst;
+        for (position, yaw, age) in bursts.visible(time) {
+            let glow = 1.0 - age / crate::teleport::BURST_TIME;
+            let swirl = &map.objective_art.portal[1];
+            for (motion, point, angle, looping) in [
+                (burst, position, yaw, false),
+                (swirl, position, 0.0, true),
+                (swirl, position - Vec3(0.0, 0.0, 10.0), yaw + 2.4, true),
+            ] {
+                let pose = if looping {
+                    motion.sample_loop(age)
+                } else {
+                    motion.sample(age)
+                };
+                if let Some(pose) = pose {
+                    let model = view.in_model(point, Vec3(angle.cos(), angle.sin(), 0.0), 1.0);
+                    self.draw_faces_in_view(
+                        pose.current,
+                        &model,
+                        time,
+                        false,
+                        Some(pose),
+                        Some(glow),
+                    );
+                }
+            }
         }
     }
 
@@ -1034,6 +1070,7 @@ impl Frame {
         self.layer(Layer::Effects);
         let view = self.camera_view(camera);
         let zoom = self.zoom;
+        self.draw_teleport_bursts(map, &view, &game.teleports, game.time);
         let gun = (guided_camera.is_none() && game.death.is_none() && !game.scoped())
             .then(|| map.arsenal.get(&game.weapon))
             .flatten()
@@ -1546,7 +1583,6 @@ impl Frame {
                 self.solid([x - 5, y - 3, 11, 7], color);
                 self.solid([x - 3, y - 5, 7, 11], color);
             }
-            Marker::Fighter => self.solid([x - 3, y - 2, 7, 4], color),
         }
     }
 
@@ -1788,6 +1824,25 @@ impl Frame {
         mover: Option<&crate::mover::Mover>,
         skin: Option<&crate::texture::Texture>,
     ) {
+        self.draw_model_faces(
+            faces, view, time, sky, pose, glow, lights, mover, skin, None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_model_faces(
+        &mut self,
+        faces: &[Face],
+        view: &View,
+        time: f32,
+        sky: bool,
+        pose: Option<crate::game::Pose<'_>>,
+        glow: Option<f32>,
+        lights: &[crate::light::Light],
+        mover: Option<&crate::mover::Mover>,
+        skin: Option<&crate::texture::Texture>,
+        palette: Option<(&[usize], &crate::props::characters::Skin)>,
+    ) {
         let mut transformed = Vec::new();
         let mut clipped = Vec::new();
         let vertex_key = |Vec3(x, y, z): Vec3| [x.to_bits(), y.to_bits(), z.to_bits()];
@@ -1804,7 +1859,10 @@ impl Frame {
             });
 
         for face in faces.iter().filter(|face| face.sky == sky) {
-            let texture = skin.or(face.texture.as_deref());
+            let assigned = palette.and_then(|(slots, textures)| {
+                textures.get(*slots.get(face.mesh_triangle?)?)?.as_deref()
+            });
+            let texture = skin.or(assigned).or(face.texture.as_deref());
             let flags = face.flags | texture.map_or(0, |texture| texture.poly_flags);
             if flags & 1 != 0 || (sky && flags & 0x80 != 0) {
                 continue;
@@ -1825,6 +1883,16 @@ impl Frame {
             if flags & 0x100 == 0 && (view.eye - position(0, face.vertices[0])).dot(normal) < 0.0 {
                 continue;
             }
+            let uv_scale = assigned
+                .filter(|_| skin.is_none())
+                .map_or((1.0, 1.0), |texture| {
+                    let (w, h) = texture.size();
+                    let (base_w, base_h) = face
+                        .texture
+                        .as_ref()
+                        .map_or((256.0, 256.0), |base| base.size());
+                    (w / base_w, h / base_h)
+                });
             transformed.clear();
             transformed.extend(face.vertices.iter().enumerate().map(|(i, &vertex)| {
                 let point = position(i, vertex);
@@ -1845,8 +1913,8 @@ impl Frame {
                 } else {
                     let texture_point = vertex - face.origin;
                     (
-                        texture_point.dot(face.u_axis),
-                        texture_point.dot(face.v_axis),
+                        texture_point.dot(face.u_axis) * uv_scale.0,
+                        texture_point.dot(face.v_axis) * uv_scale.1,
                     )
                 };
                 Vertex {
@@ -1889,7 +1957,10 @@ impl Frame {
             let pan = if skin.is_some() {
                 [0.0; 2]
             } else {
-                [face.pan[0] + u_pan, face.pan[1] + v_pan]
+                [
+                    face.pan[0] * uv_scale.0 + u_pan,
+                    face.pan[1] * uv_scale.1 + v_pan,
+                ]
             };
             let texture = texture.map(|texture| texture.image(time));
             let a = project(clipped[0], self.width, self.height, self.zoom);
@@ -2188,12 +2259,15 @@ fn focal_length(width: usize, height: usize) -> f32 {
 }
 
 fn weapon_view_zoom(weapon: Weapon, width: usize, height: usize) -> f32 {
-    if matches!(weapon, Weapon::Rocket | Weapon::Translocator) {
-        // Maintain the vertical framing of the 4:3, 90-degree weapon view.
-        (height as f32 * (2.0 / 3.0)) / focal_length(width, height)
-    } else {
-        1.0
-    }
+    let vertical_focal = match weapon {
+        Weapon::Flak => height as f32 * 0.52,
+        Weapon::Translocator => height as f32 * 0.62,
+        Weapon::Bio | Weapon::Rocket => height as f32 * (2.0 / 3.0),
+        Weapon::Hammer => height as f32 * 0.80,
+        // Match the 16:9 weapon view on wider displays.
+        _ => focal_length(0, height),
+    };
+    vertical_focal / focal_length(width, height)
 }
 
 fn ndc(p: Vec3, [w, h]: [usize; 2]) -> [f32; 3] {
@@ -2302,6 +2376,50 @@ mod muzzle_tests {
     use super::*;
     use crate::game::deathmatch::{Match, Mode, Rules};
     use crate::package::Package;
+
+    #[test]
+    #[ignore = "requires the reference-client installation"]
+    fn stock_weapon_muzzles_remain_in_the_viewport() {
+        let path = Path::new("local/reference-client/Maps/CTF-Face.unr");
+        let bytes = std::fs::read(path).unwrap();
+        let map = Map::load(&Package::read(&bytes).unwrap(), Some(path)).unwrap();
+        for weapon in Weapon::ALL {
+            let art = &map.arsenal[&weapon];
+            let rest = crate::game::Pose {
+                current: &art.view,
+                next: &art.view,
+                fraction: 0.0,
+            };
+            for pose in [
+                Some(rest),
+                art.primary_motion.sample(0.0),
+                art.alternate_motion.sample(0.0),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let Vec3(x, y, z) = art.muzzle_position(pose).expect("stock weapon muzzle");
+                for (width, height) in [(800, 600), (1920, 1080), (3440, 1440)] {
+                    let point = project(
+                        Vertex {
+                            position: Vec3(y, z, x),
+                            u: 0.0,
+                            v: 0.0,
+                        },
+                        width,
+                        height,
+                        weapon_view_zoom(weapon, width, height),
+                    )
+                    .position;
+                    assert!(
+                        (0.0..width as f32).contains(&point.0)
+                            && (0.0..height as f32).contains(&point.1),
+                        "{weapon:?} muzzle at {point:?} in {width}x{height}",
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     #[ignore = "requires the reference-client game and maps"]

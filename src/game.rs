@@ -721,6 +721,7 @@ impl SniperZoom {
 }
 
 pub struct Practice {
+    pub(crate) teleports: crate::teleport::Bursts,
     cheats: cheats::Cheats,
     cheat_ammo: [bool; Weapon::ALL.len()],
     pub health: u16,
@@ -787,6 +788,7 @@ pub struct Practice {
 impl Practice {
     pub fn new(map: &Map) -> Self {
         let mut game = Self {
+            teleports: crate::teleport::Bursts::default(),
             cheats: cheats::Cheats::default(),
             cheat_ammo: [false; Weapon::ALL.len()],
             health: 100,

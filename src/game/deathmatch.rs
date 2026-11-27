@@ -89,6 +89,9 @@ pub(crate) struct PlayerStats {
 }
 
 pub struct Fighter {
+    character: Option<usize>,
+    character_name: Option<String>,
+    spoken_at: f32,
     pub team: Option<usize>,
     pub walker: Walker,
     pub yaw: f32,
@@ -157,6 +160,9 @@ impl Fighter {
         let walker = Walker::spawn(&map.collision, start.position);
         Self {
             team: None,
+            character: None,
+            character_name: None,
+            spoken_at: f32::NEG_INFINITY,
             previous_body: (walker.position, start.yaw),
             previous_stair_offset: 0.0,
             gait_transition: None,
@@ -466,12 +472,33 @@ impl Fighter {
         }
     }
 
+    pub(crate) fn character<'a>(
+        &self,
+        map: &'a Map,
+    ) -> Option<(
+        &'a crate::props::characters::Character,
+        &'a crate::props::characters::CharacterModel,
+    )> {
+        let character = map.characters.roster.get(self.character?)?;
+        Some((character, &map.characters.models[character.model]))
+    }
+
+    fn actor_audio<'a>(&self, map: &'a Map) -> &'a crate::movement::PlayerAudio {
+        self.character(map)
+            .map_or(&map.player_audio, |(_, model)| &model.audio)
+    }
+
     pub(crate) fn pose<'a>(&self, map: &'a Map, id: usize, time: f32) -> Option<Pose<'a>> {
+        let (deaths, idle, clips) = self.character(map).map_or(
+            (&map.player_deaths, &map.player_idle, &map.player_clips),
+            |(_, model)| (&model.deaths, &model.idle, &model.clips),
+        );
         if let Some(death) = self.fell_at {
-            let clip = &map.player_deaths[id % map.player_deaths.len()];
-            return clip.sample((time - death).min((clip.duration() - 0.001).max(0.0)));
+            let clip = &deaths[id % deaths.len()];
+            return clip
+                .sample((time - death).min((clip.duration() - 0.001).max(0.0)))
+                .or_else(|| idle.sample(0.0));
         }
-        let clips = &map.player_clips;
         let firing = time - self.fired_at;
         let hurt = time - self.hurt_at;
         let landed = time - self.landed_at;
@@ -484,7 +511,7 @@ impl Fighter {
             return clips
                 .air
                 .sample(age.min((clips.air.duration() - 0.001).max(0.0)))
-                .or_else(|| map.player_idle.sample(0.0));
+                .or_else(|| idle.sample(0.0));
         } else if landed < 0.13 && clips.land.duration() > 0.0 {
             return clips.land.sample(landed.min(clips.land.duration() - 0.001));
         } else {
@@ -508,21 +535,24 @@ impl Fighter {
                 }
             }
         };
-        clip.sample_loop(age)
-            .or_else(|| map.player_idle.sample(0.0))
+        clip.sample_loop(age).or_else(|| idle.sample(0.0))
     }
 
     fn gait_pose<'a>(&self, map: &'a Map, gait: Gait, time: f32) -> Option<Pose<'a>> {
-        let clips = &map.player_clips;
+        let (idle, clips) = self
+            .character(map)
+            .map_or((&map.player_idle, &map.player_clips), |(_, model)| {
+                (&model.idle, &model.clips)
+            });
         let clip = match gait {
-            Gait::Idle => return map.player_idle.sample_loop(time),
+            Gait::Idle => return idle.sample_loop(time),
             Gait::Strafe(side) => &clips.strafe[side],
             Gait::Backpedal => &clips.backpedal,
             Gait::Walk => &clips.walk,
             Gait::Run => &clips.run,
         };
         clip.sample_loop(self.stride_time)
-            .or_else(|| map.player_idle.sample_loop(time))
+            .or_else(|| idle.sample_loop(time))
     }
 }
 
@@ -873,6 +903,7 @@ pub(crate) struct RatedRoster {
 }
 
 pub struct Match {
+    pub(crate) teleports: crate::teleport::Bursts,
     cheats: Cheats,
     rated_roster: Option<RatedRoster>,
     dm_training: Option<dm_training::Session>,
@@ -978,6 +1009,7 @@ impl Match {
             rocket_trails: ordnance::RocketTrails::default(),
             warhead_smoke: ordnance::WarheadSmoke::default(),
             hammer_effects: Vec::new(),
+            teleports: crate::teleport::Bursts::default(),
             drops: Vec::new(),
             outgoing_damage: None,
             bolts: Vec::new(),
@@ -1025,6 +1057,32 @@ impl Match {
         };
         let mut fighter = self.spawn_at(map, spawn);
         fighter.team = self.team_for(id);
+        if let Some(name) = id
+            .checked_sub(1)
+            .and_then(|bot| self.rated_roster.as_ref()?.bots.get(bot)?.as_deref())
+        {
+            fighter.character = map
+                .characters
+                .roster
+                .iter()
+                .position(|character| character.name.eq_ignore_ascii_case(name));
+        }
+        if fighter.character.is_none() && !map.characters.models.is_empty() {
+            let models = map.characters.models.len();
+            let model = id % models;
+            let variants: Vec<_> = map
+                .characters
+                .roster
+                .iter()
+                .enumerate()
+                .filter(|(_, character)| character.model == model)
+                .map(|(index, _)| index)
+                .collect();
+            fighter.character = variants.get((id / models) % variants.len().max(1)).copied();
+        }
+        fighter.character_name = fighter
+            .character
+            .map(|index| map.characters.roster[index].name.clone());
         self.configure_dm_training_spawn(id, &mut fighter);
         self.fighters.push(fighter);
     }
@@ -1431,6 +1489,7 @@ impl Match {
     }
 
     fn reset_round(&mut self, map: &mut Map) {
+        self.teleports = crate::teleport::Bursts::default();
         self.cheats.flight = Flight::Walk;
         self.time = 0.0;
         self.finished = false;
@@ -1649,6 +1708,7 @@ impl Match {
             .as_ref()
             .and_then(|roster| roster.bots.get(id - 1))
             .and_then(|name| name.clone())
+            .or_else(|| self.fighters.get(id)?.character_name.clone())
             .unwrap_or_else(|| format!("BOT {id}"))
     }
 
@@ -2153,6 +2213,9 @@ impl Match {
                     let old = self.fighters[id].spawn;
                     let spawn = self.choose_spawn(map, id, Some(old));
                     let mut respawned = self.spawn_at(map, spawn);
+                    respawned.character = self.fighters[id].character;
+                    respawned.character_name = self.fighters[id].character_name.take();
+                    respawned.spoken_at = self.fighters[id].spoken_at;
                     respawned.score = self.fighters[id].score;
                     respawned.deaths = self.fighters[id].deaths;
                     respawned.stats = self.fighters[id].stats;
@@ -2176,6 +2239,7 @@ impl Match {
                 continue;
             }
             let fighter = &mut self.fighters[id];
+            let actor_audio = fighter.actor_audio(map);
             if fighter.weapon == Weapon::Rocket
                 && fighter.fired_units > 0
                 && fighter.inventory.ammo(Weapon::Rocket) > 0
@@ -2263,9 +2327,9 @@ impl Match {
                     map.powerups
                         .boots_jump
                         .as_ref()
-                        .or(map.player_audio.jump.as_ref())
+                        .or(actor_audio.jump.as_ref().or(map.player_audio.jump.as_ref()))
                 } else {
-                    map.player_audio.jump.as_ref()
+                    actor_audio.jump.as_ref().or(map.player_audio.jump.as_ref())
                 };
                 sounds.extend_at(sound.cloned(), fighter.walker.position, 580.0, 0.8);
             }
@@ -2292,7 +2356,11 @@ impl Match {
                     .powi(2)
                     .min(1.0);
                 sounds.extend_at(
-                    map.player_audio.land.iter().cloned(),
+                    actor_audio
+                        .land
+                        .as_ref()
+                        .or(map.player_audio.land.as_ref())
+                        .cloned(),
                     fighter.walker.position,
                     620.0,
                     gain,
@@ -2303,12 +2371,18 @@ impl Match {
             }
             if let Some(step) = motion.footstep {
                 let sound = if swimming {
-                    &map.player_audio.water_step
+                    actor_audio
+                        .water_step
+                        .as_ref()
+                        .or(map.player_audio.water_step.as_ref())
                 } else {
-                    &map.player_audio.steps[step]
+                    actor_audio.steps[step]
+                        .as_ref()
+                        .or(map.player_audio.steps[step].as_ref())
                 };
-                sounds.extend_at(sound.iter().cloned(), fighter.walker.position, 500.0, 0.7);
+                sounds.extend_at(sound.cloned(), fighter.walker.position, 500.0, 0.7);
             }
+            let departure = (fighter.walker.position, fighter.yaw);
             if let Some(arrival) = crate::teleport::touched(
                 &map.teleporters,
                 fighter.walker.position,
@@ -2320,6 +2394,8 @@ impl Match {
                 id == 0,
                 &mut sounds,
             ) {
+                self.teleports
+                    .record(departure, (fighter.walker.position, fighter.yaw), self.time);
                 fighter.capture_body();
                 fighter.airborne_since = None;
                 fighter.power.boosted_airborne = false;
@@ -2433,7 +2509,11 @@ impl Match {
             {
                 sounds.push(wave.clone());
             }
-            if let objectives::FlagNotice::PointTaken(_, index) = notice {
+            if let objectives::FlagNotice::Taken(carrier) = notice {
+                self.bot_voice(map, carrier, Some(2), &mut sounds);
+            }
+            if let objectives::FlagNotice::PointTaken(_, index, owner) = notice {
+                self.bot_voice(map, owner, Some(11), &mut sounds);
                 sounds.extend_at(
                     map.objective_art.control_sound.iter().cloned(),
                     map.control_points[index].position,
@@ -4536,9 +4616,12 @@ impl Match {
         victim.hurt_at = self.time;
         if victim.health > 0 {
             if since_pain > 0.37 {
-                let sound = &map.player_audio.pain[(usize::from(hit.damage) / 12).min(3)];
+                let slot = (usize::from(hit.damage) / 12).min(3);
+                let sound = victim.actor_audio(map).pain[slot]
+                    .as_ref()
+                    .or(map.player_audio.pain[slot].as_ref());
                 sounds.extend_at(
-                    sound.iter().cloned(),
+                    sound.cloned(),
                     victim.walker.position,
                     CONTACT_SOUND_RADIUS,
                     0.8,
@@ -4559,8 +4642,13 @@ impl Match {
                 bolt.pilot = None;
             }
         }
+        let deaths = &victim.actor_audio(map).death;
+        let death = deaths[usize::from(victim.deaths - 1) % deaths.len()]
+            .as_ref()
+            .or_else(|| deaths.iter().flatten().next())
+            .or_else(|| map.player_audio.death.iter().flatten().next());
         sounds.extend_at(
-            map.player_audio.death.iter().flatten().take(1).cloned(),
+            death.cloned(),
             victim.walker.position,
             CONTACT_SOUND_RADIUS,
             1.0,
@@ -4593,6 +4681,9 @@ impl Match {
                 self.first_frag = true;
                 self.announce(map, 0, "FIRST FRAG", sounds);
             }
+            if enemy && owner != 0 {
+                self.bot_voice(map, owner, None, sounds);
+            }
             if owner == 0 {
                 let (count, last) = self.player_frags;
                 let count = if self.time - last <= 2.5 {
@@ -4613,6 +4704,45 @@ impl Match {
                 && let Some(team) = self.fighters[hit.victim].team
             {
                 self.objectives.scores[team] = self.objectives.scores[team].saturating_sub(1);
+            }
+        }
+    }
+
+    fn bot_voice(
+        &mut self,
+        map: &Map,
+        id: usize,
+        team_call: Option<usize>,
+        sounds: &mut SoundEvents,
+    ) {
+        let local_team = self.fighters[0].team;
+        let fighter = &mut self.fighters[id];
+        if id == 0 || (team_call != Some(2) && self.time - fighter.spoken_at < 7.0) {
+            return;
+        }
+        let Some((_, model)) = fighter.character(map) else {
+            return;
+        };
+        let sample = if let Some(call) = team_call {
+            model.team_calls[call].as_ref()
+        } else {
+            model
+                .taunts
+                .get((usize::from(fighter.stats.kills) + id) % model.taunts.len().max(1))
+        };
+        if let Some(sample) = sample {
+            fighter.spoken_at = self.time;
+            if team_call.is_some() {
+                if fighter.team == local_team {
+                    sounds.push(sample.clone());
+                }
+            } else {
+                sounds.extend_at(
+                    std::iter::once(sample.clone()),
+                    fighter.walker.position,
+                    CONTACT_SOUND_RADIUS,
+                    0.9,
+                );
             }
         }
     }
@@ -10315,6 +10445,16 @@ mod tests {
                 && angle_delta(yaw_after, yaw_before).abs() < 0.001
         );
         assert!(bot.bot.goal.is_none());
+        let effects = game.teleports.visible(game.time).collect::<Vec<_>>();
+        assert_eq!(effects.len(), 2);
+        assert!(distance_squared(effects[0].0, entry) < 35.0_f32.powi(2));
+        assert!(distance_squared(effects[1].0, exit) < 35.0_f32.powi(2));
+        assert_eq!(
+            game.teleports
+                .visible(game.time + crate::teleport::BURST_TIME)
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -10383,6 +10523,13 @@ mod tests {
         game.fighters[1].walker.position = red;
         game.objectives.tick(&map, &mut game.fighters, 1.0);
         assert_eq!(game.flag_icon_states(), Some([1, 1]));
+        game.fighters[1].capture_body();
+        let (carried, _, home) = game.flag_models(&map, 1.0)[0].unwrap();
+        let (carrier, yaw) = game.fighters[1].body_transform(1.0);
+        assert!(!home);
+        assert!((carried - carrier).dot(Vec3(yaw.cos(), yaw.sin(), 0.0)) < -25.0);
+        assert!(carried.2 > carrier.2);
+        assert!(game.flag_models(&map, 1.0)[1].is_none());
 
         game.fighters[1].walker.position = Vec3(0.0, 0.0, 300.0);
         game.fighters[1].health = 0;

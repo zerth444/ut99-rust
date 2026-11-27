@@ -133,7 +133,6 @@ struct Flag {
 
 #[derive(Clone, Copy)]
 pub(crate) enum Marker {
-    Fighter,
     Flag,
     ControlPoint,
 }
@@ -157,21 +156,21 @@ struct ZoneControl {
 }
 
 pub(super) enum FlagNotice {
-    Taken,
+    Taken(usize),
     Returned,
     Captured(usize),
-    PointTaken(usize, usize),
+    PointTaken(usize, usize, usize),
 }
 
 impl FlagNotice {
     pub fn message(&self) -> &'static str {
         match self {
-            Self::Taken => "Flag taken",
+            Self::Taken(_) => "Flag taken",
             Self::Returned => "Flag returned",
             Self::Captured(0) => "Red scored a capture",
             Self::Captured(_) => "Blue scored a capture",
-            Self::PointTaken(0, _) => "Red took a control point",
-            Self::PointTaken(_, _) => "Blue took a control point",
+            Self::PointTaken(0, ..) => "Red took a control point",
+            Self::PointTaken(..) => "Blue took a control point",
         }
     }
 
@@ -179,7 +178,7 @@ impl FlagNotice {
         match *self {
             Self::Captured(team) => Some(team),
             Self::Returned => Some(2),
-            Self::Taken | Self::PointTaken(..) => None,
+            Self::Taken(_) | Self::PointTaken(..) => None,
         }
     }
 }
@@ -294,7 +293,7 @@ impl Objectives {
                         stats.returns = stats.returns.saturating_add(1);
                         FlagNotice::Returned
                     } else {
-                        FlagNotice::Taken
+                        FlagNotice::Taken(id)
                     });
                 }
             }
@@ -341,7 +340,7 @@ impl Objectives {
                 zone.owner = Some((team, controller));
                 if changed_team {
                     zone.score_at = time + 2.0;
-                    notice = Some(FlagNotice::PointTaken(team, index));
+                    notice = Some(FlagNotice::PointTaken(team, index, controller));
                     let stats = &mut fighters[controller].stats;
                     stats.points_taken = stats.points_taken.saturating_add(1);
                 }
@@ -553,7 +552,13 @@ impl Objectives {
                 FlagState::Held(0) => return None,
                 FlagState::Held(id) => {
                     let (point, yaw) = fighters[id].body_transform(blend);
-                    (point, yaw, false)
+                    let forward = Vec3(yaw.cos(), yaw.sin(), 0.0);
+                    let right = Vec3(-forward.1, forward.0, 0.0);
+                    (
+                        point - forward * 33.0 + right * 12.0 + Vec3(0.0, 0.0, 26.0),
+                        yaw + std::f32::consts::PI,
+                        false,
+                    )
                 }
             })
         })

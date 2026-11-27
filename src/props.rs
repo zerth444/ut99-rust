@@ -5,6 +5,8 @@ use std::{
     sync::Arc,
 };
 
+pub(crate) mod characters;
+
 use crate::game::ordnance::{self, Kind};
 use crate::game::shock;
 use crate::game::{ActorClips, Flash, Item, Motion, RocketAnimations, Weapon, WeaponAssets};
@@ -412,6 +414,7 @@ pub struct Scene {
     pub player_deaths: [Motion; 3],
     pub player_idle: Motion,
     pub player_clips: ActorClips,
+    pub characters: characters::Characters,
     pub ordnance: ordnance::Arsenal,
     pub ballistics: crate::game::ballistics::Art,
     pub zones: Vec<crate::movement::Zone>,
@@ -427,6 +430,7 @@ pub struct Scene {
 #[derive(Default)]
 pub struct ObjectiveArt {
     pub portal: [Motion; 2],
+    pub teleport_burst: Motion,
     pub teleport_sound: Option<Arc<Wave>>,
     pub torch_sprites: Vec<(Vec3, Arc<Texture>, f32)>,
     pub base: [Motion; 2],
@@ -504,7 +508,8 @@ pub fn load(
                 | "unreali"
                 | "soldierskins"
                 | "ladrstatic"
-        ) && !(training && name == "tutvoiceas")
+        ) && !characters::supporting_package(&name)
+            && !(training && name == "tutvoiceas")
             && !(dm_training && name == "tutvoicedm")
             && !(ctf_training && name == "tutvoicectf")
             && !map.imports.iter().any(|import| {
@@ -516,6 +521,42 @@ pub fn load(
         Some((name, fs::read(path).ok()?))
     })
     .collect();
+    if let Some(reference) = folder
+        .parent()
+        .and_then(Path::parent)
+        .map(|root| root.join("reference-client"))
+    {
+        for directory in ["System", "Textures", "Sounds"] {
+            for path in fs::read_dir(reference.join(directory))
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+            {
+                let Some(name) = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(str::to_ascii_lowercase)
+                else {
+                    continue;
+                };
+                if characters::supporting_package(&name)
+                    && path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| {
+                            ["u", "utx", "uax"]
+                                .iter()
+                                .any(|kind| ext.eq_ignore_ascii_case(kind))
+                        })
+                    && !packages.iter().any(|(loaded, _)| *loaded == name)
+                    && let Ok(data) = fs::read(path)
+                {
+                    packages.push((name, data));
+                }
+            }
+        }
+    }
     packages.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut assets = Assets {
         packages: vec![Package::read(map.data)?],
@@ -727,10 +768,16 @@ pub fn load(
             find_export(&assets, "botpack", "Resp2A", "Sound"),
         );
     }
-    if actors
-        .iter()
-        .any(|actor| map.object_name(actor.class) == Some("VisibleTeleporter"))
-    {
+    if has_portals {
+        objectives.teleport_burst = objective_motion(
+            &mut assets,
+            &mut class_cache,
+            &mut textures,
+            "UTTeleportEffect",
+            "Burst",
+            None,
+        );
+        objectives.teleport_burst.rate *= 0.6;
         objectives.portal = ["VisibleTeleporter", "UTTeleEffect"].map(|class| {
             let mut motion = objective_motion(
                 &mut assets,
@@ -1344,6 +1391,7 @@ pub fn load(
     });
     let (player_deaths, player_idle, player_clips) =
         player_models(&mut assets, &mut class_cache, &mut textures);
+    let characters = characters::load(&mut assets, &mut class_cache, &mut textures, &mut waves);
     let ordnance = Kind::ALL.map(|kind| {
         projectile_art(
             &mut assets,
@@ -1464,6 +1512,7 @@ pub fn load(
         player_deaths,
         player_idle,
         player_clips,
+        characters,
         ordnance,
         ballistics,
         zones,
@@ -1544,7 +1593,17 @@ fn player_models(
     {
         visual.multiskins[slot] = find_export(assets, "soldierskins", name, "Texture");
     }
-    let mut clip = |name| effect_motion(assets, textures, object, visual, &mesh, &[name]);
+    player_animations(assets, textures, object, visual, &mesh)
+}
+
+fn player_animations(
+    assets: &mut Assets<'_>,
+    textures: &mut HashMap<Object, Option<Arc<Texture>>>,
+    object: Object,
+    visual: Appearance,
+    mesh: &Mesh,
+) -> ([Motion; 3], Motion, ActorClips) {
+    let mut clip = |name| effect_motion(assets, textures, object, visual, mesh, &[name]);
     let deaths = ["Dead1", "Dead3", "Dead8"].map(&mut clip);
     let idle = clip("Breath1");
     let clips = ActorClips {
@@ -2875,10 +2934,18 @@ fn read_player(
     assets: &mut Assets<'_>,
     waves: &mut HashMap<Object, Option<Arc<Wave>>>,
 ) -> (crate::movement::Profile, crate::movement::PlayerAudio) {
+    let class = find_export(assets, "botpack", "TMale2", "Class")
+        .or_else(|| find_export(assets, "botpack", "TournamentPlayer", "Class"));
+    read_player_class(assets, waves, class)
+}
+
+fn read_player_class(
+    assets: &mut Assets<'_>,
+    waves: &mut HashMap<Object, Option<Arc<Wave>>>,
+    mut class: Option<Object>,
+) -> (crate::movement::Profile, crate::movement::PlayerAudio) {
     let mut player = crate::movement::Profile::default();
     let mut audio = crate::movement::PlayerAudio::default();
-    let mut class = find_export(assets, "botpack", "TMale2", "Class")
-        .or_else(|| find_export(assets, "botpack", "TournamentPlayer", "Class"));
     let mut chain = Vec::new();
     let mut visited = HashSet::new();
     while let Some(object) = class.filter(|id| visited.insert(*id)) {
@@ -2892,7 +2959,8 @@ fn read_player(
             continue;
         };
         let mut references = Vec::new();
-        while let Ok(Some((name, mut value))) = props.next() {
+        while let Ok(Some(prop)) = props.next_tag() {
+            let (name, mut value) = (prop.name, prop.value);
             let field = match name {
                 "GroundSpeed" => &mut player.ground_speed,
                 "WaterSpeed" => &mut player.water_speed,
@@ -2906,9 +2974,11 @@ fn read_player(
                 "Mass" => &mut player.mass,
                 "Buoyancy" => &mut player.buoyancy,
                 "UnderWaterTime" => &mut player.underwater_time,
-                "Footstep1" | "Footstep2" | "Footstep3" | "JumpSound" | "Land" | "WaterStep" => {
+                "Footstep1" | "Footstep2" | "Footstep3" | "JumpSound" | "Land" | "WaterStep"
+                | "HitSound1" | "HitSound2" | "HitSound3" | "HitSound4" | "Die" | "Die2"
+                | "Die3" | "Deaths" | "LandGrunt" => {
                     if let Ok(reference) = value.compact() {
-                        references.push((name.to_owned(), reference));
+                        references.push((name.to_owned(), prop.array_index, reference));
                     }
                     continue;
                 }
@@ -2918,7 +2988,7 @@ fn read_player(
                 *field = value.max(0.0);
             }
         }
-        for (name, reference) in references {
+        for (name, index, reference) in references {
             let wave = assets.resolve(object.package, reference);
             let sound = cached_wave(assets, waves, wave);
             match name.as_str() {
@@ -2926,8 +2996,16 @@ fn read_player(
                 "Footstep2" => audio.steps[1] = sound,
                 "Footstep3" => audio.steps[2] = sound,
                 "JumpSound" => audio.jump = sound,
-                "Land" => audio.land = sound,
+                "Land" | "LandGrunt" => audio.land = sound,
                 "WaterStep" => audio.water_step = sound,
+                "HitSound1" => audio.pain[0] = sound,
+                "HitSound2" => audio.pain[1] = sound,
+                "HitSound3" => audio.pain[2] = sound,
+                "HitSound4" => audio.pain[3] = sound,
+                "Die" => audio.death[0] = sound,
+                "Die2" => audio.death[1] = sound,
+                "Die3" => audio.death[2] = sound,
+                "Deaths" if index < audio.death.len() => audio.death[index] = sound,
                 _ => {}
             }
         }

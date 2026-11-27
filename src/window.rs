@@ -1019,12 +1019,20 @@ unsafe fn message_loop(
                     );
                     boot_jump = movement_audio.jump && !key(walk) && game.used_boot_jump();
                     movement_audio.jump |= dodged;
+                    let departure = (walker.position, camera.yaw);
                     if let Some(arrival) = crate::teleport::touched(
                         &map.teleporters,
                         walker.position,
                         &mut occupied_portal,
+                    ) && arrival.apply(
+                        map,
+                        &mut walker,
+                        &mut camera.yaw,
+                        true,
+                        &mut sound_events,
                     ) {
-                        arrival.apply(map, &mut walker, &mut camera.yaw, true, &mut sound_events);
+                        game.teleports
+                            .record(departure, (walker.position, camera.yaw), game.time);
                     }
                     if walker.position.2 < kill_z {
                         game.health = 0;
