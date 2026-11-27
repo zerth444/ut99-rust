@@ -48,6 +48,11 @@ struct TriggerLight {
 }
 
 impl Light {
+    pub(crate) fn reaches(&self, point: Vec3) -> bool {
+        let offset = self.position - point;
+        offset.dot(offset) < self.radius * self.radius
+    }
+
     fn animated(&self) -> bool {
         self.flicker || self.trigger.is_some()
     }
@@ -156,7 +161,12 @@ pub fn read_coronas(package: &Package<'_>, path: &Path) -> io::Result<Vec<Corona
         .collect())
 }
 
-pub fn actor_lighting(lights: &[Light], position: Vec3, normal: Vec3, time: f32) -> [f32; 3] {
+pub fn actor_lighting<'a>(
+    lights: impl IntoIterator<Item = &'a Light>,
+    position: Vec3,
+    normal: Vec3,
+    time: f32,
+) -> [f32; 3] {
     let mut color = [0.22_f32; 3];
     for light in lights {
         let offset = light.position - position;

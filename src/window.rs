@@ -853,6 +853,7 @@ unsafe fn message_loop(
                     (frame.width, frame.height) = (size.0 as usize, size.1 as usize);
                     game.hud_scale = settings.hud_scale as f32 / 100.0;
                     game.show_decals = settings.show_decals;
+                    game.view_bob = 0.004 * settings.view_bob as f32;
                     let scoreboard = active
                         && !console.open
                         && briefing_page.is_none()
@@ -1174,13 +1175,19 @@ unsafe fn message_loop(
                 let mut visual_camera = Camera { ..camera };
                 if !fly {
                     let delta = Vec3(0.0, 0.0, walker.stair_offset());
+                    let mut profile = map.collision.profile;
+                    profile.bob = 0.004 * settings.view_bob as f32;
+                    let eye = walker.visual_eye(profile, camera.right());
                     visual_camera.position = map
                         .collision
-                        .ray_surface(camera.position, delta)
-                        .map_or(camera.position + delta, |(point, normal)| {
-                            point + normal * 0.5
-                        });
+                        .ray_surface(eye, delta)
+                        .map_or(eye + delta, |(point, normal)| point + normal * 0.5);
                 }
+                game.walk_bob = if fly {
+                    Vec3::default()
+                } else {
+                    walker.walk_bob(0.004 * settings.view_bob as f32)
+                };
                 frame.draw_practice(map, &visual_camera, game.time, &game);
                 let track = map
                     .music

@@ -7,6 +7,10 @@ use std::{
 
 pub(crate) mod characters;
 
+pub(crate) const GIB_FAMILIES: usize = 6;
+
+pub(crate) const COUNTDOWN_SECONDS: [u16; 14] = [300, 180, 60, 30, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
+
 use crate::game::ordnance::{self, Kind};
 use crate::game::shock;
 use crate::game::{ActorClips, Flash, Item, Motion, RocketAnimations, Weapon, WeaponAssets};
@@ -76,6 +80,7 @@ struct Appearance {
     status_icon: Option<Object>,
     player_offset: Option<Vec3>,
     player_scale: Option<f32>,
+    bob_damping: Option<f32>,
     fire_sound: Option<Object>,
     alt_sound: Option<Object>,
     pickup_sound: Option<Object>,
@@ -116,6 +121,7 @@ struct VisualProperties {
     status_icon: Option<i32>,
     player_offset: Option<Vec3>,
     player_scale: Option<f32>,
+    bob_damping: Option<f32>,
     fire_sound: Option<i32>,
     alt_sound: Option<i32>,
     pickup_sound: Option<i32>,
@@ -160,6 +166,7 @@ impl VisualProperties {
             status_icon: None,
             player_offset: None,
             player_scale: None,
+            bob_damping: None,
             fire_sound: None,
             alt_sound: None,
             pickup_sound: None,
@@ -203,6 +210,7 @@ impl VisualProperties {
                 "StatusIcon" => props_out.status_icon = Some(value.compact()?),
                 "PlayerViewOffset" => props_out.player_offset = Some(Vec3::read(&mut value)?),
                 "PlayerViewScale" => props_out.player_scale = Some(value.f32()?),
+                "BobDamping" => props_out.bob_damping = Some(value.f32()?),
                 "FireSound" => props_out.fire_sound = Some(value.compact()?),
                 "AltFireSound" => props_out.alt_sound = Some(value.compact()?),
                 "PickupSound" => props_out.pickup_sound = Some(value.compact()?),
@@ -302,6 +310,7 @@ impl VisualProperties {
         parent.fire_offset = self.fire_offset.or(parent.fire_offset);
         parent.player_offset = self.player_offset.or(parent.player_offset);
         parent.player_scale = self.player_scale.or(parent.player_scale);
+        parent.bob_damping = self.bob_damping.or(parent.bob_damping);
         parent.pickup_ammo = self.pickup_ammo.or(parent.pickup_ammo);
         parent.ammo_amount = self.ammo_amount.or(parent.ammo_amount);
         parent.max_ammo = self.max_ammo.or(parent.max_ammo);
@@ -409,11 +418,14 @@ pub struct Scene {
     pub hud: crate::hud_art::Art,
     pub player: crate::movement::Profile,
     pub player_audio: crate::movement::PlayerAudio,
-    pub match_announcer: [Option<Arc<Wave>>; 5],
+    pub match_announcer: [Option<Arc<Wave>>; 13],
+    pub countdown_announcer: [Option<Arc<Wave>>; COUNTDOWN_SECONDS.len()],
     pub ctf_announcer: [Option<Arc<Wave>>; 3],
     pub player_deaths: [Motion; 3],
     pub player_idle: Motion,
     pub player_clips: ActorClips,
+    pub player_gibs: [Option<crate::game::deathmatch::dm_training::gibs::Art>; GIB_FAMILIES],
+    pub player_gib_sound: Option<Arc<Wave>>,
     pub characters: characters::Characters,
     pub ordnance: ordnance::Arsenal,
     pub ballistics: crate::game::ballistics::Art,
@@ -1016,6 +1028,7 @@ pub fn load(
         let visual = appearance(&mut assets, &mut class_cache, Some(class));
         let ammo = appearance(&mut assets, &mut class_cache, visual.ammo_class);
         let mut weapon_assets = WeaponAssets {
+            bob_damping: visual.bob_damping,
             pickup_ammo: visual.pickup_ammo,
             max_ammo: ammo.max_ammo,
             status_icon: visual
@@ -1391,6 +1404,20 @@ pub fn load(
     });
     let (player_deaths, player_idle, player_clips) =
         player_models(&mut assets, &mut class_cache, &mut textures);
+    let player_gibs = std::array::from_fn(|family| {
+        player_gibs(
+            &mut assets,
+            &mut class_cache,
+            &mut textures,
+            &mut waves,
+            family,
+        )
+    });
+    let player_gib_sound = cached_wave(
+        &assets,
+        &mut waves,
+        find_export(&assets, "botpack", "NewGib", "Sound"),
+    );
     let characters = characters::load(&mut assets, &mut class_cache, &mut textures, &mut waves);
     let ordnance = Kind::ALL.map(|kind| {
         projectile_art(
@@ -1449,6 +1476,25 @@ pub fn load(
         "MultiKill",
         "Winner",
         "LostMatch",
+        "HeadShot",
+        "UltraKill",
+        "MonsterKill",
+        "KillingSpree",
+        "Rampage",
+        "Dominating",
+        "Unstoppable",
+        "Godlike",
+    ]
+    .map(|name| {
+        cached_wave(
+            &assets,
+            &mut waves,
+            find_export(&assets, "announcer", name, "Sound"),
+        )
+    });
+    let countdown_announcer = [
+        "cd5min", "cd3min", "cd1min", "cd30sec", "cd10", "cd9", "cd8", "cd7", "cd6", "cd5", "cd4",
+        "cd3", "cd2", "cd1",
     ]
     .map(|name| {
         cached_wave(
@@ -1508,10 +1554,13 @@ pub fn load(
         player,
         player_audio,
         match_announcer,
+        countdown_announcer,
         ctf_announcer,
         player_deaths,
         player_idle,
         player_clips,
+        player_gibs,
+        player_gib_sound,
         characters,
         ordnance,
         ballistics,
@@ -1603,8 +1652,15 @@ fn player_animations(
     visual: Appearance,
     mesh: &Mesh,
 ) -> ([Motion; 3], Motion, ActorClips) {
+    let deaths = [
+        &["Dead1", "Dead2", "Death1", "Death"][..],
+        &["Dead3", "Dead2", "Dead1", "Death1", "Death"][..],
+        &[
+            "Dead8", "Dead7", "Dead4", "Dead2", "Dead1", "Death1", "Death",
+        ][..],
+    ]
+    .map(|names| effect_motion(assets, textures, object, visual, mesh, names));
     let mut clip = |name| effect_motion(assets, textures, object, visual, mesh, &[name]);
-    let deaths = ["Dead1", "Dead3", "Dead8"].map(&mut clip);
     let idle = clip("Breath1");
     let clips = ActorClips {
         walk: clip("WalkSm"),
@@ -2026,7 +2082,10 @@ fn read_shock(
                     }
                     _ => continue,
                 };
-                if let Ok(value) = value.f32() {
+                if let Ok(value) = value.f32()
+                    && value.is_finite()
+                    && value > 0.0
+                {
                     *property = value;
                 }
             }
@@ -2397,6 +2456,129 @@ fn deathmatch_training(
         nali_death_sound,
         gibs,
     })
+}
+
+fn player_gibs(
+    assets: &mut Assets<'_>,
+    classes: &mut HashMap<Object, Appearance>,
+    textures: &mut HashMap<Object, Option<Arc<Texture>>>,
+    waves: &mut HashMap<Object, Option<Arc<Wave>>>,
+    family: usize,
+) -> Option<crate::game::deathmatch::dm_training::gibs::Art> {
+    use crate::game::deathmatch::dm_training::gibs::{Art, Part};
+    let heads = [
+        "UT_HeadMale",
+        "UT_HeadFemale",
+        "UT_BossHead",
+        "TSkaarjHead",
+        "TNaliHead",
+        "TCowHead",
+    ];
+    let (torso, arm, leg, foot) = match family {
+        1 => (
+            "TFemaleMasterChunk",
+            "UT_FemaleArm",
+            "UT_Thigh",
+            "UT_FemaleFoot",
+        ),
+        2 => (
+            "TBossMasterChunk",
+            "UT_BossArm",
+            "UT_BossThigh",
+            "UT_MaleFoot",
+        ),
+        _ => ("TMaleMasterChunk", "UT_MaleArm", "UT_Thigh", "UT_MaleFoot"),
+    };
+    let head_package = if family < 3 { "botpack" } else { "multimesh" };
+    let _ = find_export(assets, head_package, heads[family], "Class")?;
+    let parts = [
+        ("botpack", torso, 0.0),
+        (head_package, heads[family], 0.65),
+        ("botpack", arm, 0.15),
+        ("botpack", leg, -0.2),
+        ("botpack", foot, -0.6),
+    ]
+    .into_iter()
+    .enumerate()
+    .filter_map(|(part, (package, class, height))| {
+        let class = find_export(assets, package, class, "Class")?;
+        let visual = appearance(assets, classes, Some(class));
+        let object = visual.mesh?;
+        let (package, export) = assets.object(object);
+        let mesh = Mesh::read(package, export).ok()?;
+        let vertices = effect_vertices(&mesh, mesh.frame(0)?, visual.scale);
+        let faces = mesh_faces(assets, textures, object, visual, &mesh, &vertices);
+        (!faces.is_empty()).then_some(Part {
+            faces,
+            height,
+            trail: part > 0,
+        })
+    })
+    .collect::<Vec<_>>();
+    if parts.len() < 2 {
+        return None;
+    }
+    let mut spurt = objective_motion(assets, classes, textures, "UT_BloodBurst", "Burst", None);
+    if spurt.frames.is_empty() {
+        spurt = package_effect_motion(
+            assets,
+            classes,
+            textures,
+            "unrealshare",
+            "BloodSpurt",
+            "GravSpray2",
+        );
+    }
+    let trail = package_effect_motion(
+        assets,
+        classes,
+        textures,
+        "unrealshare",
+        "BloodTrail",
+        "Trail",
+    );
+    let impacts = ["gibP1", "gibP3", "gibP4", "gibP5", "gibP6"].map(|name| {
+        cached_wave(
+            assets,
+            waves,
+            find_export(assets, "unrealshare", name, "Sound"),
+        )
+    });
+    let class = find_export(assets, "botpack", "UTCreatureChunks", "Class");
+    let visual = appearance(assets, classes, class);
+    Some(Art {
+        parts,
+        spurt,
+        trail,
+        impacts,
+        mass: 100.0,
+        health: 100.0,
+        collision: [
+            visual.collision_radius.unwrap_or(6.0),
+            visual.collision_height.unwrap_or(6.0),
+        ],
+        lifetime: Some(visual.lifetime.filter(|time| *time > 0.0).unwrap_or(15.0)),
+    })
+}
+
+fn package_effect_motion(
+    assets: &mut Assets<'_>,
+    classes: &mut HashMap<Object, Appearance>,
+    textures: &mut HashMap<Object, Option<Arc<Texture>>>,
+    package: &str,
+    class: &str,
+    sequence: &str,
+) -> Motion {
+    let class = find_export(assets, package, class, "Class");
+    let visual = appearance(assets, classes, class);
+    let Some(object) = visual.mesh else {
+        return Motion::default();
+    };
+    let (data, export) = assets.object(object);
+    let Ok(mesh) = Mesh::read(data, export) else {
+        return Motion::default();
+    };
+    effect_motion(assets, textures, object, visual, &mesh, &[sequence])
 }
 
 fn training_nali_gibs(

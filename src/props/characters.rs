@@ -17,6 +17,8 @@ pub struct Character {
 pub struct CharacterModel {
     pub idle: Motion,
     pub deaths: [Motion; 3],
+    pub decapitation: Motion,
+    pub gib_family: Option<usize>,
     pub clips: ActorClips,
     pub slots: Vec<usize>,
     pub audio: crate::movement::PlayerAudio,
@@ -217,9 +219,27 @@ pub(super) fn load(
         let (taunts, team_calls) = find_export(assets, package, voice, "Class")
             .map(|voice| voice_samples(assets, waves, voice))
             .unwrap_or_default();
+        let decapitation = match class {
+            "TMale1" | "TMale2" | "TBoss" | "TCow" => &["Dead4"][..],
+            "TFemale1" | "TFemale2" => &["Dead6"][..],
+            "TSkaarj" => &["Dead5"][..],
+            "TNali" => &["Dead3"][..],
+            _ => &[][..],
+        };
+        let decapitation = effect_motion(assets, textures, object, appearance, &mesh, decapitation);
         characters.models.push(CharacterModel {
             idle,
             deaths,
+            decapitation,
+            gib_family: match class {
+                "TMale1" | "TMale2" => Some(0),
+                "TFemale1" | "TFemale2" => Some(1),
+                "TBoss" => Some(2),
+                "TSkaarj" => Some(3),
+                "TNali" => Some(4),
+                "TCow" => Some(5),
+                _ => None,
+            },
             clips,
             audio,
             #[cfg(test)]
@@ -351,6 +371,11 @@ mod tests {
         assert!(map.characters.roster.len() >= 70);
         for (index, model) in map.characters.models.iter().enumerate() {
             assert!(!model.taunts.is_empty(), "{}", model.class);
+            assert!(
+                model.deaths.iter().all(|clip| clip.frames.len() > 1),
+                "{}",
+                model.class
+            );
             assert!(
                 model.audio.pain.iter().any(Option::is_some),
                 "{}",

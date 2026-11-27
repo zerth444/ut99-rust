@@ -1,4 +1,9 @@
-use std::{collections::HashMap, fs, io, path::Path, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    fs, io,
+    path::Path,
+    sync::Arc,
+};
 
 use crate::map::Vec3;
 use crate::package::{Export, Package, invalid};
@@ -28,6 +33,7 @@ struct SoundEvent {
 enum SoundSlot {
     BioCharge(usize),
     Tutorial,
+    Announcer,
 }
 
 #[derive(Clone, Copy)]
@@ -63,6 +69,15 @@ impl SoundEvents {
             gain: 1.0,
             source: None,
             slot: None,
+        });
+    }
+
+    pub(crate) fn announce(&mut self, wave: Arc<Wave>) {
+        self.0.push(SoundEvent {
+            wave,
+            gain: 1.0,
+            source: None,
+            slot: Some(SoundSlot::Announcer),
         });
     }
 
@@ -372,6 +387,7 @@ pub struct Mixer {
     cursors: Vec<f64>,
     mix: Vec<[f32; 2]>,
     voices: Vec<Voice>,
+    announcer_queue: VecDeque<SoundEvent>,
     weapon_loop: Option<(Arc<Wave>, f64)>,
     world_loops: HashMap<LoopId, MovingEmitter>,
 }
@@ -408,6 +424,7 @@ impl Mixer {
             cursors: Vec::new(),
             mix: Vec::new(),
             voices: Vec::new(),
+            announcer_queue: VecDeque::new(),
             weapon_loop: None,
             world_loops: HashMap::new(),
         }
@@ -446,6 +463,17 @@ impl Mixer {
 
     fn play(&mut self, event: SoundEvent) {
         if !event.gain.is_finite() || event.gain <= 0.0 {
+            return;
+        }
+        if event.slot == Some(SoundSlot::Announcer)
+            && self
+                .voices
+                .iter()
+                .any(|voice| voice.event.slot == event.slot)
+        {
+            if self.announcer_queue.len() < 8 {
+                self.announcer_queue.push_back(event);
+            }
             return;
         }
         if event.slot.is_some() {
@@ -536,6 +564,14 @@ impl Mixer {
             }
             (*cursor as usize) < count
         });
+        if !self
+            .voices
+            .iter()
+            .any(|voice| voice.event.slot == Some(SoundSlot::Announcer))
+            && let Some(next) = self.announcer_queue.pop_front()
+        {
+            self.play(next);
+        }
     }
 
     fn write_pcm(&self, output: &mut [i16], effects_gain: f32, music: &[i16], music_gain: f32) {

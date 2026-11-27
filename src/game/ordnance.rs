@@ -1329,6 +1329,10 @@ pub(super) fn guided_velocity(previous: Vec3, aim: Vec3, dt: f32, roll: &mut f32
 pub(super) const FLAK_SHELL_IMPACT: (f32, f32) = (0.5, 2.0);
 pub(super) const ROCKET_IMPACT: (f32, f32) = (0.7, 1.4);
 
+pub(super) fn projectile_headshot(kind: Kind, hit: Vec3, center: Vec3) -> bool {
+    kind == Kind::Razor && hit.2 - center.2 > 0.62 * crate::collision::PLAYER_HEIGHT
+}
+
 pub(super) fn direct_damage(
     kind: Kind,
     velocity: Vec3,
@@ -1340,8 +1344,7 @@ pub(super) fn direct_damage(
     if kind == Kind::Chunk && velocity.dot(velocity) <= 200.0 * 200.0 {
         return (0, Vec3::default());
     }
-    let damage = if kind == Kind::Razor && hit.2 - center.2 > 0.62 * crate::collision::PLAYER_HEIGHT
-    {
+    let damage = if projectile_headshot(kind, hit, center) {
         (3.5 * f32::from(damage)) as u16
     } else {
         damage
@@ -1906,6 +1909,9 @@ mod tests {
                 yaw: 0.0,
                 health: 200,
                 outgoing_scale: 1,
+                fell_at: None,
+                overkill: 0,
+                gibbed: false,
             };
             shots.fire(
                 &map,

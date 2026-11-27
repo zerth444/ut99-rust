@@ -90,6 +90,10 @@ pub(crate) struct PlayerStats {
 
 pub struct Fighter {
     character: Option<usize>,
+    spree: u16,
+    gibbed: bool,
+    decapitated: bool,
+    corpse_damage: u16,
     character_name: Option<String>,
     spoken_at: f32,
     pub team: Option<usize>,
@@ -161,6 +165,10 @@ impl Fighter {
         Self {
             team: None,
             character: None,
+            spree: 0,
+            gibbed: false,
+            decapitated: false,
+            corpse_damage: 0,
             character_name: None,
             spoken_at: f32::NEG_INFINITY,
             previous_body: (walker.position, start.yaw),
@@ -494,7 +502,14 @@ impl Fighter {
             |(_, model)| (&model.deaths, &model.idle, &model.clips),
         );
         if let Some(death) = self.fell_at {
-            let clip = &deaths[id % deaths.len()];
+            if self.gibbed {
+                return None;
+            }
+            let clip = (self.decapitated)
+                .then(|| self.character(map).map(|(_, model)| &model.decapitation))
+                .flatten()
+                .filter(|clip| !clip.frames.is_empty())
+                .unwrap_or(&deaths[id % deaths.len()]);
             return clip
                 .sample((time - death).min((clip.duration() - 0.001).max(0.0)))
                 .or_else(|| idle.sample(0.0));
@@ -745,7 +760,15 @@ impl Trace {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HitKind {
+    Impact,
+    Shot,
+    Headshot,
+}
+
 struct Hit {
+    kind: HitKind,
     bypass_armor: bool,
     victim: usize,
     owner: Option<usize>,
@@ -863,6 +886,7 @@ impl shock::Targets for ShockTargets<'_> {
     ) -> Option<shock::Blast> {
         match target {
             shock::Target::Pawn(victim) => self.hits.push(Hit {
+                kind: HitKind::Impact,
                 owner: Some(owner),
                 victim,
                 damage: damage.saturating_mul(self.game.shock_damage_scale(owner)),
@@ -920,6 +944,7 @@ pub struct Match {
     pub overtime: bool,
     pub(crate) guidance_lost_until: f32,
     pub hud_scale: f32,
+    pub(crate) view_bob: f32,
     pub show_decals: bool,
     pub decals: decals::Marks,
     pub ballistics: ballistics::Effects,
@@ -928,6 +953,8 @@ pub struct Match {
     pub rocket_trails: ordnance::RocketTrails,
     pub warhead_smoke: ordnance::WarheadSmoke,
     pub(crate) hammer_effects: Vec<super::Effect>,
+    body_gibs: Vec<(usize, dm_training::gibs::Gibs)>,
+    gib_seed: u32,
     pub(crate) drops: Vec<DroppedWeapon>,
     outgoing_damage: Option<DamageReadout>,
     bolts: Vec<Bolt>,
@@ -1001,6 +1028,7 @@ impl Match {
             overtime: false,
             guidance_lost_until: 0.0,
             hud_scale: 1.0,
+            view_bob: map.collision.profile.bob,
             show_decals: true,
             decals: decals::Marks::default(),
             ballistics: ballistics::Effects::default(),
@@ -1009,6 +1037,8 @@ impl Match {
             rocket_trails: ordnance::RocketTrails::default(),
             warhead_smoke: ordnance::WarheadSmoke::default(),
             hammer_effects: Vec::new(),
+            body_gibs: Vec::new(),
+            gib_seed: 0x4769_6273,
             teleports: crate::teleport::Bursts::default(),
             drops: Vec::new(),
             outgoing_damage: None,
@@ -1352,6 +1382,30 @@ impl Match {
         Some((position, pose))
     }
 
+    pub(crate) fn body_gibs<'a>(
+        &'a self,
+        map: &'a Map,
+    ) -> impl Iterator<Item = (Vec3, Vec3, f32, &'a [crate::map::Face])> + 'a {
+        self.body_gibs
+            .iter()
+            .filter_map(|(family, chunks)| Some((map.player_gibs[*family].as_ref()?, chunks)))
+            .flat_map(|(art, chunks)| {
+                chunks
+                    .models(art)
+                    .map(|(origin, spin, faces)| (origin, spin, 1.0, faces))
+            })
+    }
+
+    pub(crate) fn body_spurts<'a>(
+        &'a self,
+        map: &'a Map,
+    ) -> impl Iterator<Item = (Vec3, Vec3, Pose<'a>)> + 'a {
+        self.body_gibs
+            .iter()
+            .filter_map(|(family, chunks)| Some((map.player_gibs[*family].as_ref()?, chunks)))
+            .flat_map(move |(art, chunks)| chunks.spurts(art, self.time))
+    }
+
     pub(crate) fn training_gibs<'a>(
         &'a self,
         map: &'a Map,
@@ -1499,6 +1553,7 @@ impl Match {
         self.rocket_trails = ordnance::RocketTrails::default();
         self.warhead_smoke = ordnance::WarheadSmoke::default();
         self.hammer_effects.clear();
+        self.body_gibs.clear();
         self.drops.clear();
         self.outgoing_damage = None;
         self.decals = decals::Marks::default();
@@ -1747,7 +1802,9 @@ impl Match {
 
     fn announce(&mut self, map: &Map, index: usize, text: &'static str, sounds: &mut SoundEvents) {
         self.announcement = Some((text, self.time + 2.0));
-        sounds.extend(map.match_announcer[index].iter().cloned());
+        if let Some(wave) = &map.match_announcer[index] {
+            sounds.announce(wave.clone());
+        }
     }
 
     pub fn damage_notice(&self) -> Option<(u16, u16, f32)> {
@@ -1923,7 +1980,7 @@ impl Match {
         let mut camera = player.camera(map);
         let mut profile = map.collision.profile;
         profile.bob = bob;
-        let eye = player.walker.eye(profile, camera.right());
+        let eye = player.walker.visual_eye(profile, camera.right());
         let (previous, _) = player.previous_body;
         let offset = player.previous_stair_offset
             + (player.walker.stair_offset() - player.previous_stair_offset) * blend;
@@ -2086,6 +2143,7 @@ impl Match {
                 self.apply_hit(
                     map,
                     Hit {
+                        kind: HitKind::Impact,
                         victim: 0,
                         owner: Some(0),
                         damage: u16::MAX,
@@ -2108,7 +2166,19 @@ impl Match {
             }
             return sounds;
         }
+        let before = self.remaining();
         self.time += dt;
+        let remaining = self.remaining();
+        if remaining < before && !self.overtime {
+            if let Some((index, _)) = crate::props::COUNTDOWN_SECONDS
+                .iter()
+                .enumerate()
+                .find(|&(_, &second)| second <= before.saturating_sub(1) && second >= remaining)
+                && let Some(wave) = &map.countdown_announcer[index]
+            {
+                sounds.announce(wave.clone());
+            }
+        }
         if let Some(round) = &mut self.assault
             && let Some(training) = map.assault.as_ref().and_then(|data| data.tutorial.as_ref())
             && round.briefing_step(training, self.time, &mut sounds)
@@ -2345,6 +2415,7 @@ impl Match {
                 );
                 if fall > 0 {
                     hits.push(Hit {
+                        kind: HitKind::Impact,
                         bypass_armor: false,
                         victim: id,
                         owner: None,
@@ -2408,6 +2479,7 @@ impl Match {
             }
             if fighter.walker.position.2 < self.kill_z {
                 hits.push(Hit {
+                    kind: HitKind::Impact,
                     bypass_armor: false,
                     victim: id,
                     owner: None,
@@ -2429,6 +2501,7 @@ impl Match {
                         Impact::Heal(_) => unreachable!(),
                     };
                     hits.push(Hit {
+                        kind: HitKind::Impact,
                         victim: id,
                         owner: None,
                         damage,
@@ -2448,6 +2521,12 @@ impl Match {
         self.separate_fighters(map);
         self.collect(map, &mut sounds);
         self.update_drops(map, dt, &mut sounds);
+        for (family, chunks) in &mut self.body_gibs {
+            if let Some(art) = map.player_gibs[*family].as_ref() {
+                chunks.tick(art, map, self.time, dt, &mut self.gib_seed, &mut sounds);
+            }
+        }
+        self.body_gibs.retain(|(_, chunks)| !chunks.expired());
         self.move_translocators(map, dt, &mut sounds);
         self.update_rocket_locks(map, &mut sounds);
         if let Some(detonation) = manual_detonation {
@@ -3021,6 +3100,7 @@ impl Match {
             let offset = start + delta * at - camera.position;
             let damage = super::hammer_damage(alternate, offset.dot(offset).sqrt(), charge);
             hits.push(Hit {
+                kind: HitKind::Impact,
                 bypass_armor: false,
                 victim,
                 owner: Some(id),
@@ -3035,6 +3115,7 @@ impl Match {
                 .walker
                 .apply_self_damage_momentum(momentum, map.collision.profile);
             hits.push(Hit {
+                kind: HitKind::Impact,
                 bypass_armor: false,
                 victim: id,
                 owner: Some(id),
@@ -3517,6 +3598,13 @@ impl Match {
                     let headshot = weapon == Weapon::Sniper
                         && point.2 - self.fighters[victim].walker.position.2 > 0.62 * PLAYER_HEIGHT;
                     hits.push(Hit {
+                        kind: if headshot {
+                            HitKind::Headshot
+                        } else if bullet.is_some() {
+                            HitKind::Shot
+                        } else {
+                            HitKind::Impact
+                        },
                         bypass_armor: false,
                         victim,
                         owner: Some(id),
@@ -3650,6 +3738,7 @@ impl Match {
                 let damage = (PulseBeam::DAMAGE_PER_SECOND * duration) as u16 * boost;
                 if damage > 0 {
                     hits.push(Hit {
+                        kind: HitKind::Impact,
                         victim,
                         owner: Some(id),
                         damage,
@@ -3718,16 +3807,14 @@ impl Match {
         let scale = self.shock_damage_scale(owner);
         self.objective_blast(map, owner, &blast, scale, "jolted");
         self.blast_translocators(map, owner, &blast, scale);
-        for (victim, fighter) in self
-            .fighters
-            .iter()
-            .enumerate()
-            .filter(|(_, fighter)| fighter.health > 0)
-        {
+        for (victim, fighter) in self.fighters.iter().enumerate().filter(|(_, fighter)| {
+            fighter.health > 0 || (fighter.fell_at.is_some() && !fighter.gibbed)
+        }) {
             if let Some((damage, momentum)) =
                 blast.hit_player(&map.collision, fighter.walker.position)
             {
                 hits.push(Hit {
+                    kind: HitKind::Impact,
                     owner: Some(owner),
                     victim,
                     damage: damage.saturating_mul(scale),
@@ -4254,6 +4341,15 @@ impl Match {
                     });
                 }
                 hits.push(Hit {
+                    kind: if ordnance::projectile_headshot(
+                        payload.kind,
+                        position,
+                        self.fighters[victim].walker.position,
+                    ) {
+                        HitKind::Headshot
+                    } else {
+                        HitKind::Impact
+                    },
                     bypass_armor: false,
                     victim,
                     owner: Some(bolt.owner),
@@ -4402,12 +4498,13 @@ impl Match {
                 .fighters
                 .iter()
                 .enumerate()
-                .filter(|(_, f)| f.health > 0)
+                .filter(|(_, f)| f.health > 0 || (f.fell_at.is_some() && !f.gibbed))
             {
                 if let Some((damage, momentum)) =
                     blast.hit_player(&map.collision, fighter.walker.position)
                 {
                     hits.push(Hit {
+                        kind: HitKind::Impact,
                         bypass_armor: false,
                         victim,
                         owner: Some(owner),
@@ -4503,6 +4600,7 @@ impl Match {
                     wave.struck[victim] = true;
                     if damage > 0 {
                         hits.push(Hit {
+                            kind: HitKind::Impact,
                             bypass_armor: false,
                             victim,
                             owner: Some(wave.owner),
@@ -4560,8 +4658,28 @@ impl Match {
             return;
         }
         let victim = &mut self.fighters[hit.victim];
-        if victim.health == 0
-            || hit.damage == 0
+        if victim.health == 0 {
+            let recent = victim.fell_at.is_some_and(|at| self.time - at > 0.0);
+            if recent && !victim.gibbed && hit.damage != u16::MAX && hit.damage > 0 {
+                let damage = if hit.kind == HitKind::Shot {
+                    hit.damage * 2 / 5
+                } else {
+                    hit.damage
+                };
+                victim.corpse_damage = victim.corpse_damage.saturating_add(damage);
+                if damage > 40 || (damage > 30 && victim.corpse_damage > 80) {
+                    victim.walker.add_velocity(hit.impulse);
+                    if let Some(chunks) =
+                        spawn_body_gibs(map, victim, self.time, false, &mut self.gib_seed, sounds)
+                    {
+                        victim.gibbed = true;
+                        self.body_gibs.push(chunks);
+                    }
+                }
+            }
+            return;
+        }
+        if hit.damage == 0
             || (hit.damage != u16::MAX
                 && (hit.owner.is_some() || cannon)
                 && self.time < victim.protected_until)
@@ -4630,6 +4748,8 @@ impl Match {
             return;
         }
         victim.deaths += 1;
+        victim.spree = 0;
+        victim.decapitated = hit.kind == HitKind::Headshot;
         if hit.victim == 0 {
             self.player_frags = (0, f32::NEG_INFINITY);
         }
@@ -4637,6 +4757,18 @@ impl Match {
             .extend(DroppedWeapon::from_fighter(map, victim, self.time));
         victim.charge = None;
         victim.fell_at = Some(self.time);
+        let overkill = damage.saturating_sub(health_before);
+        let gibs = hit.kind == HitKind::Impact
+            && hit.damage != u16::MAX
+            && (overkill > 80
+                || (overkill > 40 && dm_training::gibs::roll(&mut self.gib_seed) < 0.6));
+        if (gibs || victim.decapitated)
+            && let Some(chunks) =
+                spawn_body_gibs(map, victim, self.time, !gibs, &mut self.gib_seed, sounds)
+        {
+            victim.gibbed = gibs;
+            self.body_gibs.push(chunks);
+        }
         for bolt in &mut self.bolts {
             if bolt.owner == hit.victim {
                 bolt.pilot = None;
@@ -4668,6 +4800,18 @@ impl Match {
             if enemy {
                 let stats = &mut self.fighters[owner].stats;
                 stats.kills = stats.kills.saturating_add(1);
+                self.fighters[owner].spree = self.fighters[owner].spree.saturating_add(1);
+                let spree = match self.fighters[owner].spree {
+                    5 => Some((8, "KILLING SPREE")),
+                    10 => Some((9, "RAMPAGE")),
+                    15 => Some((10, "DOMINATING")),
+                    20 => Some((11, "UNSTOPPABLE")),
+                    25 => Some((12, "GODLIKE")),
+                    _ => None,
+                };
+                if let Some((sample, text)) = spree {
+                    self.announce(map, sample, text, sounds);
+                }
             }
             self.fighters[owner].score = self.fighters[owner]
                 .score
@@ -4679,12 +4823,15 @@ impl Match {
             }
             if !self.first_frag {
                 self.first_frag = true;
-                self.announce(map, 0, "FIRST FRAG", sounds);
+                self.announce(map, 0, "FIRST BLOOD", sounds);
             }
             if enemy && owner != 0 {
                 self.bot_voice(map, owner, None, sounds);
             }
-            if owner == 0 {
+            if owner == 0 && enemy {
+                if hit.kind == HitKind::Headshot {
+                    self.announce(map, 5, "HEADSHOT", sounds);
+                }
                 let (count, last) = self.player_frags;
                 let count = if self.time - last <= 2.5 {
                     count.saturating_add(1)
@@ -4693,8 +4840,10 @@ impl Match {
                 };
                 self.player_frags = (count, self.time);
                 match count {
-                    2 => self.announce(map, 1, "DOUBLE FRAG", sounds),
-                    3 => self.announce(map, 2, "MULTI FRAG", sounds),
+                    2 => self.announce(map, 1, "DOUBLE KILL", sounds),
+                    3 => self.announce(map, 2, "MULTI KILL", sounds),
+                    4 => self.announce(map, 6, "ULTRA KILL", sounds),
+                    5.. => self.announce(map, 7, "MONSTER KILL", sounds),
                     _ => {}
                 }
             }
@@ -6226,6 +6375,39 @@ fn take_item(
     true
 }
 
+fn spawn_body_gibs(
+    map: &Map,
+    fighter: &Fighter,
+    time: f32,
+    head_only: bool,
+    seed: &mut u32,
+    sounds: &mut SoundEvents,
+) -> Option<(usize, dm_training::gibs::Gibs)> {
+    let family = fighter
+        .character(map)
+        .map_or(Some(0), |(_, model)| model.gib_family)?;
+    let art = map.player_gibs[family].as_ref()?;
+    let mut chunks = dm_training::gibs::Gibs::spawn(
+        art,
+        fighter.walker.position,
+        fighter.walker.velocity() * art.mass,
+        PLAYER_HEIGHT,
+        time,
+        seed,
+    );
+    if head_only {
+        chunks.only_part(1);
+    } else {
+        sounds.extend_at(
+            map.player_gib_sound.iter().cloned(),
+            fighter.walker.position,
+            CONTACT_SOUND_RADIUS,
+            1.0,
+        );
+    }
+    Some((family, chunks))
+}
+
 fn nearest_hit(
     fighters: &[Fighter],
     owner: usize,
@@ -6431,6 +6613,60 @@ mod tests {
 
     #[test]
     #[ignore = "requires local GOTY assets"]
+    fn shock_combo_gibs_and_stock_kill_announcements_apply_through_match_damage() {
+        let (map, mut game) = flight_fixture();
+        assert!(map.player_gibs.iter().all(Option::is_some));
+        assert!(map.match_announcer.iter().all(Option::is_some));
+        game.time = 2.0;
+        game.fighters[0].spree = 9;
+        game.fighters[1].walker.position = Vec3(100.0, 0.0, 39.2);
+        let mut sounds = SoundEvents::default();
+        let hit = |kind, damage| Hit {
+            kind,
+            victim: 1,
+            owner: Some(0),
+            damage,
+            bypass_armor: false,
+            impulse: Vec3::default(),
+        };
+        game.apply_hit(&map, hit(HitKind::Headshot, 100), &mut sounds);
+        assert_eq!(game.fighters[1].health, 0);
+        assert!(!game.fighters[1].gibbed);
+        assert!(game.fighters[1].pose(&map, 1, game.time).is_some());
+        assert_eq!(game.body_gibs(&map).count(), 1);
+        for sample in [5, 9] {
+            assert!(sounds.waves().any(|wave| std::sync::Arc::ptr_eq(
+                wave,
+                map.match_announcer[sample].as_ref().unwrap()
+            )));
+        }
+        let score = game.fighters[0].score;
+        game.time += 0.2;
+        game.apply_hit(&map, hit(HitKind::Impact, 100), &mut sounds);
+        assert!(game.fighters[1].gibbed);
+        assert!(game.fighters[1].pose(&map, 1, game.time).is_none());
+        assert!(game.body_gibs(&map).count() >= 4);
+        assert_eq!(game.fighters[0].score, score);
+
+        game.fighters[1] = Fighter::spawn(&map, 0, 0.0);
+        game.fighters[1].walker.position = Vec3(100.0, 0.0, 39.2);
+        game.fighters[1].health = 30;
+        let mut hits = Vec::new();
+        game.shock_blast(
+            &map,
+            0,
+            shock::Blast::radial(Vec3(120.0, 0.0, 39.2), 250.0, 165.0, 100.0),
+            &mut hits,
+        );
+        for hit in hits {
+            game.apply_hit(&map, hit, &mut sounds);
+        }
+        assert_eq!(game.fighters[1].health, 0);
+        assert!(game.fighters[1].gibbed);
+    }
+
+    #[test]
+    #[ignore = "requires local GOTY assets"]
     fn cheat_commands_change_only_the_local_player() {
         let mut map = arena();
         let mut game = Match::new(
@@ -6443,6 +6679,7 @@ mod tests {
         );
         game.time = 2.0;
         let hit = |victim| Hit {
+            kind: HitKind::Impact,
             victim,
             owner: Some(1 - victim),
             damage: 20,
@@ -6819,6 +7056,7 @@ mod tests {
         game.apply_hit(
             &map,
             Hit {
+                kind: HitKind::Impact,
                 victim: 0,
                 owner: None,
                 damage: 100,
@@ -7050,6 +7288,7 @@ mod tests {
             game.apply_hit(
                 &map,
                 Hit {
+                    kind: HitKind::Impact,
                     victim: 1,
                     owner: Some(0),
                     damage: 1000,
@@ -7217,6 +7456,7 @@ mod tests {
             game.apply_hit(
                 &map,
                 Hit {
+                    kind: HitKind::Impact,
                     victim: 1,
                     owner: Some(0),
                     damage: 1000,
@@ -7842,6 +8082,7 @@ mod tests {
         let mut sounds = SoundEvents::default();
         game.time = 2.0;
         let hit = |victim| Hit {
+            kind: HitKind::Impact,
             victim,
             owner: Some(0),
             bypass_armor: true,
@@ -8248,6 +8489,7 @@ mod tests {
                     game.apply_hit(
                         &map,
                         Hit {
+                            kind: HitKind::Impact,
                             bypass_armor: false,
                             victim: 0,
                             owner: Some(1),
@@ -8906,6 +9148,7 @@ mod tests {
         game.time = 2.0;
         let mut sounds = SoundEvents::default();
         let hit = |owner, damage| Hit {
+            kind: HitKind::Impact,
             owner,
             victim: 1,
             damage,
@@ -8954,6 +9197,7 @@ mod tests {
         game.fighters[0].weapon = Weapon::Hammer;
         assert!(DroppedWeapon::from_fighter(&map, &game.fighters[0], game.time).is_none());
         let kill = || Hit {
+            kind: HitKind::Impact,
             owner: Some(0),
             victim: 1,
             damage: 200,
@@ -9462,6 +9706,7 @@ mod tests {
         game.apply_hit(
             &map,
             Hit {
+                kind: HitKind::Impact,
                 bypass_armor: false,
                 victim: 0,
                 owner: Some(1),
@@ -9531,6 +9776,7 @@ mod tests {
             game.apply_hit(
                 &map,
                 Hit {
+                    kind: HitKind::Impact,
                     bypass_armor: false,
                     victim,
                     owner: Some(0),
@@ -9545,6 +9791,7 @@ mod tests {
             game.apply_hit(
                 &map,
                 Hit {
+                    kind: HitKind::Impact,
                     bypass_armor: false,
                     victim,
                     owner: None,
@@ -10877,9 +11124,10 @@ mod tests {
         game.apply_hit(
             &map,
             Hit {
+                kind: HitKind::Impact,
                 victim: 0,
                 owner: Some(1),
-                damage: 200,
+                damage: 100,
                 impulse: Vec3::default(),
                 bypass_armor: true,
             },
@@ -11035,6 +11283,7 @@ mod tests {
         game.time = 2.0;
         let mut sounds = SoundEvents::default();
         let hit = |victim, owner| Hit {
+            kind: HitKind::Impact,
             bypass_armor: false,
             victim,
             owner: Some(owner),

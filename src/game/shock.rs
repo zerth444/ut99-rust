@@ -93,6 +93,7 @@ pub(super) struct Blast {
     radius: f32,
     damage: f32,
     momentum: f32,
+    combo: bool,
 }
 
 impl Blast {
@@ -102,6 +103,7 @@ impl Blast {
             radius,
             damage,
             momentum,
+            combo: false,
         }
     }
     fn new(position: Vec3, assets: &Assets, combo: bool) -> Self {
@@ -110,6 +112,7 @@ impl Blast {
             radius: if combo { 250.0 } else { 70.0 },
             damage: assets.damage * if combo { 3.0 } else { 1.0 },
             momentum: assets.momentum * if combo { 2.0 } else { 1.0 },
+            combo,
         }
     }
 
@@ -118,7 +121,15 @@ impl Blast {
         collision: &crate::collision::Collision,
         center: Vec3,
     ) -> Option<(u16, Vec3)> {
-        self.hit_actor(collision, center, crate::collision::PLAYER_RADIUS)
+        let radius = crate::collision::PLAYER_RADIUS;
+        let hit = self.falloff(center, radius)?;
+        let exposed = crate::collision::PLAYER_HEIGHT * 0.65;
+        let visible = self.visible(collision, center)
+            || (self.combo
+                && [exposed, -exposed]
+                    .into_iter()
+                    .any(|height| self.visible(collision, center + Vec3(0.0, 0.0, height))));
+        visible.then_some(hit)
     }
 
     pub(super) fn hit_actor(
@@ -127,17 +138,25 @@ impl Blast {
         center: Vec3,
         radius: f32,
     ) -> Option<(u16, Vec3)> {
+        let hit = self.falloff(center, radius)?;
+        self.visible(collision, center).then_some(hit)
+    }
+
+    fn visible(&self, collision: &crate::collision::Collision, point: Vec3) -> bool {
+        let offset = self.position - point;
+        let distance = offset.dot(offset).sqrt();
+        // Stop just short of the surface where the projectile exploded.
+        distance <= 0.2
+            || collision
+                .ray(point, offset * (1.0 - 0.2 / distance))
+                .is_none()
+    }
+
+    fn falloff(&self, center: Vec3, radius: f32) -> Option<(u16, Vec3)> {
         let offset = center - self.position;
         let distance = offset.dot(offset).sqrt();
         let scale = 1.0 - (distance.max(1.0) - radius).max(0.0) / self.radius;
-        // Stop just short of the origin so the surface hit by the projectile does
-        // not occlude the explosion on its own side of the wall.
-        if scale <= 0.0
-            || (distance > 0.2
-                && collision
-                    .ray(center, offset * (0.2 / distance - 1.0))
-                    .is_some())
-        {
+        if scale <= 0.0 {
             return None;
         }
         let direction = offset * distance.max(1.0).recip();
@@ -724,6 +743,24 @@ mod tests {
         package::Package,
         render::Frame,
     };
+
+    #[test]
+    fn combo_reaches_an_exposed_pawn_but_respects_full_cover() {
+        let mut collision = crate::collision::Collision::test_world();
+        let blast = Blast::new(Vec3(0.0, 0.0, 40.0), &Assets::default(), true);
+        let target = Vec3(100.0, 0.0, 40.0);
+        let damage = blast.hit_player(&collision, target).unwrap().0;
+        assert!(damage > 100);
+        collision.add_box(Vec3(45.0, -50.0, 0.0), Vec3(55.0, 50.0, 45.0));
+        assert!(
+            blast
+                .hit_actor(&collision, target, crate::collision::PLAYER_RADIUS)
+                .is_none()
+        );
+        assert_eq!(blast.hit_player(&collision, target).unwrap().0, damage);
+        collision.add_box(Vec3(45.0, -50.0, 45.0), Vec3(55.0, 50.0, 100.0));
+        assert!(blast.hit_player(&collision, target).is_none());
+    }
 
     #[test]
     #[ignore = "requires the local GOTY Deck16 map, models, textures and sounds"]

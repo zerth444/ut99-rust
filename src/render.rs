@@ -88,6 +88,26 @@ struct Vertex {
     v: f32,
 }
 
+struct WeaponLighting<'a> {
+    camera: &'a Camera,
+    lights: Vec<&'a crate::light::Light>,
+    ambient: [f32; 3],
+}
+
+impl WeaponLighting<'_> {
+    fn sample(&self, center: Vec3, normal: Vec3, time: f32) -> [f32; 3] {
+        let axes = View::camera(self.camera);
+        let world = |v: Vec3| axes.forward * v.0 + axes.right * v.1 + axes.up * v.2;
+        let direct = crate::light::actor_lighting(
+            self.lights.iter().copied(),
+            self.camera.position + world(center) * (1.0 / 64.0),
+            world(normal),
+            time,
+        );
+        std::array::from_fn(|channel| (direct[channel] + self.ambient[channel]).min(1.8))
+    }
+}
+
 struct View {
     eye: Vec3,
     right: Vec3,
@@ -595,9 +615,13 @@ impl Frame {
         .then(|| map.arsenal.get(&player.weapon))
         .flatten()
         .map(|art| (art, player.weapon_pose(art, game.time)));
-        let muzzle = gun
-            .and_then(|(art, pose)| art.muzzle_position(pose))
-            .map(|point| self.projected_muzzle(player.weapon, point));
+        let walk_bob = player.walker.walk_bob(game.view_bob);
+        let muzzle = gun.and_then(|(art, pose)| {
+            Some(self.projected_muzzle(
+                player.weapon,
+                art.muzzle_position(pose)? + weapon_bob(art, walk_bob),
+            ))
+        });
         let attach = |weapon, point, age| view.attach_muzzle(map, muzzle, weapon, point, zoom, age);
         self.draw_flags(map, &view, game.time, game.flag_models(map, body_blend));
         self.draw_control_points(map, &view, game.time, game.control_owners());
@@ -672,33 +696,14 @@ impl Frame {
         for visual in game.assault_effects(map) {
             self.draw_world_effect(&view, game.time, visual);
         }
-        for (origin, angles, scale, faces) in
-            game.assault_debris(map).chain(game.training_gibs(map))
+        for (origin, angles, scale, faces) in game
+            .assault_debris(map)
+            .chain(game.training_gibs(map))
+            .chain(game.body_gibs(map))
         {
-            if view.point(origin).2 + 24.0 * scale < NEAR {
-                continue;
-            }
-            let axis = |vector| crate::mover::rotate(vector, angles);
-            let model = view.basis_model(
-                origin,
-                axis(Vec3(1.0, 0.0, 0.0)),
-                axis(Vec3(0.0, 1.0, 0.0)),
-                axis(Vec3(0.0, 0.0, 1.0)),
-                Vec3(scale, scale, scale),
-            );
-            self.draw_lit_faces(
-                faces,
-                &model,
-                game.time,
-                false,
-                None,
-                None,
-                &map.scene_lights,
-                None,
-                None,
-            );
+            self.draw_chunk(map, &view, game.time, origin, angles, scale, faces);
         }
-        for (origin, direction, pose) in game.training_spurts(map) {
+        for (origin, direction, pose) in game.training_spurts(map).chain(game.body_spurts(map)) {
             let model = view.in_model(origin, direction, 1.0);
             self.draw_faces_in_view(pose.current, &model, game.time, false, Some(pose), None);
         }
@@ -771,6 +776,7 @@ impl Frame {
                     None,
                     skin,
                     palette,
+                    None,
                 );
             }
         }
@@ -890,7 +896,17 @@ impl Frame {
                     .as_ref()
                     .is_some_and(|flash| game.time - player.fired_at < flash.length)
                     .then_some(player.fired_count as usize);
-                self.draw_weapon_view(player.weapon, weapon, pose, game.time, muzzle, skin);
+                self.draw_weapon_view(
+                    map,
+                    camera,
+                    player.weapon,
+                    weapon,
+                    pose,
+                    game.time,
+                    muzzle,
+                    skin,
+                    walk_bob,
+                );
             }
         }
         self.layer(Layer::Hud);
@@ -956,23 +972,105 @@ impl Frame {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn draw_chunk(
+        &mut self,
+        map: &Map,
+        view: &View,
+        time: f32,
+        origin: Vec3,
+        angles: Vec3,
+        scale: f32,
+        faces: &[Face],
+    ) {
+        if view.point(origin).2 + 24.0 * scale < NEAR {
+            return;
+        }
+        let axis = |vector| crate::mover::rotate(vector, angles);
+        let model = view.basis_model(
+            origin,
+            axis(Vec3(1.0, 0.0, 0.0)),
+            axis(Vec3(0.0, 1.0, 0.0)),
+            axis(Vec3(0.0, 0.0, 1.0)),
+            Vec3(scale, scale, scale),
+        );
+        self.draw_lit_faces(
+            faces,
+            &model,
+            time,
+            false,
+            None,
+            None,
+            &map.scene_lights,
+            None,
+            None,
+        );
+    }
+
     fn projected_muzzle(&self, weapon: Weapon, Vec3(x, y, z): Vec3) -> (Weapon, Vec3) {
         let zoom = weapon_view_zoom(weapon, self.width, self.height);
         (weapon, Vec3(x, y * zoom, z * zoom))
     }
 
+    fn weapon_ambient(&self, map: &Map, eye: Vec3) -> [f32; 3] {
+        let ambient = map
+            .collision
+            .ray_surface(eye, Vec3(0.0, 0.0, -128.0))
+            .and_then(|(floor, normal)| {
+                map.faces.iter().find_map(|face| {
+                    let lightmap = face.lightmap.as_ref()?;
+                    let offset = floor - face.origin;
+                    if face.sky
+                        || face.normal.dot(normal) < 0.95
+                        || offset.dot(face.normal).abs() > 1.0
+                    {
+                        return None;
+                    }
+                    let mut signs = [false; 2];
+                    for (a, b) in face
+                        .vertices
+                        .iter()
+                        .zip(face.vertices.iter().cycle().skip(1))
+                    {
+                        let side = (*b - *a).cross(floor - *a).dot(face.normal);
+                        signs[0] |= side > 0.01;
+                        signs[1] |= side < -0.01;
+                    }
+                    if signs == [true, true] {
+                        return None;
+                    }
+                    let animated = self
+                        .animated_lightmaps
+                        .get(&(std::sync::Arc::as_ptr(lightmap) as usize))
+                        .map(|cached| cached.colors.as_slice());
+                    Some(lightmap.sample(
+                        offset.dot(face.u_axis) + face.pan[0],
+                        offset.dot(face.v_axis) + face.pan[1],
+                        animated,
+                    ))
+                })
+            });
+        ambient.map_or([0.20; 3], |sample| {
+            sample.map(|gain| (gain * 0.35).clamp(0.16, 0.50))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn draw_weapon_view(
         &mut self,
+        map: &Map,
+        camera: &Camera,
         kind: Weapon,
         weapon: &crate::game::WeaponAssets,
         pose: crate::game::Pose<'_>,
         time: f32,
         flash_index: Option<usize>,
         skin: Option<&crate::texture::Texture>,
+        walk_bob: Vec3,
     ) {
         self.zoom = weapon_view_zoom(kind, self.width, self.height);
         let view = Camera {
-            position: Vec3::default(),
+            position: weapon_bob(weapon, walk_bob) * -1.0,
             yaw: 0.0,
             pitch: 0.0,
         };
@@ -1025,7 +1123,16 @@ impl Frame {
         }
         self.depth.fill(0.0);
         self.layer(Layer::Weapon);
-        self.draw_lit_faces(
+        let lighting = WeaponLighting {
+            camera,
+            lights: map
+                .scene_lights
+                .iter()
+                .filter(|light| light.reaches(camera.position))
+                .collect(),
+            ambient: self.weapon_ambient(map, camera.position),
+        };
+        self.draw_model_faces(
             pose.current,
             &View::camera(&view),
             time,
@@ -1035,6 +1142,8 @@ impl Frame {
             &[],
             None,
             skin,
+            None,
+            Some(&lighting),
         );
         self.zoom = 1.0;
     }
@@ -1075,23 +1184,38 @@ impl Frame {
             .then(|| map.arsenal.get(&game.weapon))
             .flatten()
             .map(|art| (art, game.pose(art)));
-        let muzzle = gun
-            .and_then(|(art, pose)| art.muzzle_position(pose))
-            .map(|point| self.projected_muzzle(game.weapon, point));
+        let muzzle = gun.and_then(|(art, pose)| {
+            Some(self.projected_muzzle(
+                game.weapon,
+                art.muzzle_position(pose)? + weapon_bob(art, game.walk_bob),
+            ))
+        });
         let attach = |weapon, point, age| view.attach_muzzle(map, muzzle, weapon, point, zoom, age);
         if game.show_decals {
             for mark in game.decals.visible() {
                 self.draw_faces_in_view(mark, &view, time, false, None, None);
             }
         }
-        if let Some(target) = &game.target {
+        for (position, rotation, scale, faces) in game.body_gibs(map) {
+            self.draw_chunk(map, &view, time, position, rotation, scale, faces);
+        }
+        for (position, direction, pose) in game.body_spurts(map) {
+            let model = view.in_model(position, direction, 1.0);
+            self.draw_faces_in_view(pose.current, &model, time, false, Some(pose), None);
+        }
+        if let Some(target) = &game.target
+            && !target.gibbed
+        {
             let motion = if target.health == 0 {
                 &map.player_deaths[0]
             } else {
                 &map.player_idle
             };
             let age = if target.health == 0 {
-                (motion.duration() - 0.001).max(0.0)
+                target
+                    .fell_at
+                    .map_or(0.0, |at| time - at)
+                    .min((motion.duration() - 0.001).max(0.0))
             } else if motion.duration() > 0.0 {
                 game.time.rem_euclid(motion.duration())
             } else {
@@ -1118,7 +1242,9 @@ impl Frame {
         );
         game.ballistics
             .visuals(&map.ballistics, game.time, &mut draw_effect);
-        if let Some(death) = &game.death {
+        if let Some(death) = &game.death
+            && !death.gibbed
+        {
             let motion = &map.player_deaths[death.animation];
             let age = (game.time - death.started).min((motion.duration() - 0.001).max(0.0));
             if let Some(pose) = motion.sample(age) {
@@ -1152,12 +1278,15 @@ impl Frame {
                 None
             };
             self.draw_weapon_view(
+                map,
+                camera,
                 game.weapon,
                 weapon,
                 pose,
                 time,
                 (game.muzzle > game.time).then_some(game.shots as usize),
                 skin,
+                game.walk_bob,
             );
         }
         self.layer(Layer::Hud);
@@ -1825,7 +1954,7 @@ impl Frame {
         skin: Option<&crate::texture::Texture>,
     ) {
         self.draw_model_faces(
-            faces, view, time, sky, pose, glow, lights, mover, skin, None,
+            faces, view, time, sky, pose, glow, lights, mover, skin, None, None,
         );
     }
 
@@ -1842,6 +1971,7 @@ impl Frame {
         mover: Option<&crate::mover::Mover>,
         skin: Option<&crate::texture::Texture>,
         palette: Option<(&[usize], &crate::props::characters::Skin)>,
+        weapon_lighting: Option<&WeaponLighting<'_>>,
     ) {
         let mut transformed = Vec::new();
         let mut clipped = Vec::new();
@@ -1933,6 +2063,15 @@ impl Frame {
             }
             let light = if flags & 0x0040_0000 != 0 {
                 [1.0; 3]
+            } else if let Some(lighting) = weapon_lighting {
+                let center = face
+                    .vertices
+                    .iter()
+                    .copied()
+                    .fold(Vec3::default(), |sum, vertex| sum + vertex)
+                    * (1.0 / face.vertices.len() as f32)
+                    - view.eye;
+                lighting.sample(center, normal, time)
             } else if lights.is_empty() {
                 [0.93 + normal.dot(Vec3(-0.34, 0.43, 0.69)) * 0.32; 3]
             } else {
@@ -2258,6 +2397,17 @@ fn focal_length(width: usize, height: usize) -> f32 {
     (width as f32).max(height as f32 * (16.0 / 9.0)) * 0.48
 }
 
+fn weapon_bob(weapon: &crate::game::WeaponAssets, walk: Vec3) -> Vec3 {
+    let damping = weapon.bob_damping.unwrap_or(0.96);
+    // Weapon.uc positions the mesh relative to the same WalkBob used for the camera.
+    // First-person meshes are stored in the renderer at 64 times their UE1 scale.
+    Vec3(
+        0.0,
+        (damping - 1.0) * walk.1,
+        (0.45 + 0.55 * damping - 1.0) * walk.2,
+    ) * 64.0
+}
+
 fn weapon_view_zoom(weapon: Weapon, width: usize, height: usize) -> f32 {
     let vertical_focal = match weapon {
         Weapon::Flak => height as f32 * 0.52,
@@ -2267,7 +2417,7 @@ fn weapon_view_zoom(weapon: Weapon, width: usize, height: usize) -> f32 {
         // Match the 16:9 weapon view on wider displays.
         _ => focal_length(0, height),
     };
-    vertical_focal / focal_length(width, height)
+    0.84 * vertical_focal / focal_length(width, height)
 }
 
 fn ndc(p: Vec3, [w, h]: [usize; 2]) -> [f32; 3] {

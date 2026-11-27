@@ -24,6 +24,7 @@ pub(crate) struct Art {
 }
 
 struct Chunk {
+    part: usize,
     position: Vec3,
     velocity: Vec3,
     rotation: Vec3,
@@ -38,7 +39,7 @@ struct Spurt {
     born: f32,
 }
 
-pub(in crate::game::deathmatch) struct Gibs {
+pub(crate) struct Gibs {
     chunks: Vec<Chunk>,
     spurts: Vec<Spurt>,
     expires: f32,
@@ -75,6 +76,7 @@ impl Gibs {
                     (base_velocity + variation) * (0.2 + roll(seed))
                 };
                 Chunk {
+                    part: index,
                     position: origin + Vec3(0.0, 0.0, part.height * height),
                     velocity,
                     rotation: Vec3::default(),
@@ -93,6 +95,14 @@ impl Gibs {
             }],
             expires: art.lifetime.map_or(f32::INFINITY, |age| time + age),
         }
+    }
+
+    pub fn only_part(&mut self, index: usize) {
+        self.chunks.retain(|chunk| chunk.part == index);
+    }
+
+    pub fn expired(&self) -> bool {
+        self.chunks.is_empty() && self.spurts.is_empty()
     }
 
     pub fn tick(
@@ -164,10 +174,13 @@ impl Gibs {
         &'a self,
         art: &'a Art,
     ) -> impl Iterator<Item = (Vec3, Vec3, &'a [Face])> + 'a {
-        self.chunks
-            .iter()
-            .zip(&art.parts)
-            .map(|(chunk, part)| (chunk.position, chunk.rotation, part.faces.as_slice()))
+        self.chunks.iter().map(|chunk| {
+            (
+                chunk.position,
+                chunk.rotation,
+                art.parts[chunk.part].faces.as_slice(),
+            )
+        })
     }
 
     pub fn spurts<'a>(
@@ -194,6 +207,6 @@ impl Gibs {
     }
 }
 
-pub(super) fn roll(seed: &mut u32) -> f32 {
+pub(in crate::game::deathmatch) fn roll(seed: &mut u32) -> f32 {
     (jitter(seed) + 1.0) * 0.5
 }

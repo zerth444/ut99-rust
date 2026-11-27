@@ -635,12 +635,38 @@ impl Walker {
         };
         let lateral = 0.4 * profile.bob * stride * (8.0 * self.bob_time).sin();
         let vertical = self.applied_bob + 0.3 * profile.bob * stride * (16.0 * self.bob_time).sin();
+        self.eye_offset(profile, right, Vec3(0.0, lateral, vertical))
+    }
+
+    pub(crate) fn visual_eye(&self, profile: Profile, right: Vec3) -> Vec3 {
+        self.eye_offset(profile, right, self.walk_bob(profile.bob))
+    }
+
+    fn eye_offset(&self, profile: Profile, right: Vec3, bob: Vec3) -> Vec3 {
         let height = if self.grounded {
             profile.eye_height
         } else {
             profile.eye_height * 0.7
         };
-        self.position + UP * (height + vertical) + right * lateral
+        self.position + UP * (height + bob.2) + right * bob.1
+    }
+
+    pub(crate) fn walk_bob(&self, amount: f32) -> Vec3 {
+        let speed = if self.grounded {
+            horizontal_length(self.velocity)
+        } else {
+            0.0
+        };
+        let lateral = 0.65 * amount * speed * (6.0 * self.bob_time).sin();
+        let stride = if !self.grounded {
+            0.0
+        } else if speed < 10.0 {
+            30.0
+        } else {
+            speed
+        };
+        let vertical = self.applied_bob + amount * stride * (12.0 * self.bob_time).sin();
+        Vec3(0.0, lateral, vertical)
     }
 
     pub fn stair_offset(&self) -> f32 {

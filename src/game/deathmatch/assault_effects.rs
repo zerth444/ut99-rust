@@ -509,6 +509,7 @@ impl Environment {
                     blast.hit_player(&map.collision, fighter.walker.position)
                 {
                     hits.push(Hit {
+                        kind: super::HitKind::Impact,
                         victim,
                         owner: None,
                         bypass_armor: false,

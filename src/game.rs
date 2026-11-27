@@ -152,6 +152,7 @@ impl Weapon {
 
 #[derive(Default)]
 pub struct WeaponAssets {
+    pub(crate) bob_damping: Option<f32>,
     pub view: Vec<Face>,
     pub pickup_ammo: Option<u16>,
     pub max_ammo: Option<u16>,
@@ -647,6 +648,7 @@ pub struct Death {
     pub yaw: f32,
     pub started: f32,
     pub animation: usize,
+    pub gibbed: bool,
 }
 
 pub struct TrainingTarget {
@@ -654,6 +656,9 @@ pub struct TrainingTarget {
     pub yaw: f32,
     pub health: u16,
     outgoing_scale: u16,
+    pub(crate) fell_at: Option<f32>,
+    overkill: u16,
+    pub(crate) gibbed: bool,
 }
 
 impl TrainingTarget {
@@ -670,9 +675,12 @@ impl TrainingTarget {
     }
 
     fn damage(&mut self, damage: u16) {
-        self.health = self
-            .health
-            .saturating_sub(damage.saturating_mul(self.outgoing_scale));
+        if self.health == 0 {
+            return;
+        }
+        let damage = damage.saturating_mul(self.outgoing_scale);
+        self.overkill = damage.saturating_sub(self.health);
+        self.health = self.health.saturating_sub(damage);
     }
 }
 
@@ -721,6 +729,10 @@ impl SniperZoom {
 }
 
 pub struct Practice {
+    pub(crate) walk_bob: Vec3,
+    body_gibs: Vec<deathmatch::dm_training::gibs::Gibs>,
+    gib_seed: u32,
+    blast_overkill: u16,
     pub(crate) teleports: crate::teleport::Bursts,
     cheats: cheats::Cheats,
     cheat_ammo: [bool; Weapon::ALL.len()],
@@ -788,6 +800,10 @@ pub struct Practice {
 impl Practice {
     pub fn new(map: &Map) -> Self {
         let mut game = Self {
+            walk_bob: Vec3::default(),
+            body_gibs: Vec::new(),
+            gib_seed: 0x4769_6273,
+            blast_overkill: 0,
             teleports: crate::teleport::Bursts::default(),
             cheats: cheats::Cheats::default(),
             cheat_ammo: [false; Weapon::ALL.len()],
@@ -882,6 +898,7 @@ impl Practice {
         self.ordnance = ordnance::Shots::default();
         self.ballistics = ballistics::Effects::default();
         self.death = None;
+        self.blast_overkill = 0;
         self.charge = None;
         self.rocket_fired = None;
         self.walking_since = None;
@@ -1158,6 +1175,9 @@ impl Practice {
                     yaw: camera.yaw + std::f32::consts::PI,
                     health: 100,
                     outgoing_scale: self.damage_scale(),
+                    fell_at: None,
+                    overkill: 0,
+                    gibbed: false,
                 });
                 self.owned.fill(true);
                 self.owned[Weapon::Translocator as usize] = false;
@@ -1287,11 +1307,24 @@ impl Practice {
         let choice = ((self.jitter() + 1.0) * 1.5) as usize % 3;
         self.score = self.score.saturating_sub(1);
         self.clear_powerups();
+        let gibbed = self.blast_overkill > 80 && map.player_gibs[0].is_some();
+        if gibbed && let Some(art) = &map.player_gibs[0] {
+            self.body_gibs
+                .push(deathmatch::dm_training::gibs::Gibs::spawn(
+                    art,
+                    position,
+                    Vec3::default(),
+                    crate::collision::PLAYER_HEIGHT,
+                    self.time,
+                    &mut self.gib_seed,
+                ));
+        }
         self.death = Some(Death {
             position,
             yaw,
             started: self.time,
             animation: choice,
+            gibbed,
         });
         self.pulse_beam = None;
         self.pulse_primary_since = None;
@@ -1302,7 +1335,37 @@ impl Practice {
         self.hit_taken = 0;
         self.notice("PRESS FIRE TO RESPAWN");
         self.message_until = f32::INFINITY;
-        map.player_audio.death[choice].clone()
+        if gibbed {
+            map.player_gib_sound.clone()
+        } else {
+            map.player_audio.death[choice].clone()
+        }
+    }
+
+    pub(crate) fn body_gibs<'a>(
+        &'a self,
+        map: &'a Map,
+    ) -> impl Iterator<Item = (Vec3, Vec3, f32, &'a [crate::map::Face])> + 'a {
+        self.body_gibs
+            .iter()
+            .filter_map(|chunks| {
+                Some(
+                    chunks
+                        .models(map.player_gibs[0].as_ref()?)
+                        .map(|(position, spin, faces)| (position, spin, 1.0, faces)),
+                )
+            })
+            .flatten()
+    }
+
+    pub(crate) fn body_spurts<'a>(
+        &'a self,
+        map: &'a Map,
+    ) -> impl Iterator<Item = (Vec3, Vec3, Pose<'a>)> + 'a {
+        self.body_gibs
+            .iter()
+            .filter_map(|chunks| Some(chunks.spurts(map.player_gibs[0].as_ref()?, self.time)))
+            .flatten()
     }
 
     pub fn pain_sound(&mut self, map: &Map) -> Option<Arc<Wave>> {
@@ -1415,6 +1478,12 @@ impl Practice {
         self.decals.follow_movers(&map.movers);
         self.ordnance.follow_movers(&map.movers);
         let mut sounds = SoundEvents::default();
+        if let Some(art) = &map.player_gibs[0] {
+            for chunks in &mut self.body_gibs {
+                chunks.tick(art, map, self.time, dt, &mut self.gib_seed, &mut sounds);
+            }
+            self.body_gibs.retain(|chunks| !chunks.expired());
+        }
         if self.damage_amp_active() && self.time >= self.amp_warning {
             self.amp_warning += 1.0;
             sounds.extend(map.powerups.amp_out.iter().cloned());
@@ -1629,6 +1698,32 @@ impl Practice {
                         .nuclear_wave(map, self.time, target.position, 1)
             {
                 target.damage(damage);
+            }
+        }
+        if let Some(target) = &mut self.target
+            && target.health == 0
+            && target.fell_at.is_none()
+        {
+            target.fell_at = Some(self.time);
+            if target.overkill > 80
+                && let Some(art) = &map.player_gibs[0]
+            {
+                target.gibbed = true;
+                self.body_gibs
+                    .push(deathmatch::dm_training::gibs::Gibs::spawn(
+                        art,
+                        target.position,
+                        Vec3::default(),
+                        crate::collision::PLAYER_HEIGHT,
+                        self.time,
+                        &mut self.gib_seed,
+                    ));
+                sounds.extend_at(
+                    map.player_gib_sound.iter().cloned(),
+                    target.position,
+                    crate::sound::CONTACT_SOUND_RADIUS,
+                    1.0,
+                );
             }
         }
         let self_hits = self.ordnance.take_self_hits();
@@ -2071,6 +2166,9 @@ impl Practice {
         if shield {
             self.shield_flash_until = self.time + 0.16;
             self.shield_hit_pending = true;
+        }
+        if self.health > 0 {
+            self.blast_overkill = damage.saturating_sub(self.health);
         }
         self.health_damage(damage);
     }

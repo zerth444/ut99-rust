@@ -295,6 +295,7 @@ impl Defenses {
                             blast.hit_player(&map.collision, fighter.walker.position)
                         {
                             hits.push(Hit {
+                                kind: super::HitKind::Impact,
                                 victim,
                                 owner: None,
                                 bypass_armor: false,
@@ -607,6 +608,7 @@ fn trace_warheads(
 
 fn gun_hit(victim: usize, damage: u16, direction: Vec3, map: &Map) -> Hit {
     Hit {
+        kind: super::HitKind::Impact,
         victim,
         owner: None,
         bypass_armor: false,

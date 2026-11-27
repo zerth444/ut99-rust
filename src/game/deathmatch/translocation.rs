@@ -366,6 +366,7 @@ fn equipment(map: &Map) -> Option<&Art> {
 
 fn telefrag(victim: usize, owner: Option<usize>) -> Hit {
     Hit {
+        kind: super::HitKind::Impact,
         victim,
         owner,
         damage: u16::MAX,
