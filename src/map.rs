@@ -121,6 +121,19 @@ pub struct Map {
 }
 
 impl Map {
+    pub(crate) fn clear_player_start(&self, preferred: usize) -> usize {
+        (0..self.starts.len())
+            .map(|offset| (preferred + offset) % self.starts.len())
+            .find(|&index| {
+                let start = self.starts[index];
+                start.enabled
+                    && self.collision.player_fits(
+                        crate::collision::Walker::spawn(&self.collision, start.position).position,
+                    )
+            })
+            .unwrap_or(preferred)
+    }
+
     pub(crate) fn supports_mode(&self, mode: crate::game::deathmatch::Mode) -> bool {
         use crate::game::deathmatch::Mode;
         match mode {

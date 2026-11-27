@@ -156,7 +156,7 @@ impl Collision {
     }
 
     fn sweep(&self, start: Vec3, delta: Vec3, extent: Vec3) -> Option<Hit> {
-        self.sweep_except(start, delta, extent, None)
+        self.sweep_except(start, delta, extent, None, 0.0)
     }
 
     fn sweep_except(
@@ -165,6 +165,7 @@ impl Collision {
         delta: Vec3,
         extent: Vec3,
         ignored: Option<usize>,
+        contact_slop: f32,
     ) -> Option<Hit> {
         let end = start + delta;
         let lo = Vec3(start.0.min(end.0), start.1.min(end.1), start.2.min(end.2)) - extent;
@@ -175,12 +176,12 @@ impl Collision {
                 continue;
             }
             let hit = if hull.parts.is_empty() {
-                hull.sweep(start, delta, extent)
+                hull.sweep(start, delta, extent, contact_slop)
             } else {
                 hull.parts
                     .iter()
                     .filter(|part| part.overlaps(lo, hi))
-                    .filter_map(|part| part.sweep(start, delta, extent))
+                    .filter_map(|part| part.sweep(start, delta, extent, contact_slop))
                     .min_by(|a, b| a.fraction.total_cmp(&b.fraction))
             };
             if let Some(mut hit) = hit
@@ -203,8 +204,14 @@ impl Collision {
         height: f32,
         support: usize,
     ) -> bool {
-        self.sweep_except(origin, delta, Vec3(radius, radius, height), Some(support))
-            .is_none()
+        self.sweep_except(
+            origin,
+            delta,
+            Vec3(radius, radius, height),
+            Some(support),
+            0.0,
+        )
+        .is_none()
     }
 
     pub fn ray(&self, start: Vec3, delta: Vec3) -> Option<Vec3> {
@@ -239,11 +246,53 @@ impl Collision {
     }
 
     fn trace(&self, start: Vec3, delta: Vec3) -> Option<Hit> {
-        self.sweep(start, delta, PLAYER)
+        let floor_slop = if delta.0 == 0.0 && delta.1 == 0.0 && delta.2 < 0.0 {
+            SKIN
+        } else {
+            0.0
+        };
+        self.sweep_except(start, delta, PLAYER, None, floor_slop)
     }
 
     pub(crate) fn player_fits(&self, point: Vec3) -> bool {
         !self.hulls.iter().any(|hull| hull.contains_player(point))
+    }
+
+    fn nearby_player_start(&self, origin: Vec3) -> Option<Vec3> {
+        use std::f32::consts::FRAC_1_SQRT_2 as DIAGONAL;
+        const DIRECTIONS: [Vec3; 8] = [
+            Vec3(1.0, 0.0, 0.0),
+            Vec3(-1.0, 0.0, 0.0),
+            Vec3(0.0, 1.0, 0.0),
+            Vec3(0.0, -1.0, 0.0),
+            Vec3(DIAGONAL, DIAGONAL, 0.0),
+            Vec3(-DIAGONAL, DIAGONAL, 0.0),
+            Vec3(DIAGONAL, -DIAGONAL, 0.0),
+            Vec3(-DIAGONAL, -DIAGONAL, 0.0),
+        ];
+        let mut best: Option<(Vec3, f32)> = None;
+        for height in [0.0, 4.0, 8.0, -4.0, -8.0, 16.0, 24.0, 32.0, 40.0] {
+            for radius in [0.0, 4.0, 8.0, 16.0, 24.0, 32.0] {
+                let distance = height * height + radius * radius;
+                if distance == 0.0 || best.is_some_and(|(_, best)| distance >= best) {
+                    continue;
+                }
+                let directions = if radius == 0.0 {
+                    &DIRECTIONS[..1]
+                } else {
+                    &DIRECTIONS
+                };
+                for &direction in directions {
+                    let delta = direction * radius + UP * height;
+                    let candidate = origin + delta;
+                    if self.player_fits(candidate) && self.sweep(origin, delta, PLAYER).is_none() {
+                        best = Some((candidate, distance));
+                        break;
+                    }
+                }
+            }
+        }
+        best.map(|(position, _)| position)
     }
 
     fn water_jump_clear(&self, position: Vec3, forward: Vec3) -> bool {
@@ -406,15 +455,20 @@ impl Hull {
         })
     }
 
-    fn sweep(&self, start: Vec3, delta: Vec3, extent: Vec3) -> Option<Hit> {
+    fn sweep(&self, start: Vec3, delta: Vec3, extent: Vec3, contact_slop: f32) -> Option<Hit> {
         let mut enter = f32::NEG_INFINITY;
         let mut exit: f32 = 1.0;
         let mut normal = Vec3::default();
+        let mut nearest = (f32::NEG_INFINITY, 0.0, Vec3::default());
         for plane in &self.planes {
             let n = plane.normal;
             let extent = Vec3(n.0.abs(), n.1.abs(), n.2.abs()).dot(extent);
             let from = n.dot(start) - plane.distance - extent;
             let along = n.dot(delta);
+            if contact_slop > 0.0 && (from > nearest.0 || (from == nearest.0 && along < nearest.1))
+            {
+                nearest = (from, along, n);
+            }
             if along.abs() < 0.00001 {
                 if from > 0.0 {
                     return None;
@@ -432,7 +486,21 @@ impl Hull {
                 return None;
             }
         }
-        // An already-overlapping hull must permit moving out of it.
+        // At a shared brush edge a player can start a sweep within the contact skin.
+        // Report motion into that face while still allowing the player to leave it.
+        let (depth, approach, boundary_normal) = nearest;
+        if (-contact_slop..=0.0).contains(&depth)
+            && boundary_normal.2 >= FLOOR_NORMAL
+            && approach < -0.00001
+            && exit > 0.0
+        {
+            return Some(Hit {
+                fraction: 0.0,
+                normal: boundary_normal,
+                hull: None,
+            });
+        }
+        // A deeply overlapping hull must permit moving out of it.
         ((-0.0001..=1.0).contains(&enter) && exit > 0.0).then_some(Hit {
             fraction: enter.max(0.0),
             normal,
@@ -467,9 +535,20 @@ impl Walker {
         // Some map starts are authored for smaller pawns. Raise the hull before
         // settling it onto the nearest floor to avoid spawning inside a step.
         let raised = position + UP * 10.0;
-        let floor = collision.floor(raised, 26.0);
+        let mut floor = collision.floor(raised, 26.0);
+        let mut settled = floor.map_or(position, |distance| raised - UP * distance);
+        if !collision.player_fits(settled)
+            && let Some(clear) = collision.nearby_player_start(position)
+        {
+            floor = collision.floor(clear, collision.profile.step_height);
+            settled = floor.map_or(clear, |distance| clear - UP * distance);
+            if !collision.player_fits(settled) {
+                settled = clear;
+                floor = None;
+            }
+        }
         Self {
-            position: floor.map_or(position, |distance| raised - UP * distance),
+            position: settled,
             grounded: floor.is_some(),
             air_control_override: None,
             velocity: Vec3::default(),
@@ -793,6 +872,137 @@ fn limit(velocity: Vec3, maximum: f32) -> Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn read_collision_map(path: &std::path::Path) -> crate::map::Map {
+        let bytes = std::fs::read(path).unwrap();
+        let package = crate::package::Package::read(&bytes).unwrap();
+        crate::map::Map::load(&package, None)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+    }
+
+    #[test]
+    #[ignore = "requires the local reference-client maps"]
+    fn facing_worlds_crossing_holds_the_player_and_leaves_the_void_open() {
+        let path = std::path::Path::new("local/reference-client/Maps/CTF-Face.unr");
+        let bytes = std::fs::read(path).unwrap();
+        let package = crate::package::Package::read(&bytes).unwrap();
+        let map = crate::map::Map::load(&package, Some(path)).unwrap();
+        let world = &map.collision;
+        // The two authored path nodes on the north side of the island join.
+        let red = Vec3(2763.362, 155.78903, -1377.8925);
+        let blue = Vec3(2604.2207, 140.81895, -1392.8776);
+        for (from, to) in [(red, blue), (blue, red)] {
+            let direction = crate::mover::unit(Vec3(to.0 - from.0, to.1 - from.1, 0.0));
+            let floor = world.floor_position(from + UP * 100.0, 200.0).unwrap();
+            for jump in [false, true] {
+                let mut walker = Walker::spawn(world, floor);
+                assert!(walker.grounded);
+                for tick in 0..100 {
+                    let events = walker.advance(
+                        world,
+                        direction * world.profile.ground_speed,
+                        (jump && tick == 6).then_some(world.profile.jump_speed),
+                        1.0 / 120.0,
+                    );
+                    if jump && tick == 6 {
+                        assert!(events.jump);
+                    }
+                    assert!(walker.position.2 > -1420.0, "{:?}", walker.position);
+                    if (walker.position - to).dot(direction) >= 0.0 {
+                        break;
+                    }
+                }
+                assert!((walker.position - to).dot(direction) >= 0.0);
+            }
+        }
+        let at_join = world
+            .floor_position((red + blue) * 0.5 + UP * 50.0, 100.0)
+            .unwrap();
+        let mut walker = Walker::spawn(world, at_join);
+        walker.position = at_join - UP * (1.4 * SKIN);
+        let overlap = walker.position;
+        assert!(world.sweep(overlap, UP * -2.0, PLAYER).is_none());
+        assert!(world.trace(overlap, UP * -2.0).is_some());
+        assert!(world.trace(overlap, UP * 2.0).is_none());
+        for _ in 0..120 {
+            walker.advance(world, Vec3::default(), None, 1.0 / 120.0);
+        }
+        assert!(walker.grounded && (walker.position.2 - at_join.2).abs() < 0.5);
+
+        // Open space to the south-east of the ridge must still allow a fall.
+        let mut walker = Walker::spawn(world, Vec3(3084.0, -29.0, -1300.0));
+        assert!(!walker.grounded);
+        for _ in 0..120 {
+            walker.advance(world, Vec3::default(), None, 1.0 / 120.0);
+        }
+        assert!(walker.position.2 < -1400.0);
+    }
+
+    #[test]
+    #[ignore = "requires the local reference-client maps"]
+    fn installed_maps_provide_clear_player_spawns_and_floor_contacts() {
+        let folder = std::path::Path::new("local/reference-client/Maps");
+        let mut paths = std::fs::read_dir(folder)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension().is_some_and(|ext| ext == "unr")
+                    && path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .is_some_and(|stem| {
+                            ["AS-", "CTF-", "DM-", "DOM-"]
+                                .iter()
+                                .any(|prefix| stem.starts_with(prefix))
+                        })
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert!(paths.len() >= 73);
+        let mut positions = 0;
+        for path in paths {
+            let map = read_collision_map(&path);
+            let world = &map.collision;
+            assert!(map.starts.iter().any(|start| start.enabled));
+            for (index, _) in map
+                .starts
+                .iter()
+                .enumerate()
+                .filter(|(_, start)| start.enabled)
+            {
+                let picked = map.clear_player_start(index);
+                let mut walker = Walker::spawn(world, map.starts[picked].position);
+                let position = walker.position;
+                assert!(
+                    world.player_fits(position),
+                    "{} start {index}: {position:?}",
+                    path.display()
+                );
+                let zone = world.regions.at(position);
+                if !walker.grounded
+                    || zone.water
+                    || zone.gravity.2 > -50.0
+                    || world.trace(position, UP * 6.0).is_some()
+                {
+                    continue;
+                }
+                walker.position = position + UP * 6.0;
+                walker.grounded = false;
+                for _ in 0..60 {
+                    walker.advance(world, Vec3::default(), None, 1.0 / 120.0);
+                }
+                assert!(
+                    walker.grounded && (walker.position.2 - position.2).abs() < 0.5,
+                    "{} start {index}: {position:?} -> {:?}",
+                    path.display(),
+                    walker.position
+                );
+                positions += 1;
+            }
+        }
+        assert!(positions > 500, "only {positions} floor contacts");
+        eprintln!("Checked {positions} floor contacts");
+    }
 
     #[test]
     fn self_damage_momentum_lifts_grounded_players_and_limits_extra_upward_boost() {

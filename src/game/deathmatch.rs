@@ -1520,7 +1520,10 @@ impl Match {
                     .then_with(|| a.2.total_cmp(&b.2))
                     .then_with(|| b.3.cmp(&a.3))
             })
-            .map_or(self.preferred_start, |(spawn, _, _, _)| spawn)
+            .map_or_else(
+                || map.clear_player_start(self.preferred_start),
+                |(spawn, _, _, _)| spawn,
+            )
     }
 
     pub fn remaining(&self) -> u16 {
@@ -5943,7 +5946,12 @@ fn usable_start(map: &Map, index: usize) -> Option<Vec3> {
     let start = map.starts[index];
     let walker = Walker::spawn(&map.collision, start.position);
     let zone = map.collision.regions.at(walker.position);
-    (start.enabled && walker.grounded && !zone.water && !zone.pain).then_some(walker.position)
+    (start.enabled
+        && walker.grounded
+        && !zone.water
+        && !zone.pain
+        && map.collision.player_fits(walker.position))
+    .then_some(walker.position)
 }
 
 fn aim_error(delta: Vec3, yaw: f32, pitch: f32) -> (f32, f32) {

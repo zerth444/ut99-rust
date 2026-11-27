@@ -142,6 +142,9 @@ unsafe fn message_loop(
     let mut frame = Frame::hardware(map);
     let hud = Hud::new();
     let mut game = Practice::new(map);
+    if match_rules.is_none() {
+        start = map.clear_player_start(start);
+    }
     let mut mouse = Mouse::new(window);
     let mut music_muted = false;
     let mut primary = false;
@@ -620,7 +623,7 @@ unsafe fn message_loop(
                             return Ok(());
                         }
                         VK_TAB if game.death.is_none() => {
-                            start = (start + 1) % map.starts.len();
+                            start = map.clear_player_start((start + 1) % map.starts.len());
                             occupied_portal = None;
                             camera = Camera::from_start(map.starts[start]);
                             walker = Walker::spawn(&map.collision, map.starts[start].position);
