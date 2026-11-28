@@ -392,7 +392,7 @@ impl Map {
                 }
             }
         }
-        collision.face_ridge_contacts = title.eq_ignore_ascii_case("Facing Worlds");
+        collision.facing_worlds_contacts = title.eq_ignore_ascii_case("Facing Worlds");
         Ok(Self {
             title,
             author,

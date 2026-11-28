@@ -186,6 +186,40 @@ impl View {
         }
     }
 
+    fn attach_shock(
+        &self,
+        map: &Map,
+        muzzle: Option<(Weapon, Vec3)>,
+        point: Vec3,
+        effect: shock::MuzzleEffect,
+        zoom: f32,
+    ) -> Vec3 {
+        match effect {
+            shock::MuzzleEffect::Bolt { age } => {
+                self.attach_muzzle(map, muzzle, Weapon::Shock, point, zoom, Some(age))
+            }
+            shock::MuzzleEffect::Beam { end } => {
+                let Some((Weapon::Shock, local)) = muzzle.filter(|&(_, local)| local.0 > NEAR)
+                else {
+                    return point;
+                };
+                let end_depth = self.point(end).2;
+                if end_depth <= NEAR {
+                    return point;
+                }
+                // Put the point cloud on the muzzle's screen ray at a useful
+                // world depth. If a wall is close, shorten this same ray.
+                let depth = (end_depth * 0.6).clamp(NEAR, 72.0);
+                let anchor = self.muzzle_at(local, depth, zoom);
+                let depth = map
+                    .collision
+                    .ray(self.eye, anchor - self.eye)
+                    .map_or(depth, |hit| (self.point(hit).2 - 0.2).max(NEAR));
+                self.muzzle_at(local, depth, zoom)
+            }
+        }
+    }
+
     fn muzzle_at(&self, local: Vec3, depth: f32, zoom: f32) -> Vec3 {
         // The local offset already includes the weapon projection. Keep its
         // screen ray under the visible muzzle at the world camera's FOV.
@@ -719,8 +753,8 @@ impl Frame {
             .visuals(&map.ordnance, game.time, |visual| {
                 self.draw_world_effect(&view, game.time, visual);
             });
-        self.draw_shock(map, &view, &game.shock, game.time, |point, age| {
-            attach(Weapon::Shock, point, age)
+        self.draw_shock(map, &view, &game.shock, game.time, |point, effect| {
+            view.attach_shock(map, muzzle, point, effect, zoom)
         });
         for &effect in &game.hammer_effects {
             self.effect(camera, effect);
@@ -1262,8 +1296,8 @@ impl Frame {
         for effect in game.visible_effects() {
             self.effect(camera, effect);
         }
-        self.draw_shock(map, &view, &game.shock, time, |point, age| {
-            attach(Weapon::Shock, point, age)
+        self.draw_shock(map, &view, &game.shock, time, |point, effect| {
+            view.attach_shock(map, muzzle, point, effect, zoom)
         });
         if let Some(beam) = &game.pulse_beam {
             let mut beam = *beam;
@@ -1326,7 +1360,7 @@ impl Frame {
         view: &View,
         shots: &shock::Shots,
         time: f32,
-        attach: impl Fn(Vec3, Option<f32>) -> Vec3,
+        attach: impl Fn(Vec3, shock::MuzzleEffect) -> Vec3,
     ) {
         if let Some(assets) = shock::assets(map) {
             shots.visuals(assets, time, attach, |visual| match visual {
@@ -2558,6 +2592,64 @@ mod muzzle_tests {
     use super::*;
     use crate::game::deathmatch::{Match, Mode, Rules};
     use crate::package::Package;
+
+    #[test]
+    #[ignore = "requires the reference-client map"]
+    fn shock_beam_keeps_the_muzzle_even_when_a_wall_shortens_its_origin() {
+        let path = Path::new("local/reference-client/Maps/CTF-Face.unr");
+        let data = std::fs::read(path).unwrap();
+        let mut map = Map::load(&Package::read(&data).unwrap(), Some(path)).unwrap();
+        map.collision = crate::collision::Collision::test_world();
+        let camera = Camera {
+            position: Vec3::default(),
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        let view = View::camera(&camera);
+        let frame = Frame::new();
+        let art = &map.arsenal[&Weapon::Shock];
+        let pose = art.primary_motion.sample(0.08).unwrap();
+        let offset = weapon_bob(art, Vec3(0.0, 2.5, -4.0));
+        let muzzle = art.muzzle_position(pose).unwrap() + offset;
+        let point = Vec3(30.0, -5.0, -8.0);
+        for (wall, target) in [(None, 700.0), (Some(25.0), 110.0), (None, 45.0)] {
+            map.collision = crate::collision::Collision::test_world();
+            if let Some(x) = wall {
+                map.collision
+                    .add_box(Vec3(x, -200.0, -200.0), Vec3(x + 2.0, 200.0, 200.0));
+            }
+            let zoom = 0.92;
+            let start = view.attach_shock(
+                &map,
+                Some(frame.projected_muzzle(Weapon::Shock, muzzle)),
+                point,
+                shock::MuzzleEffect::Beam {
+                    end: Vec3(target, 0.0, 0.0),
+                },
+                zoom,
+            );
+            assert!(start.0 < wall.unwrap_or(target));
+            let pixel = |p, zoom| {
+                project(
+                    Vertex {
+                        position: p,
+                        u: 0.0,
+                        v: 0.0,
+                    },
+                    frame.width,
+                    frame.height,
+                    zoom,
+                )
+                .position
+            };
+            let barrel = pixel(
+                view.point(muzzle),
+                weapon_view_zoom(Weapon::Shock, frame.width, frame.height),
+            );
+            let effect = pixel(view.point(start), zoom);
+            assert!((barrel.0 - effect.0).abs() < 0.01 && (barrel.1 - effect.1).abs() < 0.01);
+        }
+    }
 
     #[test]
     fn weapon_sway_keeps_world_muzzle_on_the_drawn_barrel() {

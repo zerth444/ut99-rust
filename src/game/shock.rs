@@ -195,6 +195,11 @@ struct Ring {
     born: f32,
 }
 
+pub enum MuzzleEffect {
+    Bolt { age: f32 },
+    Beam { end: Vec3 },
+}
+
 pub enum Visual<'a> {
     Sprite {
         position: Vec3,
@@ -603,14 +608,19 @@ impl Shots {
         &self,
         assets: &'a Assets,
         now: f32,
-        local_muzzle: impl Fn(Vec3, Option<f32>) -> Vec3,
+        local_muzzle: impl Fn(Vec3, MuzzleEffect) -> Vec3,
         mut draw: impl FnMut(Visual<'a>),
     ) {
         if let Some(texture) = &assets.bolt {
             for bolt in &self.bolts {
                 draw(Visual::Sprite {
                     position: if bolt.owner == 0 {
-                        local_muzzle(bolt.position, Some(now - bolt.born))
+                        local_muzzle(
+                            bolt.position,
+                            MuzzleEffect::Bolt {
+                                age: now - bolt.born,
+                            },
+                        )
                     } else {
                         bolt.position
                     },
@@ -623,14 +633,22 @@ impl Shots {
         if let Some(art) = &assets.beam {
             for beam in &self.beams {
                 let start = if beam.owner == 0 {
-                    local_muzzle(beam.start, None)
+                    local_muzzle(beam.start, MuzzleEffect::Beam { end: beam.end })
                 } else {
                     beam.start
                 };
                 let delta = beam.end - start;
-                let forward = unit(delta);
+                let length = delta.dot(delta).sqrt();
+                if length < 0.01 {
+                    continue;
+                }
+                let forward = delta * length.recip();
                 let (right, up) = axes(forward);
-                let count = beam.count();
+                let count = if beam.owner == 0 {
+                    beam.count().max(1)
+                } else {
+                    beam.count()
+                };
                 for index in 0..count {
                     let age = now - beam.born - index as f32 * 0.05;
                     if !(0.0..art.lifetime).contains(&age) {
@@ -639,7 +657,11 @@ impl Shots {
                     let center = start + delta * (index as f32 / count as f32);
                     let (sin, cos) =
                         (age * (1_000_000.0 / 65_536.0) * std::f32::consts::TAU).sin_cos();
+                    let remaining = length * (1.0 - index as f32 / count as f32);
                     for &Vec3(x, y, z) in &art.points {
+                        if beam.owner == 0 && x >= remaining {
+                            continue;
+                        }
                         draw(Visual::Sprite {
                             position: center
                                 + forward * x

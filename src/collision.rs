@@ -26,7 +26,7 @@ pub(crate) struct Hull {
 
 pub struct Collision {
     hulls: Vec<Hull>,
-    pub(crate) face_ridge_contacts: bool,
+    pub(crate) facing_worlds_contacts: bool,
     pub profile: Profile,
     pub regions: Regions,
 }
@@ -49,7 +49,7 @@ impl Collision {
     pub(crate) fn test_world() -> Self {
         Self {
             hulls: Vec::new(),
-            face_ridge_contacts: false,
+            facing_worlds_contacts: false,
             profile: Profile::default(),
             regions: Regions::default(),
         }
@@ -62,7 +62,7 @@ impl Collision {
     ) -> io::Result<Self> {
         Ok(Self {
             hulls: Self::read_hulls(planes, offsets, data)?,
-            face_ridge_contacts: false,
+            facing_worlds_contacts: false,
             profile: Profile::default(),
             regions: Regions::default(),
         })
@@ -258,7 +258,7 @@ impl Collision {
     }
 
     fn at_face_ridge(&self, p: Vec3) -> bool {
-        self.face_ridge_contacts
+        self.facing_worlds_contacts
             && (2150.0..=3180.0).contains(&p.0)
             && (-510.0..=680.0).contains(&p.1)
             && (-1700.0..=-1070.0).contains(&p.2)
@@ -341,7 +341,34 @@ impl Collision {
                 .is_none()
     }
 
-    fn slide(&self, mut position: Vec3, mut delta: Vec3) -> Vec3 {
+    fn clear_player_move(&self, from: Vec3, to: Vec3) -> Vec3 {
+        let step = to - from;
+        if !self.facing_worlds_contacts
+            || step.dot(step) == 0.0
+            || self.player_fits(to)
+            || !self.player_fits(from)
+        {
+            return to;
+        }
+        // At an intersection of BSP hulls a sweep can stop on one plane and
+        // place the pawn inside its neighbor. Keep the reachable portion.
+        let (mut clear, mut blocked) = (0.0, 1.0);
+        for _ in 0..8 {
+            let probe = 0.5 * (clear + blocked);
+            if self.player_fits(from + step * probe) {
+                clear = probe;
+            } else {
+                blocked = probe;
+            }
+        }
+        from + step * clear
+    }
+
+    fn slide(&self, start: Vec3, delta: Vec3) -> Vec3 {
+        self.clear_player_move(start, self.slide_along_planes(start, delta))
+    }
+
+    fn slide_along_planes(&self, mut position: Vec3, mut delta: Vec3) -> Vec3 {
         let mut normals = Vec::new();
         for _ in 0..4 {
             if delta.dot(delta) < 1e-8 {
@@ -875,7 +902,7 @@ impl Walker {
                     if stepped.dot(delta) > moved.dot(delta)
                         && let Some(floor) = world.floor(raised, profile.step_height + 3.0)
                     {
-                        self.position = raised - UP * floor;
+                        self.position = world.clear_player_move(raised, raised - UP * floor);
                     }
                 }
             }
@@ -887,7 +914,7 @@ impl Walker {
             if self.grounded
                 && let Some(floor) = world.floor(self.position, profile.step_height.max(5.0))
             {
-                self.position = self.position - UP * floor;
+                self.position = world.clear_player_move(self.position, self.position - UP * floor);
                 let height_change = self.position.2 - origin.2;
                 self.stair_offset = (self.stair_offset - height_change * damping)
                     .clamp(-profile.step_height, profile.step_height);
@@ -905,7 +932,8 @@ impl Walker {
                 } else {
                     distance.max(0.0)
                 };
-                self.position = self.position + UP * (distance * vertical.2.signum());
+                let proposed = self.position + UP * (distance * vertical.2.signum());
+                self.position = world.clear_player_move(self.position, proposed);
                 self.grounded = self.velocity.2 < 0.0 && hit.normal.2 >= FLOOR_NORMAL;
                 if self.grounded {
                     events.landing = Some(-self.velocity.2);
@@ -929,7 +957,7 @@ impl Walker {
                     self.velocity.2 = 0.0;
                 }
             } else {
-                self.position = self.position + vertical;
+                self.position = world.clear_player_move(self.position, self.position + vertical);
             }
         }
 
@@ -1059,6 +1087,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires the local GOTY map"]
+    fn face_terrain_keeps_pawns_out_of_bsp_during_ripper_knockback() {
+        let map = read_collision_map(std::path::Path::new("local/goty/Maps/CTF-Face.unr"));
+        let world = &map.collision;
+        let mut trajectories = 0;
+        for y in (-530..780).step_by(61) {
+            for x in (-1050..6700).step_by(83) {
+                let from = Vec3(x as f32, y as f32, -1150.0);
+                let Some((ground, normal)) = world.ray_surface(from, UP * -980.0) else {
+                    continue;
+                };
+                if normal.2 < FLOOR_NORMAL {
+                    continue;
+                }
+                let initial = Walker::spawn(world, ground + UP * PLAYER_HEIGHT);
+                if !initial.grounded || !world.player_fits(initial.position) {
+                    continue;
+                }
+                for angle in 0..8 {
+                    let angle = angle as f32 * std::f32::consts::TAU / 8.0;
+                    let dir = Vec3(angle.cos(), angle.sin(), 0.0);
+                    for vertical in [-60.0, 0.0, 60.0] {
+                        let mut walker = Walker::spawn(world, initial.position);
+                        walker.set_teleport_velocity(dir * 320.0);
+                        walker.add_velocity(
+                            dir * (150.0_f32.powi(2) - vertical * vertical).sqrt() + UP * vertical,
+                        );
+                        trajectories += 1;
+                        for _ in 0..17 {
+                            let before = walker.position;
+                            walker.advance(world, dir * 400.0, None, 1.0 / 120.0);
+                            assert!(
+                                world.player_fits(walker.position),
+                                "knockback from {before:?} penetrated at {:?}",
+                                walker.position
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(trajectories > 5_000);
     }
 
     fn read_collision_map(path: &std::path::Path) -> crate::map::Map {
